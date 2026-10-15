@@ -1,0 +1,4 @@
+fastapi>=0.110,<1
+uvicorn>=0.27,<1
+requests>=2.31
+PySocks>=1.7

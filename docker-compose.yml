@@ -1,0 +1,20 @@
+services:
+  lightvela-web:
+    build: .
+    image: lightvela-web:latest
+    container_name: lightvela-web
+    restart: unless-stopped
+    ports:
+      - "${LV_PORT:-18080}:8000"
+    environment:
+      LV_WEB_PASSWORD: "${LV_WEB_PASSWORD:?请先在 .env 里设置 LV_WEB_PASSWORD}"
+      LV_SECRET: "${LV_SECRET:?请先在 .env 里设置 LV_SECRET}"
+      LV_DATA_DIR: "/data"
+      LV_PORT: "8000"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

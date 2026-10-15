@@ -1,0 +1,1021 @@
+# -*- coding: utf-8 -*-
+"""
+LightVela 抢名额 · 核心逻辑（解析 + 网络）。被 _build_lv_gui.py 内联进单文件入口。
+设计约束：本文件自包含，不 import 本项目其它模块。
+"""
+import os
+import re
+import sys
+import json
+import time
+import base64
+import hmac
+import hashlib
+import struct
+import shutil
+import secrets
+import threading
+import subprocess
+from urllib.parse import urlparse, unquote, quote
+
+import requests
+
+# ---------------- 常量 ----------------
+CLIENT_ID = "Ov23ctPQOrmnxkn8SRqM"
+REDIRECT = "https://api.lightvela.ai/auth/oauth/github/callback"
+SCOPE = "read:user,user:email"
+API = "https://api.lightvela.ai"
+DEFAULT_PROXY_TYPE = "socks5"
+DEFAULT_PROXY_HOST = "a.rr2.kdns.fr"
+DEFAULT_PROXY_PORT = "10800"
+DEFAULT_PROXY_USER = "6582443"
+DEFAULT_PROXY_PASS = "6582443"
+DEFAULT_PROXY = "6582443:6582443@a.rr2.kdns.fr:10800"   # 兼容旧写法
+DEFAULT_BUNDLE = "bundle_launch_ai_01"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/147.0.7727.22 Safari/537.36")
+
+MODES = ("check", "prelogin", "rush", "fullflow")
+MODE_LABEL = {"check": "体检（只登录+查订阅，不下单）",
+              "prelogin": "预登录（登录并存令牌，不下单）",
+              "rush": "抢单（登录+抢 0 元名额）",
+              "fullflow": "全流程（建Bot→设主模型→部署→核实）"}
+
+# ---- 全流程：复用已跑通的 Node 引擎（不重写底层 WS/BSON 隧道，稳） ----
+PURECODE_JS = "lightvela-purecode.js"
+DEPLOY_MSG_FILE = "_deploy_msg.txt"
+NODE_CANDIDATES = [
+    r"C:\Users\Administrator\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe",
+    r"C:\Users\Administrator\.workbuddy-ai\binaries\node\versions\24.15.0\node.exe",
+    r"C:\Program Files\nodejs\node.exe",
+]
+DEPLOY_MSG_DEFAULT = (
+    "# 这里是【默认部署指令】。请把自己的探针地址与令牌填进来。\n"
+    "# 更推荐的做法：在本程序同目录放一个 _deploy_msg.txt，写入你的指令原文，\n"
+    "# 程序会优先读取它（该文件已在 .gitignore 中，不会被提交到仓库）。\n"
+    "#\n"
+    "# 示例：\n"
+    "# bash <(curl -sSL https://raw.githubusercontent.com/<your-name>/yufu-probe/main/install-agent.sh) __PROBE_WS__ __PROBE_TOKEN__\n"
+    "#\n"
+    "帮我部署这个项目,不需要我进行二次确认,部署成功之后做一个探针服务的检测并给我一个报告.\n"
+)
+VERIFY_CMD = ("echo ===BEGIN===; systemctl is-active yufu-agent; systemctl is-enabled yufu-agent; "
+              "ps -ef | grep yufu | grep -v grep; ss -tn | grep 19527; "
+              "cat /var/lib/yufu-agent/uuid 2>&1; echo ===DONE===")
+
+
+def app_dir():
+    """exe/脚本所在目录（--onefile 下取 exe 目录，而非解包临时目录）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+TOKEN_FILE = "lv-tokens.json"
+
+
+# ---------------- 账号解析 ----------------
+def parse_accounts(text):
+    """每行：邮箱----密码----用户名----2FA----创建时间（后两项可缺）。
+    返回 [{'idx','raw_parts','email','password','login','tfa','created','ok','err'}]"""
+    rows = []
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = [p.strip() for p in re.split(r"-{2,}", s)]
+        r = {"idx": len(rows) + 1, "raw_parts": parts, "ok": False, "err": "",
+             "email": "", "password": "", "login": "", "tfa": "", "created": ""}
+        if len(parts) < 4:
+            r["err"] = "字段不足（需 邮箱----密码----用户名----2FA）"
+        elif not parts[0] or not parts[1] or not parts[3]:
+            r["err"] = "邮箱/密码/2FA 不能为空"
+        else:
+            r["email"], r["password"] = parts[0], parts[1]
+            r["login"] = parts[2] or parts[0]
+            r["tfa"] = parts[3]
+            r["created"] = parts[4] if len(parts) > 4 else ""
+            r["ok"] = True
+        rows.append(r)
+    return rows
+
+
+def to_line(acc):
+    """按原格式导出（保持用户输入的分段，不多不少）。"""
+    parts = list(acc.get("raw_parts") or [])
+    return "----".join(parts)
+
+
+# ---------------- 代理 ----------------
+def upgrade_socks_scheme(p):
+    """socks5:// -> socks5h://（远端解析 DNS）。实测 socks5:// 在本机连不通。"""
+    p = (p or "").strip()
+    if p.lower().startswith("socks5://"):
+        return "socks5h://" + p[len("socks5://"):]
+    return p
+
+
+def normalize_proxy(ptype, raw):
+    """支持三种写法：
+      1) 带协议：socks5h://user:pass@host:port（原样返回，忽略 ptype）
+      2) host:port:user:pass      （按 ptype 组装）
+      3) host:port                （按 ptype 组装）
+    ★ socks5 一律映射成 socks5h（远端解析 DNS）：
+      实测 socks5:// 走本地解析在本机连不通，socks5h:// 正常。代理池必须用 h。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        return upgrade_socks_scheme(raw)
+    parts = raw.split(":")
+    ptype = (ptype or DEFAULT_PROXY_TYPE).strip().lower()
+    if ptype not in ("socks5", "socks5h", "http", "https"):
+        ptype = DEFAULT_PROXY_TYPE
+    if ptype == "socks5":
+        ptype = "socks5h"          # ★ 必须远端解析，否则连不通
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return "%s://%s:%s@%s:%s" % (ptype, user, pw, host, port)
+    return "%s://%s" % (ptype, raw)
+
+
+def proxy_of(acc, default_proxy):
+    """账号自带代理优先，否则用界面上的默认代理。"""
+    p = acc.get("proxy") if isinstance(acc, dict) else None
+    return (p or default_proxy or "").strip()
+
+
+def proxy_from_parts(ptype, host, port, user="", pw=""):
+    """界面四栏（类型/地址/端口/账号/密码）→ 归一化代理 URL。
+    · 地址栏若粘了整段 URL（含 ://），原样升级 socks5→socks5h 后返回
+    · 地址栏若粘了 host:port 或 user:pass@host:port 且端口栏留空，也认
+    · 有账号就拼 user:pass@，没有就 host:port
+    · socks5 一律升级 socks5h（远端解析，本机实测必须）"""
+    host = (host or "").strip()
+    port = str(port or "").strip()
+    user = (user or "").strip()
+    pw = (pw or "").strip()
+    if not host:
+        return ""
+    t = (ptype or DEFAULT_PROXY_TYPE).strip().lower()
+    if t not in ("socks5", "socks5h", "http", "https"):
+        t = DEFAULT_PROXY_TYPE
+    if t == "socks5":
+        t = "socks5h"
+    if "://" in host:
+        return upgrade_socks_scheme(host)
+    if not port:
+        # 端口栏空着：允许把 host:port / user:pass@host:port 整段粘在地址栏
+        if "@" in host or ":" in host:
+            return normalize_proxy(ptype, host)
+        return ""
+    if user:
+        return "%s://%s:%s@%s:%s" % (t, quote(user, safe=""), quote(pw, safe=""), host, port)
+    return "%s://%s:%s" % (t, host, port)
+
+
+def proxy_to_json(proxy_url):
+    """归一化 URL → Node 侧 LIGHTVELA_EGRESS_PROXY 需要的 JSON 对象。
+    Node 侧只认 http / https / socks5 三种 kind。"""
+    u = urlparse(proxy_url or "")
+    scheme = (u.scheme or "").lower()
+    kind = {"socks5h": "socks5", "socks5": "socks5",
+            "http": "http", "https": "https"}.get(scheme, "http")
+    return {"type": kind, "host": u.hostname or "", "port": u.port or 0,
+            "username": unquote(u.username or ""), "password": unquote(u.password or "")}
+
+
+# ---------------- Node 引擎桥（全流程用） ----------------
+def find_node():
+    """★ 先找【程序同目录】的 node.exe（绿色版整套拷走就能用），
+    找不到再退回到本机已装的 Node。"""
+    for name in ("node.exe", "node"):
+        local = os.path.join(app_dir(), name)
+        if os.path.isfile(local):
+            return local
+    for c in NODE_CANDIDATES:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("node") or ""
+
+
+def find_purecode():
+    p = os.path.join(app_dir(), PURECODE_JS)
+    return p if os.path.isfile(p) else ""
+
+
+def deploy_msg():
+    """优先读同目录 _deploy_msg.txt，没有就用内嵌默认值。"""
+    p = os.path.join(app_dir(), DEPLOY_MSG_FILE)
+    if os.path.isfile(p):
+        try:
+            t = open(p, encoding="utf-8").read().strip()
+            if t:
+                return t
+        except Exception:
+            pass
+    return DEPLOY_MSG_DEFAULT
+
+
+def tail(text, n=200):
+    """取输出的最后 n 个字符（一行化），给日志用。"""
+    t = (text or "").replace("\r", "").strip()
+    t = re.sub(r"\n+", " ⏎ ", t)
+    return t[-n:] if len(t) > n else t
+
+
+def run_node(js, args, extra_env=None, timeout=600):
+    """跑 Node 引擎子进程，返回 (returncode, 合并输出)。失败抛异常。"""
+    node = find_node()
+    if not node:
+        raise RuntimeError("找不到 node.exe（全流程需要 Node 环境）")
+    if not js or not os.path.isfile(js):
+        raise RuntimeError("找不到 %s（请把它放在程序同目录）" % PURECODE_JS)
+    env = dict(os.environ)
+    for k, v in (extra_env or {}).items():
+        env[k] = "" if v is None else str(v)
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = 0x08000000      # CREATE_NO_WINDOW：别弹黑框
+    p = subprocess.run([node, js] + [str(a) for a in args],
+                       cwd=os.path.dirname(js), env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       timeout=timeout, **kw)
+    return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
+
+
+# ---------------- TOTP ----------------
+def totp(secret, offset=0):
+    key = base64.b32decode(secret.upper().replace(" ", ""))
+    counter = int(time.time() // 30) + offset
+    h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    return "%06d" % ((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000)
+
+
+def parse_inputs(html):
+    out = {}
+    for m in re.finditer(r'<input\b[^>]*>', html):
+        tag = m.group(0)
+        n = re.search(r'name="([^"]*)"', tag)
+        if not n:
+            continue
+        v = re.search(r'value="([^"]*)"', tag)
+        out[n.group(1)] = v.group(1) if v else ''
+    return out
+
+
+def new_session(proxy):
+    s = requests.Session()
+    # ★ 必须关掉 trust_env：环境里的 http_proxy/https_proxy 优先级高于 session.proxies，
+    #   会静默盖掉显式代理，导致出口 IP 固定不变。
+    s.trust_env = False
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
+    return s
+
+
+def api_session(token, proxy):
+    s = requests.Session()
+    s.trust_env = False
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    s.headers.update({"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+                      "Authorization": "Bearer " + token,
+                      "Origin": "https://lightvela.ai", "Referer": "https://lightvela.ai/agents/",
+                      "Content-Type": "application/json"})
+    return s
+
+
+def extract_token(url):
+    if not url:
+        return None
+    m = re.search(r'[#?&]session_token=([0-9a-fA-F]{32,})', url)
+    return m.group(1) if m else None
+
+
+def gh_login(login, password, tfa, proxy, log=None):
+    """GitHub 登录 + OAuth -> 返回 LightVela Bearer。失败抛异常。"""
+    def L(m):
+        if log:
+            log(m)
+    s = new_session(proxy)
+    r = s.get("https://github.com/login", timeout=40)
+    d = parse_inputs(r.text)
+    d.update({"login": login, "password": password, "commit": "Sign in",
+              "webauthn-support": d.get("webauthn-support") or "unsupported",
+              "webauthn-iuvpaa-support": d.get("webauthn-iuvpaa-support") or "unsupported",
+              "javascript-support": d.get("javascript-support") or "false"})
+    r2 = s.post("https://github.com/session", data=d, timeout=40, allow_redirects=False)
+    loc = r2.headers.get("Location", "")
+    if r2.status_code == 200:
+        raise RuntimeError("GitHub 拒登（密码错/验证码/风控）")
+    r3 = s.get(loc if loc.startswith("http") else "https://github.com" + loc, timeout=40)
+    if "two-factor" in r3.url or "two-factor" in r3.text[:4000]:
+        L("  需要 2FA，提交动态码")
+        d3 = parse_inputs(r3.text)
+        d3["app_otp"] = totp(tfa)
+        r4 = s.post("https://github.com/sessions/two-factor", data=d3, timeout=40, allow_redirects=False)
+        if r4.status_code >= 400:
+            d3["app_otp"] = totp(tfa, 1)
+            r4 = s.post("https://github.com/sessions/two-factor", data=d3, timeout=40, allow_redirects=False)
+        if s.cookies.get_dict().get("logged_in") != "yes":
+            raise RuntimeError("2FA 未通过")
+
+    L("  GitHub 登录成功，走 OAuth 授权")
+    state = secrets.token_hex(16)
+    s.cookies.set("lc_github_oauth_state", state, domain=".lightvela.ai", path="/")
+    s.cookies.set("lc_github_oauth_return_to", "/agents/", domain=".lightvela.ai", path="/")
+    url = ("https://github.com/login/oauth/authorize?client_id=" + CLIENT_ID +
+           "&redirect_uri=" + REDIRECT.replace(":", "%3A").replace("/", "%2F") +
+           "&scope=" + SCOPE.replace(":", "%3A").replace(",", "%2C") +
+           "&state=" + state)
+    rr = s.get(url, timeout=40, allow_redirects=True)
+    tok = extract_token(rr.url)
+    if tok:
+        return tok
+    d = parse_inputs(rr.text)
+    d["authorize"] = "1"          # ★ 点"同意"
+    r5 = s.post("https://github.com/login/oauth/authorize", data=d, timeout=40, allow_redirects=False)
+    loc = r5.headers.get("Location", "")
+    if "error=" in loc:
+        raise RuntimeError("GitHub 拒绝授权: " + loc[:120])
+    r6 = s.get(loc if loc.startswith("http") else "https://github.com" + loc,
+               timeout=40, allow_redirects=False)
+    tok = extract_token(r6.headers.get("Location", ""))
+    if not tok:
+        raise RuntimeError("没拿到 session_token")
+    return tok
+
+
+def live_passes(s):
+    r = s.get(API + "/v1/passes", timeout=40)
+    try:
+        return r.json().get("data", {}).get("passes", []) or []
+    except Exception:
+        return []
+
+
+def probe_token(s):
+    """查订阅 + 顺手判断令牌死活（★ 显式令牌检查）。
+    返回 (state, passes)：state ∈ 'ok' | 'dead' | 'unknown'
+      ok      = HTTP 2xx，令牌有效（passes 为空 = 真的没订阅）
+      dead    = HTTP 401/403，令牌已失效 → 必须重新登录
+      unknown = 网络异常或其它状态码 → 不能判死（抖动而已）
+    老版把状态码吞了，令牌过期会伪装成"没订阅"，导致假成功。
+    """
+    try:
+        r = s.get(API + "/v1/passes", timeout=40)
+    except Exception:
+        return "unknown", []
+    if r.status_code in (401, 403):
+        return "dead", []
+    if 200 <= r.status_code < 300:
+        try:
+            d = r.json().get("data", {}) or {}
+            return "ok", d.get("passes", []) or []
+        except Exception:
+            return "ok", []
+    return "unknown", []
+
+
+# ---------------- 凭证文件（令牌库）----------------
+def token_path():
+    """凭证文件位置。
+    优先用环境变量 LV_DATA_DIR（Docker 版指向挂载的数据盘）；
+    未设置时退回【程序所在目录】——桌面版即 exe 同目录。"""
+    d = os.environ.get("LV_DATA_DIR") or app_dir()
+    return os.path.join(d, TOKEN_FILE)
+
+
+def load_tokens():
+    """读出 {login: token}（扁平化，兼容老的纯字符串写法）。"""
+    p = token_path()
+    if not os.path.isfile(p):
+        return {}
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        if not isinstance(d, dict):
+            return {}
+        out = {}
+        for k, v in d.items():
+            t = v.get("token") if isinstance(v, dict) else v
+            if k and t:
+                out[k] = t
+        return out
+    except Exception:
+        return {}
+
+
+def merge_tokens(local, incoming):
+    """合并两份凭证。同一账号【时间新的赢】（老大选的"甲"规则）。
+    返回 (merged, added, updated)。"""
+    merged = {}
+    for k, v in (local or {}).items():
+        t = v.get("token") if isinstance(v, dict) else v
+        ts = int(v.get("ts") or 0) if isinstance(v, dict) else 0
+        if k and t:
+            merged[k] = {"token": t, "ts": ts}
+    added = updated = 0
+    for k, v in (incoming or {}).items():
+        t = v.get("token") if isinstance(v, dict) else v
+        ts = int(v.get("ts") or 0) if isinstance(v, dict) else 0
+        if not (k and t):
+            continue
+        old = merged.get(k)
+        if old is None:
+            merged[k] = {"token": t, "ts": ts}
+            added += 1
+        elif ts >= int(old.get("ts") or 0):
+            merged[k] = {"token": t, "ts": ts}
+            updated += 1
+    return merged, added, updated
+
+
+def write_tokens(d):
+    p = token_path()
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    return p
+
+
+def order(s, bundle):
+    r = s.post(API + "/v1/passes/dianshi/order-and-pay",
+               data=json.dumps({"bundle_id": bundle, "period": 1, "time_unit": "m"}), timeout=40)
+    code, msg = "", ""
+    try:
+        j = r.json()
+        code = str(j.get("code") or j.get("error") or "")
+        msg = str(j.get("message") or j.get("msg") or "")
+    except Exception:
+        msg = r.text[:120]
+    return r.status_code, code, msg
+
+
+# ---------------- 任务 ----------------
+class Job(object):
+    def __init__(self, accounts, proxy, mode, interval=1.0, duration=300.0,
+                 use_saved=False, bundle=DEFAULT_BUNDLE, parallel=1,
+                 flow_rush=True, bot_prefix="agent", bot_retry=3, deploy_retry=3,
+                 skip_verify=False):
+        self.accounts = accounts
+        self.proxy = proxy
+        self.mode = mode if mode in MODES else "check"
+        self.interval = float(interval or 1.0)
+        self.duration = float(duration or 300.0)
+        self.use_saved = bool(use_saved)
+        self.bundle = bundle or DEFAULT_BUNDLE
+        self.parallel = max(1, int(parallel or 1))
+        # 全流程参数
+        self.flow_rush = bool(flow_rush)
+        self.bot_prefix = (bot_prefix or "agent").strip() or "agent"
+        self.bot_retry = max(1, int(bot_retry or 1))
+        self.deploy_retry = max(1, int(deploy_retry or 1))
+        self.skip_verify = bool(skip_verify)
+        self.lock = threading.Lock()
+        self.logs = []
+        self.rows = []
+        for a in accounts:
+            self.rows.append({
+                "idx": a["idx"],
+                "login": a.get("login") or a.get("email") or ("#%d" % a["idx"]),
+                "stage": "待处理" if a["ok"] else "格式错误",
+                "detail": a.get("err", ""),
+                "ok": False,
+                "result": "",
+            })
+        self.stop_flag = False
+        self.done = False
+        self.tokens = {}
+        self.started_at = 0.0
+        self.finished_at = 0.0
+        self.summary = ""
+
+    # --- 上报 ---
+    def log(self, msg):
+        with self.lock:
+            self.logs.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+            if len(self.logs) > 4000:
+                del self.logs[:1500]
+
+    def row(self, idx, **kw):
+        with self.lock:
+            for r in self.rows:
+                if r["idx"] == idx:
+                    r.update(kw)
+                    return
+
+    def snapshot(self):
+        with self.lock:
+            return {"logs": list(self.logs), "rows": [dict(r) for r in self.rows],
+                    "done": self.done, "summary": self.summary}
+
+    def stop(self):
+        self.stop_flag = True
+        self.log("⏹ 收到停止指令，正在收尾 ...")
+
+    def _stopped(self):
+        return self.stop_flag
+
+    # --- 单账号 ---
+    def run_one(self, acc):
+        idx = acc["idx"]
+        name = acc.get("login") or acc.get("email") or ("#%d" % idx)
+        tag = "[%d] %s" % (idx, name)
+        px = proxy_of(acc, self.proxy)
+        try:
+            if not acc["ok"]:
+                self.row(idx, stage="格式错误", detail=acc.get("err", ""), ok=False)
+                self.log(tag + " 跳过：" + acc.get("err", ""))
+                return
+            token = ""
+            if self.use_saved:
+                token = self.tokens.get(name) or self.tokens.get(acc.get("email", "")) or ""
+                if not token:
+                    self.row(idx, stage="失败", detail="无已存令牌", ok=False)
+                    self.log(tag + " ❌ 没有已存令牌（请先跑一次预登录）")
+                    return
+                self.log(tag + " 复用已存令牌，跳过登录")
+            else:
+                self.row(idx, stage="登录中", detail="")
+                self.log(tag + " 开始登录 ...")
+                t0 = time.time()
+                token = gh_login(acc["login"], acc["password"], acc["tfa"], px,
+                                 log=lambda m: self.log(tag + m))
+                self.tokens[name] = token
+                self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
+                self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
+
+            s = api_session(token, px)
+            self.row(idx, stage="查订阅", detail="")
+            state, have = probe_token(s)
+            if state == "dead":
+                # ★ 显式令牌检查：401/403 直接判失败，让老大导出失败账号重跑
+                self.log(tag + " ❌ 令牌已失效（401/403）——请去掉「复用已存令牌」重新跑一次预登录")
+                self.row(idx, stage="失败", detail="令牌已失效，需重新登录", ok=False,
+                         result="token_dead")
+                return
+            if state == "unknown":
+                self.log(tag + " ⚠ 查订阅没成功（网络抖动？），按'无订阅'继续尝试")
+            has_pass = bool(have)
+            if has_pass:
+                pid = have[0].get("pass_id", "")
+                bid = have[0].get("bundle_id", "")
+                self.log(tag + " ⭐ 已有订阅：%s %s" % (bid, pid))
+                self.row(idx, stage="已订阅", detail="%s %s" % (bid, pid), ok=True, result="already")
+                if self.mode != "fullflow":
+                    return
+            else:
+                if self.mode == "check":
+                    self.log(tag + " 体检：无订阅（未下单）")
+                    self.row(idx, stage="无订阅", detail="体检未下单", ok=False, result="no_pass")
+                    return
+                if self.mode == "prelogin":
+                    self.log(tag + " 预登录完成，令牌已存")
+                    self.row(idx, stage="已存令牌", detail="Bearer " + token[:12] + "…", ok=True, result="prelogin")
+                    return
+
+            # ---- 抢单（rush 模式；或全流程里勾了「先抢订阅」）----
+            if self.mode == "rush" or (self.mode == "fullflow" and self.flow_rush):
+                if not self._rush(idx, tag, s, has_pass):
+                    return
+            elif self.mode == "fullflow" and not has_pass:
+                self.row(idx, stage="失败", detail="没有订阅且未开启抢单", ok=False, result="no_pass")
+                self.log(tag + " ❌ 没有 0 元订阅；全流程需要先有订阅（可勾选「先抢订阅」）")
+                return
+
+            # ---- 全流程后续：建Bot → 设主模型 → 部署 → 核实 ----
+            if self.mode == "fullflow":
+                self._deploy_flow(idx, tag, token, px)
+        except Exception as e:
+            self.log(tag + " ❌ 失败：%s" % e)
+            self.row(idx, stage="失败", detail=str(e)[:160], ok=False, result="error")
+
+    def _rush(self, idx, tag, s, has_pass):
+        """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。"""
+        if has_pass:
+            return True
+        self.row(idx, stage="抢单中", detail="")
+        self.log(tag + " 开始抢单（间隔 %ss，最长 %ss）..." % (self.interval, self.duration))
+        deadline = time.time() + self.duration
+        n = 0
+        while time.time() < deadline and not self._stopped():
+            n += 1
+            try:
+                st, code, msg = order(s, self.bundle)
+            except Exception as e:
+                if n == 1 or n % 10 == 0:
+                    self.log(tag + " 第 %d 发网络异常，重连重试：%s" % (n, str(e)[:60]))
+                time.sleep(self.interval)
+                continue
+            if 200 <= st < 300:
+                time.sleep(0.8)
+                live = live_passes(s)
+                if live:
+                    pid = live[0].get("pass_id", "")
+                    bid = live[0].get("bundle_id", "")
+                    self.log(tag + " 🎉 抢到！第 %d 发 | %s | pass=%s" % (n, bid, pid))
+                    self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="grabbed")
+                    return True
+                self.log(tag + " 第 %d 发下单成功但未生效，继续 ..." % n)
+                self.row(idx, stage="抢单中", detail="第 %d 发已下单待生效" % n)
+            elif st == 401:
+                self.log(tag + " ❌ 凭证失效(401)")
+                self.row(idx, stage="失败", detail="凭证失效(401)", ok=False, result="error")
+                return False
+            else:
+                if n == 1 or n % 10 == 0:
+                    self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
+                self.row(idx, stage="抢单中", detail="已发 %d 次｜%s" % (n, code or msg))
+            time.sleep(self.interval)
+        if self._stopped():
+            self.row(idx, stage="已停止", detail="用户停止", ok=False, result="stopped")
+            self.log(tag + " 已停止（共 %d 发）" % n)
+        else:
+            self.row(idx, stage="超时未抢到", detail="共 %d 发" % n, ok=False, result="timeout")
+            self.log(tag + " ⏰ 超时未抢到（共 %d 发）" % n)
+        return False
+
+    # ---- 全流程：建Bot → 部署 → 核实（复用已跑通的 Node 引擎）----
+    def _deploy_flow(self, idx, tag, token, px):
+        js = find_purecode()
+        if not js:
+            self.row(idx, stage="失败", detail="缺少 " + PURECODE_JS, ok=False, result="error")
+            self.log(tag + " ❌ 找不到 %s（需与本程序同目录）" % PURECODE_JS)
+            return
+        if not find_node():
+            self.row(idx, stage="失败", detail="缺少 Node 环境", ok=False, result="error")
+            self.log(tag + " ❌ 找不到 node.exe，无法执行建Bot/部署/核实")
+            return
+
+        cred = {"LIGHTVELA_BEARER": token, "LIGHTVELA_NO_AUTOCLOSE": "1"}
+        if px:
+            cred["LIGHTVELA_EGRESS_PROXY"] = json.dumps(proxy_to_json(px), ensure_ascii=False)
+
+        # ① 建 Bot（Node 侧有现成实例会自动复用）
+        self.row(idx, stage="建Bot中", detail="")
+        self.log(tag + " 开始创建机器人 ...")
+        name = "%s-%s" % (self.bot_prefix, idx)
+        bot = ""
+        for attempt in range(1, self.bot_retry + 1):
+            if self._stopped():
+                break
+            try:
+                _, out = run_node(js, ["--create-bot", "--name", name], cred, timeout=300)
+            except Exception as e:
+                out = "ERR " + str(e)
+            m = re.search(r"BOT=([A-Za-z0-9_-]+)\|status=([a-zA-Z]*)", out)
+            if m and m.group(1):
+                bot = m.group(1)
+                self.log(tag + " ✅ 建Bot成功：实例=%s 状态=%s" % (bot, m.group(2) or "?"))
+                break
+            self.log(tag + " 建Bot第 %d/%d 次未成功：%s" % (attempt, self.bot_retry, tail(out, 160)))
+            time.sleep(2)
+        if not bot:
+            self.row(idx, stage="失败", detail="建Bot失败", ok=False, result="error")
+            return
+        self.row(idx, stage="建Bot完成", detail="实例 " + bot)
+
+        # ② 部署（发命令，成功判据 = 回复里含"部署完成，探针服务运行正常"）
+        dep = dict(cred)
+        dep["LIGHTVELA_INSTANCE_ID"] = bot
+        dep["LIGHTVELA_BOT_ID"] = bot
+        self.row(idx, stage="部署中", detail="")
+        self.log(tag + " 发送部署指令（单次最长等 20 分钟）...")
+        ok = False
+        for attempt in range(1, self.deploy_retry + 1):
+            if self._stopped():
+                break
+            try:
+                _, out = run_node(js, ["--message", deploy_msg()], dep, timeout=1260)
+            except subprocess.TimeoutExpired:
+                out = "ERR 部署超时（20 分钟）"
+            except Exception as e:
+                out = "ERR " + str(e)
+            if "RESULT=OK|" in out:
+                ok = True
+                self.log(tag + " ✅ 部署成功（第 %d 次）" % attempt)
+                break
+            self.log(tag + " 部署第 %d/%d 次未成功：%s" % (attempt, self.deploy_retry, tail(out, 160)))
+            time.sleep(3)
+        if not ok:
+            self.row(idx, stage="失败", detail="部署失败", ok=False, result="error")
+            return
+        self.row(idx, stage="已部署", detail="实例 " + bot)
+
+        # ③ 核实（独立连沙箱 shell，不看机器人自己怎么说）
+        if self.skip_verify:
+            self.log(tag + " ⏭ 已按设置跳过「独立核实」（以部署步 RESULT=OK 判成功）")
+            self.row(idx, stage="✅ 完成", detail="部署成功（未二次核实）实例 " + bot, ok=True, result="done")
+            return
+        self.row(idx, stage="核实中", detail="")
+        verified, uuid = False, ""
+        for attempt in range(1, 4):
+            if self._stopped():
+                break
+            time.sleep(2 if attempt == 1 else 5)
+            try:
+                _, out = run_node(js, ["--shell", VERIFY_CMD, "--shell-wait", "15000"], dep, timeout=180)
+            except Exception as e:
+                out = "ERR " + str(e)
+            v_active = bool(re.search(r"(^|\n)active\s*($|\n)", out))
+            v_proc = "yufu-agent" in out
+            v_estab = bool(re.search(r"ESTAB[\s\S]{0,120}19527", out))
+            mu = re.search(r"\n([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", out)
+            uuid = mu.group(1) if mu else ""
+            verified = v_estab and (v_active or v_proc)
+            self.log(tag + " 核实第 %d 次：服务=%s 进程=%s 连面板=%s uuid=%s → %s"
+                     % (attempt, v_active, v_proc, v_estab, uuid or "?", "在线 ✓" if verified else "未通过"))
+            if verified:
+                break
+        if verified:
+            self.row(idx, stage="✅ 完成", detail="已核实在线 uuid=" + (uuid or "?"), ok=True, result="done")
+            self.log(tag + " 🏁 全流程完成：实例 %s 探针在线" % bot)
+        else:
+            self.row(idx, stage="失败", detail="部署完成但未核实到在线", ok=False, result="error")
+
+    def run(self):
+        self.started_at = time.time()
+        self.log("===== 开始 | 账号 %d 个 | 模式 %s | 代理 %s ====="
+                 % (len(self.accounts), MODE_LABEL.get(self.mode, self.mode), self.proxy or "（直连）"))
+        try:
+            if self.parallel > 1 and len(self.accounts) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=self.parallel) as ex:
+                    list(ex.map(self.run_one, self.accounts))
+            else:
+                for a in self.accounts:
+                    if self._stopped():
+                        break
+                    self.run_one(a)
+        except Exception as e:
+            self.log("任务异常：%s" % e)
+        finally:
+            self.save_tokens()
+            ok = sum(1 for r in self.rows if r["ok"])
+            self.summary = "完成：%d/%d 成功（耗时 %.0fs）" % (ok, len(self.rows), time.time() - self.started_at)
+            self.done = True
+            self.log("===== " + self.summary + " =====")
+
+    def save_tokens(self):
+        try:
+            if not self.tokens:
+                return
+            p = token_path()
+            old = {}
+            if os.path.isfile(p):
+                try:
+                    raw = json.load(open(p, encoding="utf-8"))
+                    old = raw if isinstance(raw, dict) else {}
+                except Exception:
+                    old = {}
+            now = int(time.time())
+            for k, v in self.tokens.items():
+                if k and v:
+                    old[k] = {"token": v, "ts": now}
+            write_tokens(old)
+            self.log("令牌已存：%s（共 %d 条）" % (p, len(old)))
+        except Exception as e:
+            self.log("存令牌失败：%s" % e)
+
+    # --- 导出 ---
+    def export_text(self, which):
+        sel = {"all": lambda r: True,
+               "ok": lambda r: r["ok"],
+               "fail": lambda r: not r["ok"]}[which]
+        lines = []
+        for a in self.accounts:
+            row = next((r for r in self.rows if r["idx"] == a["idx"]), None)
+            if row is None or not sel(row):
+                continue
+            if a["ok"]:
+                lines.append(to_line(a))
+        return lines
+
+
+# ---------------- 给界面的门面 ----------------
+class Api(object):
+    """每个方法都 try/except 返回 {'ok':bool,...}，异常不越过桥。"""
+    def __init__(self):
+        self.window = None
+        self.job = None
+        self.thread = None
+        self._last_accounts = []
+
+    # 解析预览
+    def parse(self, text):
+        try:
+            accs = parse_accounts(text)
+            good = [a for a in accs if a["ok"]]
+            return {"ok": True, "total": len(accs), "valid": len(good),
+                    "invalid": len(accs) - len(good),
+                    "sample": [{"idx": a["idx"], "login": a.get("login") or a.get("email") or "",
+                                "ok": a["ok"], "err": a.get("err", "")} for a in accs]}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # 读 txt
+    def read_file(self, path):
+        try:
+            if not path:
+                return {"ok": False, "error": "未选择文件"}
+            if isinstance(path, (list, tuple)):
+                path = path[0]
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return {"ok": True, "text": f.read(), "path": str(path)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # 选文件
+    def pick_file(self):
+        try:
+            import webview
+            res = self.window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False,
+                file_types=("文本文件 (*.txt)", "所有文件 (*.*)"))
+            if not res:
+                return {"ok": False, "error": "已取消"}
+            p = res[0] if isinstance(res, (list, tuple)) else res
+            return self.read_file(p)
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def normalize_proxy(self, ptype, host, port="", user="", pw=""):
+        try:
+            return {"ok": True, "proxy": proxy_from_parts(ptype, host, port, user, pw)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def test_proxy(self, ptype, host, port="", user="", pw=""):
+        try:
+            px = proxy_from_parts(ptype, host, port, user, pw)
+            if not px:
+                return {"ok": False, "error": "请先填写代理地址与端口"}
+            ips = []
+            for _ in range(3):
+                # ★ 每次新建会话 = 新连接，才能看出池子是否轮换
+                s = new_session(px)
+                t = ""
+                for url in ("https://api.ipify.org", "https://icanhazip.com"):
+                    try:
+                        t = s.get(url, timeout=25).text.strip()
+                        if t and len(t) < 40 and "<" not in t:
+                            break
+                    except Exception:
+                        t = ""
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                if t:
+                    ips.append(t)
+            if not ips:
+                return {"ok": False, "error": "没取到出口 IP（代理不通？）"}
+            return {"ok": True, "proxy": px, "ips": ips, "rotate": len(set(ips)) > 1}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def start(self, text, proxy, mode, interval, duration, use_saved,
+              parallel=1, flow_rush=True, bot_prefix="agent",
+              bot_retry=3, deploy_retry=3, skip_verify=False):
+        try:
+            if self.job and not self.job.done:
+                return {"ok": False, "error": "已有任务在跑"}
+            accs = parse_accounts(text)
+            if not accs:
+                return {"ok": False, "error": "没有账号（请粘贴或导入 txt）"}
+            self._last_accounts = accs
+            job = Job(accs, upgrade_socks_scheme(proxy), mode,
+                      interval=interval, duration=duration, use_saved=use_saved,
+                      parallel=parallel, flow_rush=flow_rush, bot_prefix=bot_prefix,
+                      bot_retry=bot_retry, deploy_retry=deploy_retry,
+                      skip_verify=skip_verify)
+            if use_saved:
+                p = token_path()
+                if os.path.isfile(p):
+                    job.tokens = load_tokens()
+                    job.log("已载入 %d 个已存令牌（%s）" % (len(job.tokens), p))
+                else:
+                    job.log("⚠ 没有令牌文件（%s），请先跑一次预登录" % p)
+            self.job = job
+            self.thread = threading.Thread(target=job.run, daemon=True)
+            self.thread.start()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def stop(self):
+        try:
+            if self.job:
+                self.job.stop()
+                return {"ok": True}
+            return {"ok": False, "error": "没有在跑的任务"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def poll(self):
+        try:
+            if not self.job:
+                return {"ok": True, "logs": [], "rows": [], "done": True, "summary": "", "running": False}
+            snap = self.job.snapshot()
+            snap["ok"] = True
+            snap["running"] = not snap["done"]
+            return snap
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                    "logs": [], "rows": [], "done": True, "running": False}
+
+    def export(self, which):
+        try:
+            if not self.job:
+                return {"ok": False, "error": "还没有任务结果"}
+            lines = self.job.export_text(which)
+            if not lines:
+                return {"ok": False, "error": "没有符合条件可导出的账号"}
+            import webview
+            name = {"all": "accounts-all", "ok": "accounts-ok", "fail": "accounts-fail"}[which]
+            res = self.window.create_file_dialog(
+                webview.SAVE_DIALOG, save_filename="%s-%s.txt" % (name, time.strftime("%Y%m%d-%H%M")))
+            if not res:
+                return {"ok": False, "error": "已取消"}
+            p = res[0] if isinstance(res, (list, tuple)) else res
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            return {"ok": True, "path": str(p), "count": len(lines), "text": "\n".join(lines)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def export_text(self, which):
+        try:
+            if not self.job:
+                return {"ok": False, "error": "还没有任务结果"}
+            lines = self.job.export_text(which)
+            if not lines:
+                return {"ok": False, "error": "没有符合条件可导出的账号"}
+            return {"ok": True, "count": len(lines), "text": "\n".join(lines)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # ---------------- 凭证（令牌库）导出 / 导入 ----------------
+    def tokens_info(self):
+        try:
+            p = token_path()
+            d = load_tokens()
+            return {"ok": True, "count": len(d), "path": p,
+                    "exists": os.path.isfile(p)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def export_tokens(self):
+        try:
+            p = token_path()
+            if not os.path.isfile(p):
+                return {"ok": False, "error": "还没有凭证文件（%s）" % p}
+            raw = json.load(open(p, encoding="utf-8"))
+            if not isinstance(raw, dict) or not raw:
+                return {"ok": False, "error": "凭证文件是空的"}
+            import webview
+            res = self.window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename="lv-tokens-%s.json" % time.strftime("%Y%m%d-%H%M"))
+            if not res:
+                return {"ok": False, "error": "已取消"}
+            dst = res[0] if isinstance(res, (list, tuple)) else res
+            with open(dst, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            return {"ok": True, "path": str(dst), "count": len(raw)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def import_tokens(self):
+        """导入凭证：与本地【合并】，同一账号【时间新的赢】。"""
+        try:
+            import webview
+            res = self.window.create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False,
+                file_types=("凭证文件 (*.json)", "所有文件 (*.*)"))
+            if not res:
+                return {"ok": False, "error": "已取消"}
+            src = res[0] if isinstance(res, (list, tuple)) else res
+            with open(src, "r", encoding="utf-8", errors="replace") as f:
+                incoming = json.load(f)
+            if not isinstance(incoming, dict):
+                return {"ok": False, "error": "文件格式不对（应该是一个 JSON 对象）"}
+            local = {}
+            p = token_path()
+            if os.path.isfile(p):
+                try:
+                    local = json.load(open(p, encoding="utf-8")) or {}
+                except Exception:
+                    local = {}
+            merged, added, updated = merge_tokens(local, incoming)
+            if not merged:
+                return {"ok": False, "error": "这份文件里没有可用的凭证"}
+            write_tokens(merged)
+            return {"ok": True, "path": str(src), "added": added,
+                    "updated": updated, "total": len(merged)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}

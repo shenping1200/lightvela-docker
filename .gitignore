@@ -1,0 +1,30 @@
+# ===== 数据 / 密钥（绝对不能提交）=====
+.env
+data/
+data/*
+*.env
+!.env.example
+
+# ===== 本地验证产物（与项目无关）=====
+_shots/
+_uicheck.js
+
+# ===== Python 垃圾 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 编辑器 / 系统垃圾 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# ===== 含真实令牌/地址的部署文案（只提交 .example 模板）=====
+_deploy_msg.txt
+
+# ===== 脱敏前的部署说明（README 已覆盖）=====
+部署说明.md
