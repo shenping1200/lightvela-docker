@@ -80,7 +80,8 @@ def token_path():
 .
 ├── Dockerfile              # 镜像定义（node:22-slim + python3 venv）
 ├── docker-compose.yml      # 编排（端口 / 数据盘 / 健康检查）
-├── deploy.sh               # ★ 一键部署脚本（含密码设置）
+├── install.sh              # ★ 一行命令安装入口（从 GitHub 拉代码并调用 deploy.sh）
+├── deploy.sh               # ★ 一键部署脚本（含端口/密码交互设置）
 ├── .env.example            # 环境变量模板（复制成 .env 用）
 ├── requirements.txt        # Python 依赖
 │
@@ -100,36 +101,57 @@ def token_path():
 
 ## 一键部署
 
-在服务器上把项目传上去，然后：
+### 方式 A：一行命令（推荐，连代码都不用先传）
+
+在**新服务器**上直接执行这一行，**全自动**：装 Docker → 从 GitHub 拉代码 → 问你端口和密码 → 构建启动 → 打印访问地址。
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/shenping1200/lightvela-docker/main/install.sh)
+```
+
+运行时会交互询问（直接回车即用默认值）：
+
+```
+请输入对外端口（直接回车用默认 18080）：
+请设置面板登录密码（直接回车用默认密码 QQqq120656387.）：
+```
+
+> 默认密码 `QQqq120656387.` 是公开的，正式用建议自己设一个。
+
+### 方式 B：已经把项目放到服务器上了
+
+```bash
+cd lightvela-docker
 bash deploy.sh
 ```
 
-脚本会自动：
+`deploy.sh` 会自动：
 
-1. 检查 Docker / docker compose（Debian/Ubuntu 上没装会尝试自动装）
-2. 生成 `.env`（写入登录密码 + 随机签名密钥，权限 600）
-3. 放行防火墙端口（ufw / firewalld / iptables 都支持）
-4. 构建镜像并启动容器
-5. 自检并打印访问地址和密码
+1. 检查 / 安装 Docker 与 docker compose（Debian/Ubuntu 没装会尝试自动装）
+2. 拉取 / 更新项目代码（如果是 git 仓库则 `pull`，否则从 GitHub 克隆）
+3. 交互询问端口与面板登录密码（也可环境变量免交互指定）
+4. 生成 `.env`（写入登录密码 + 随机签名密钥，权限 600）
+5. 放行防火墙端口（ufw / firewalld / iptables 都支持）
+6. 构建镜像并启动容器
+7. 自检并打印访问地址和密码
 
-**指定密码（免交互）：**
+**免交互指定密码 / 端口：**
 
 ```bash
 LV_WEB_PASSWORD='你的密码' bash deploy.sh
-```
-
-**顺便换端口：**
-
-```bash
 LV_PORT=8080 LV_WEB_PASSWORD='你的密码' bash deploy.sh
 ```
 
-**改密码（部署之后）：**
+**只更新代码不重新部署：**
 
 ```bash
-LV_WEB_PASSWORD='新密码' bash deploy.sh
+PULL_ONLY=1 bash deploy.sh
+```
+
+**换仓库 / 安装目录：**
+
+```bash
+REPO_URL=https://github.com/you/repo.git TARGET_DIR=/opt/xxx bash deploy.sh
 ```
 
 > `.env` 里的 `LV_SECRET` 是登录 cookie 的签名密钥，**改了会让所有已登录的设备掉线**，脚本会保留原值不覆盖。
