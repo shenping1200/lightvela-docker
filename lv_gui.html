@@ -25,8 +25,13 @@
   .spacer{flex:1}
   main{display:flex;gap:12px;padding:12px;height:calc(100vh - 45px)}
   .col{display:flex;flex-direction:column;gap:12px;min-height:0}
-  .col.left{width:400px;flex:none;overflow-y:auto;overflow-x:hidden}
+  .col.left{flex:0 0 var(--left-w,460px);width:var(--left-w,460px);max-width:68vw;overflow-y:auto;overflow-x:hidden}
   .col.right{flex:1;min-width:0}
+  .splitter{flex:none;width:8px;margin:0 -2px;align-self:stretch;cursor:col-resize;border-radius:6px;
+    background:linear-gradient(to right,transparent 3px,var(--line2) 3px,var(--line2) 5px,transparent 5px)}
+  .splitter:hover{background:linear-gradient(to right,transparent 3px,var(--blue) 3px,var(--blue) 5px,transparent 5px)}
+  body.resizing{cursor:col-resize}
+  body.resizing *{user-select:none!important}
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;
     display:flex;flex-direction:column;min-height:0;flex:none}
   .card h2{font-size:13px;font-weight:500;margin:0 0 8px;color:var(--tx);
@@ -46,6 +51,11 @@
     gap:6px 8px;align-items:center;margin-bottom:8px}
   .pgrid label{color:var(--tx2);font-size:12px}
   .pgrid input{width:100%;min-width:0}
+  .mrow{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .mrow .grp{display:flex;align-items:center;gap:6px;white-space:nowrap}
+  .mrow .grp>label{color:var(--tx2);font-size:12px}
+  .mrow .grp>input[type=number]{width:64px}
+  .mrow .unit{color:var(--tx3);font-size:12px;white-space:nowrap}
   .btn{border:1px solid var(--line2);background:#fff;color:var(--tx);border-radius:8px;
     padding:6px 12px;font-size:13px;cursor:pointer;white-space:nowrap}
   .btn:hover{border-color:var(--blue);color:var(--blue)}
@@ -104,7 +114,7 @@
 </header>
 
 <main>
-  <div class="col left">
+  <div class="col left" id="colLeft">
     <div class="card" style="flex:1;min-height:212px">
       <h2>账号 <span class="sub">邮箱----密码----用户名----2FA----创建时间</span></h2>
       <textarea id="acc" spellcheck="false" placeholder="每行一个账号：
@@ -179,6 +189,38 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
     </div>
 
     <div class="card">
+      <h2>放货监控 <span class="sub" id="monStat">未启动</span></h2>
+      <div class="mrow">
+        <div class="grp">
+          <label>轮询间隔</label>
+          <input type="number" id="monInterval" value="5" min="1" max="600" step="1">
+          <span class="unit">秒 / 轮</span>
+        </div>
+        <div class="grp">
+          <label>并发</label>
+          <input type="number" id="monParallel" value="1" min="1" max="50" step="1">
+          <span class="unit">个 / 批</span>
+        </div>
+      </div>
+      <div class="bar">
+        <button class="btn primary" id="btnMonStart">▶ 启动监控</button>
+        <button class="btn danger" id="btnMonStop" disabled>■ 停止</button>
+        <span class="stat" id="monPhase"></span>
+      </div>
+      <div class="hint" id="monHint">启动后用<b>导入列表的第一个账号</b>做登录检测；通过后按「轮询间隔」轮询套餐状态。一旦 <code>bundle_launch_ai_01</code> 从售罄变可购买，立即按「并发」数对<b>全部导入账号</b>（含第一个）并发 注册→存凭证→买 0 元；并发留空则沿用「参数」里的并发。批量中若再售罄，自动停剩余并标记「售罄跳过」。</div>
+    </div>
+
+    <div class="card">
+      <h2>部署命令 <span class="sub" id="depStat">读取中…</span></h2>
+      <textarea id="deployMsg" spellcheck="false" placeholder="把要发给机器人的部署指令原文粘到这里（例如 yufu-probe 的一行安装命令 + 说明）。点「保存并生效」后，全流程部署时会原样发送这段内容。"></textarea>
+      <div class="bar" style="margin-top:8px">
+        <button class="btn primary sm" id="btnDepSave">保存并生效</button>
+        <button class="btn sm" id="btnDepReset">恢复默认</button>
+      </div>
+      <div class="hint">全流程模式 / 放货监控抢到后，程序会把这段文本<b>原样发给机器人</b>执行。保存后<b>立即生效、无需重启</b>；内容存于服务器数据盘，容器重建也不会丢。</div>
+    </div>
+
+    <div class="card">
       <div class="bar">
         <button class="btn primary" id="btnStart">▶ 开始</button>
         <button class="btn danger" id="btnStop" disabled>■ 停止</button>
@@ -202,12 +244,14 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
     </div>
   </div>
 
+  <div class="splitter" id="splitter" title="拖动调整左右宽度，双击复位"></div>
+
   <div class="col right">
     <div class="card" style="flex:none;max-height:44%">
       <h2>账号状态 <span class="sub" id="rowCount"></span></h2>
       <div id="rowsWrap">
         <table>
-          <thead><tr><th style="width:38px">#</th><th style="width:170px">账号</th><th style="width:96px">状态</th><th>详情</th></tr></thead>
+          <thead><tr><th style="width:34px">#</th><th style="width:150px">账号</th><th style="width:84px">状态</th><th>详情</th></tr></thead>
           <tbody id="rows"><tr><td colspan="4" style="color:var(--tx3);padding:14px">还没有任务。填好账号后点「开始」。</td></tr></tbody>
         </table>
       </div>
@@ -290,7 +334,7 @@ function stageTag(stage, ok) {
   let cls = 't-wait';
   if (good.indexOf(stage) >= 0 || ok) cls = 't-ok';
   else if (run.indexOf(stage) >= 0) cls = 't-run';
-  else if (stage === '格式错误') cls = 't-warn';
+  else if (stage === '格式错误' || stage === '售罄跳过') cls = 't-warn';
   else if (['失败','超时未抢到','已停止','无订阅'].indexOf(stage) >= 0) cls = 't-bad';
   return '<span class="tag ' + cls + '">' + esc(stage) + '</span>';
 }
@@ -376,10 +420,8 @@ async function doTestProxy() {
 }
 async function doStart() {
   await doParse();
-  const nm = await API.normalize_proxy($('pType').value, $('pHost').value.trim(),
-                                       $('pPort').value.trim(), $('pUser').value.trim(),
-                                       $('pPass').value.trim());
-  const r = await API.start($('acc').value, (nm && nm.proxy) || '', $('mode').value,
+  const proxy = await proxyArg();
+  const r = await API.start($('acc').value, proxy, $('mode').value,
                             parseFloat($('interval').value) || 1,
                             parseFloat($('duration').value) || 300,
                             $('useSaved').checked,
@@ -394,6 +436,58 @@ async function doStart() {
   setStatus('运行中…', false);
 }
 async function doStop() { await API.stop(); }
+
+/* 把当前代理输入拼成后端要的 proxy 字符串 */
+async function proxyArg() {
+  const nm = await API.normalize_proxy($('pType').value, $('pHost').value.trim(),
+                                       $('pPort').value.trim(), $('pUser').value.trim(),
+                                       $('pPass').value.trim());
+  return (nm && nm.proxy) || '';
+}
+
+/* ---------- 放货监控 ---------- */
+async function doMonStart() {
+  await doParse();
+  const proxy = await proxyArg();
+  const r = await API.monitor_start($('acc').value, proxy,
+                                    parseInt($('monInterval').value, 10) || 5,
+                                    parseInt($('monParallel').value, 10) || parseInt($('parallel').value, 10) || 1);
+  if (!r || !r.ok) { appendLog(['[监控] ✗ 启动失败：' + (r && r.error)]); return; }
+  running = true;
+  $('log').textContent = ''; logLen = 0;
+  $('btnMonStart').disabled = true; $('btnMonStop').disabled = false;
+  $('btnStart').disabled = true; $('btnStop').disabled = true;
+  $('monStat').textContent = '运行中';
+  setStatus('监控中…', false);
+  if (!pollTimer) pollTimer = setInterval(poll, 700);
+}
+async function doMonStop() {
+  const r = await API.monitor_stop();
+  appendLog(['[监控] 已发送停止指令' + ((r && r.ok) ? '' : ('（' + (r && r.error) + '）'))]);
+}
+
+/* ---------- 部署命令（全流程 / 抢到后原样发给机器人）---------- */
+async function loadDeployMsg() {
+  const r = await API.deploy_msg_get();
+  if (!r || !r.ok) { $('depStat').textContent = '读取失败'; return; }
+  $('deployMsg').value = r.text || '';
+  $('depStat').textContent = r.saved ? '已保存' : '默认模板';
+}
+async function doDepSave() {
+  const r = await API.deploy_msg_set($('deployMsg').value);
+  if (!r || !r.ok) { appendLog(['[部署命令] ✗ ' + (r && r.error)]); return; }
+  $('depStat').textContent = '已保存';
+  appendLog(['[部署命令] ✓ 已保存并生效（' + r.len + ' 字）']);
+}
+async function doDepReset() {
+  if (!confirm('恢复默认部署命令？当前保存的内容会被清除。')) return;
+  const r = await API.deploy_msg_reset();
+  if (!r || !r.ok) { appendLog(['[部署命令] ✗ ' + (r && r.error)]); return; }
+  $('deployMsg').value = r.text || '';
+  $('depStat').textContent = '默认模板';
+  appendLog(['[部署命令] 已恢复默认']);
+}
+
 async function doExport(which) {
   const r = await API.export_text(which);
   if (!r || !r.ok) { appendLog(['[导出] ✗ ' + (r && r.error)]); return; }
@@ -448,14 +542,72 @@ async function poll() {
   const s = await API.poll();
   if (!s || !s.ok) return;
   if (s.logs && s.logs.length > logLen) { appendLog(s.logs.slice(logLen)); logLen = s.logs.length; }
-  renderRows(s.rows);
+  // 监控阶段（放货前）显示占位提示；触发后显示账号表格
+  if (s.monitor && s.monitor.running && (!s.rows || !s.rows.length)) {
+    $('rows').innerHTML = '<tr><td colspan="4" style="color:var(--tx3);padding:14px">监控轮询中：等待 <b>' +
+      esc(s.monitor.bundle || '目标套餐') + '</b> 放货（当前状态：<b>' + esc(s.monitor.last_state || '?') + '</b>）…</td></tr>';
+    $('rowCount').textContent = '';
+  } else {
+    renderRows(s.rows);
+  }
+  // 监控状态条
+  if (s.monitor) {
+    const m = s.monitor;
+    const phaseMap = {idle: '空闲', detect: '① 检测首号', polling: '② 轮询中', rushing: '③ 抢单中', done: '④ 已完成'};
+    $('monStat').textContent = m.running ? '运行中' : '已结束';
+    $('monPhase').innerHTML = '阶段：<b>' + (phaseMap[m.phase] || m.phase) + '</b> · 目标包：<b>' +
+      esc(m.last_state || '?') + '</b>' + (m.last_check ? ' · 最近检测 ' + new Date(m.last_check * 1000).toLocaleTimeString() : '');
+    if (m.running) {
+      $('btnMonStart').disabled = true; $('btnMonStop').disabled = false;
+      $('btnStart').disabled = true; $('btnStop').disabled = true;
+    } else {
+      $('btnMonStart').disabled = false; $('btnMonStop').disabled = true;
+      $('btnStart').disabled = false; $('btnStop').disabled = true;
+    }
+  }
   if (s.done) {
-    running = false; $('btnStart').disabled = false; $('btnStop').disabled = true;
+    running = false;
+    $('btnStart').disabled = false; $('btnStop').disabled = true;
+    $('btnMonStart').disabled = false; $('btnMonStop').disabled = true;
     setStatus('已完成', true);
     $('summary').textContent = s.summary || '';
     clearInterval(pollTimer); pollTimer = null;
     doTkInfo();
   }
+}
+
+/* ---------- 左右栏拖动分隔条 ---------- */
+function setLeftWidth(px) {
+  const max = Math.max(320, Math.min(window.innerWidth - 340, 1100));
+  px = Math.max(320, Math.min(max, px));
+  document.documentElement.style.setProperty('--left-w', px + 'px');
+  try { localStorage.setItem('lv_left_w', String(px)); } catch (e) {}
+}
+function initSplitter() {
+  try {
+    const saved = parseInt(localStorage.getItem('lv_left_w') || '', 10);
+    if (saved) setLeftWidth(saved);
+  } catch (e) {}
+  const sp = $('splitter');
+  if (!sp) return;
+  sp.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startX = e.clientX, startW = $('colLeft').getBoundingClientRect().width;
+    document.body.classList.add('resizing');
+    const move = ev => setLeftWidth(startW + (ev.clientX - startX));
+    const up = () => {
+      document.body.classList.remove('resizing');
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  });
+  sp.addEventListener('dblclick', () => setLeftWidth(460));
+  window.addEventListener('resize', () => {
+    const w = $('colLeft').getBoundingClientRect().width;
+    if (w) setLeftWidth(w);
+  });
 }
 
 /* ---------- 启动 ---------- */
@@ -467,6 +619,8 @@ function boot() {
   $('btnTest').onclick = doTestProxy;
   $('btnStart').onclick = () => { doStart(); if (!pollTimer) pollTimer = setInterval(poll, 700); };
   $('btnStop').onclick = doStop;
+  $('btnMonStart').onclick = () => { doMonStart(); if (!pollTimer) pollTimer = setInterval(poll, 700); };
+  $('btnMonStop').onclick = doMonStop;
   $('btnExpAll').onclick = () => doExport('all');
   $('btnExpOk').onclick = () => doExport('ok');
   $('btnExpFail').onclick = () => doExport('fail');
@@ -476,11 +630,15 @@ function boot() {
   $('btnTkDelOne').onclick = doTkDelOne;
   $('btnTkDelAll').onclick = doTkDelAll;
   $('btnLogout').onclick = doLogout;
+  $('btnDepSave').onclick = doDepSave;
+  $('btnDepReset').onclick = doDepReset;
   $('acc').addEventListener('input', doParse);
   $('mode').addEventListener('change', syncMode);
   syncMode();
   doParse();
   doTkInfo();
+  loadDeployMsg();
+  initSplitter();
 }
 /* 登录按钮必须在"未登录"时也绑上（不能放进 boot，否则登录页点不动） */
 function wireLogin() {

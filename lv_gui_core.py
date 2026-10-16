@@ -205,17 +205,56 @@ def find_purecode():
     return p if os.path.isfile(p) else ""
 
 
+def deploy_msg_path():
+    """部署指令文件位置：优先【数据目录】（Docker 版挂载盘 /data，界面保存到这里，
+    容器重建也不丢）；未设 LV_DATA_DIR 时退回程序目录（桌面版）。"""
+    d = os.environ.get("LV_DATA_DIR") or app_dir()
+    return os.path.join(d, DEPLOY_MSG_FILE)
+
+
+def _read_text_file(p):
+    try:
+        t = open(p, encoding="utf-8").read().strip()
+        return t or ""
+    except Exception:
+        return ""
+
+
 def deploy_msg():
-    """优先读同目录 _deploy_msg.txt，没有就用内嵌默认值。"""
-    p = os.path.join(app_dir(), DEPLOY_MSG_FILE)
-    if os.path.isfile(p):
+    """取当前生效的部署指令：
+    ① 数据目录的 _deploy_msg.txt（界面「保存并生效」写这里）
+    ② 程序目录的 _deploy_msg.txt（桌面版兼容）
+    ③ 都没有 → 内嵌默认模板。"""
+    for p in (deploy_msg_path(), os.path.join(app_dir(), DEPLOY_MSG_FILE)):
+        t = _read_text_file(p)
+        if t:
+            return t
+    return DEPLOY_MSG_DEFAULT
+
+
+def save_deploy_msg(text):
+    """把界面里的部署指令原文写入数据目录，返回落盘路径。"""
+    p = deploy_msg_path()
+    d = os.path.dirname(p)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write((text or "").strip() + "\n")
+    return p
+
+
+def reset_deploy_msg():
+    """删掉界面保存的【数据目录覆盖文件】，回到程序目录文件或内嵌默认模板。
+    只动 LV_DATA_DIR 下的覆盖文件（不碰程序目录里用户自带的 _deploy_msg.txt）。"""
+    d = os.environ.get("LV_DATA_DIR")
+    if d:
+        p = os.path.join(d, DEPLOY_MSG_FILE)
         try:
-            t = open(p, encoding="utf-8").read().strip()
-            if t:
-                return t
+            if os.path.isfile(p):
+                os.remove(p)
         except Exception:
             pass
-    return DEPLOY_MSG_DEFAULT
+    return deploy_msg()
 
 
 def tail(text, n=200):
@@ -455,6 +494,30 @@ def order(s, bundle):
     return r.status_code, code, msg
 
 
+def fetch_bundles(proxy_url, token=None):
+    """GET /v1/bundles → 返回套餐列表（失败返回 []）。token 可选（带则鉴权）。"""
+    s = api_session(token, proxy_url) if token else new_session(proxy_url)
+    try:
+        r = s.get(API + "/v1/bundles", timeout=40)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []
+    try:
+        d = r.json().get("data", {})
+        return d.get("bundles") or d.get("items") or []
+    except Exception:
+        return []
+
+
+def bundle_state(proxy_url, bundle_id=DEFAULT_BUNDLE, token=None):
+    """返回目标包的 bundle_sales_state（'AVAILABLE'/'SOLD_OUT'/...），取不到返回 None。"""
+    for b in fetch_bundles(proxy_url, token):
+        if b.get("bundle_id") == bundle_id:
+            return b.get("bundle_sales_state")
+    return None
+
+
 # ---------------- 任务 ----------------
 class Job(object):
     def __init__(self, accounts, proxy, mode, interval=1.0, duration=300.0,
@@ -469,6 +532,10 @@ class Job(object):
         self.use_saved = bool(use_saved)
         self.bundle = bundle or DEFAULT_BUNDLE
         self.parallel = max(1, int(parallel or 1))
+        # 监控批次专用开关
+        self.abort_if_soldout = False   # 一旦售罄立即终止后续账号
+        self.saved_fallback = False     # use_saved 但缺令牌时退回登录（而非失败）
+        self.soldout_flag = False       # 批次内售罄标记（一旦置位，后续账号跳过）
         # 全流程参数
         self.flow_rush = bool(flow_rush)
         self.bot_prefix = (bot_prefix or "agent").strip() or "agent"
@@ -520,6 +587,17 @@ class Job(object):
     def _stopped(self):
         return self.stop_flag
 
+    def _mark_soldout_skip(self, idx):
+        """监控批次：标记售罄跳过 + 终止后续账号（置 soldout_flag 并停任务）。"""
+        with self.lock:
+            self.soldout_flag = True
+        try:
+            self.stop()
+        except Exception:
+            pass
+        self.row(idx, stage="售罄跳过", detail="放开后又售罄，已自动终止", ok=False, result="soldout_skip")
+        self.log("[%d] 🛑 售罄：已终止后续账号并标记跳过" % idx)
+
     # --- 单账号 ---
     def run_one(self, acc):
         idx = acc["idx"]
@@ -530,6 +608,11 @@ class Job(object):
             if not acc["ok"]:
                 self.row(idx, stage="格式错误", detail=acc.get("err", ""), ok=False)
                 self.log(tag + " 跳过：" + acc.get("err", ""))
+                return
+            # 监控批次：前面账号已确认售罄 → 后续账号直接跳过，不再浪费请求
+            if self.soldout_flag or self._stopped():
+                self.row(idx, stage="售罄跳过", detail="已终止（售罄/停止）", ok=False, result="soldout_skip")
+                self.log(tag + " ⏭ 售罄/已停止，跳过")
                 return
             token = ""
             if self.use_saved:
@@ -598,6 +681,13 @@ class Job(object):
         """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。"""
         if has_pass:
             return True
+        # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
+        if self.abort_if_soldout:
+            st0 = bundle_state(self.proxy, self.bundle)
+            if st0 == "SOLD_OUT":
+                self.log(tag + " 🛑 放开后又售罄，终止本账号")
+                self._mark_soldout_skip(idx)
+                return False
         self.row(idx, stage="抢单中", detail="")
         self.log(tag + " 开始抢单（间隔 %ss，最长 %ss）..." % (self.interval, self.duration))
         deadline = time.time() + self.duration
@@ -627,6 +717,11 @@ class Job(object):
                 self.row(idx, stage="失败", detail="凭证失效(401)", ok=False, result="error")
                 return False
             else:
+                # 监控批次：下单失败且已回售罄 → 立即终止后续账号
+                if self.abort_if_soldout and bundle_state(self.proxy, self.bundle) == "SOLD_OUT":
+                    self.log(tag + " 🛑 下单失败且已售罄，终止本账号")
+                    self._mark_soldout_skip(idx)
+                    return False
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
                 self.row(idx, stage="抢单中", detail="已发 %d 次｜%s" % (n, code or msg))
@@ -796,6 +891,146 @@ class Job(object):
         return lines
 
 
+# ---------------- 放货监控 ----------------
+class Monitor(object):
+    """后台监控线程：启动检测首号 → 轮询 bundles 状态 → 放货触发并发批次。
+
+    流程严格按需求：
+      1) 拿导入列表【第一个账号】做 GitHub 授权登录 + 凭证检测（确认流程可用才继续）；
+      2) 通过后用 interval 秒轮询 GET /v1/bundles，盯 bundle_launch_ai_01 的
+         bundle_sales_state 从 SOLD_OUT 翻 AVAILABLE；
+      3) 一放货，按并发数对【全部导入账号】（含第一个）并发跑 注册→存凭证→买 0 元；
+      4) 批量中一旦再售罄，立即停剩余账号并打"售罄跳过"标记。
+    """
+
+    def __init__(self, accounts, proxy, interval_sec, parallel, api):
+        self.accounts = accounts
+        self.proxy = proxy
+        self.interval = max(1, int(interval_sec or 5))
+        self.parallel = max(1, int(parallel or 1))
+        self.api = api                      # 引用 Api，便于把批次挂到 api.job 供 UI 显示
+        self.lock = threading.Lock()
+        self.logs = []
+        self.stop_flag = False
+        self.done = False
+        self.phase = "idle"                 # idle→detect→polling→rushing→done
+        self.last_state = None
+        self.last_check = 0.0
+        self.summary = ""
+        self.first_token = ""
+
+    # --- 日志（与 Job 同款）---
+    def log(self, msg):
+        with self.lock:
+            self.logs.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+            if len(self.logs) > 4000:
+                del self.logs[:1500]
+
+    def stop(self):
+        self.stop_flag = True
+        self.log("⏹ 收到停止指令")
+        # 若已进入批量阶段，顺便停掉批次任务
+        try:
+            if self.api and self.api.job:
+                self.api.job.stop()
+        except Exception:
+            pass
+
+    def _stopped(self):
+        return self.stop_flag
+
+    # --- 阶段 1：首号登录检测 ---
+    def _detect_first(self):
+        acc = self.accounts[0]
+        tag = "[监控·首号] %s" % (acc.get("login") or acc.get("email") or "#1")
+        if not acc["ok"]:
+            self.log(tag + " ❌ 第一个账号格式错误：" + acc.get("err", ""))
+            return False
+        self.log(tag + " 启动检测：开始 GitHub 授权登录 ...")
+        px = proxy_of(acc, self.proxy)
+        t0 = time.time()
+        try:
+            token = gh_login(acc["login"], acc["password"], acc["tfa"], px,
+                             log=lambda m: self.log(tag + m))
+        except Exception as e:
+            self.log(tag + " ❌ 登录异常：%s" % e)
+            return False
+        if not token:
+            self.log(tag + " ❌ 登录失败（未拿到凭证）")
+            return False
+        self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
+        # 检测凭证是否可用（probe_token 看是否 dead）
+        s = api_session(token, px)
+        state, have = probe_token(s)
+        if state == "dead":
+            self.log(tag + " ❌ 凭证失效（401/403），流程不可用")
+            return False
+        self.log(tag + " ✅ 凭证可用（订阅状态=%s）" % (state or "unknown"))
+        self.first_token = token
+        return True
+
+    # --- 主循环 ---
+    def run(self):
+        self.log("===== 监控启动 | 账号 %d 个 | 间隔 %ds | 并发 %d | 目标 %s ====="
+                 % (len(self.accounts), self.interval, self.parallel, DEFAULT_BUNDLE))
+        try:
+            # 阶段 1：首号检测
+            self.phase = "detect"
+            if not self._detect_first():
+                self.summary = "启动检测失败：首号无法注册/凭证不可用"
+                self.log("❌ " + self.summary)
+                self.done = True
+                return
+            self.log("✅ 启动检测通过，开始轮询 bundles 状态 ...")
+
+            # 阶段 2：轮询
+            self.phase = "polling"
+            triggered = False
+            while not self._stopped():
+                self.last_check = time.time()
+                st = bundle_state(self.proxy, DEFAULT_BUNDLE)
+                self.last_state = st
+                self.log("轮询：%s = %s" % (DEFAULT_BUNDLE, st))
+                if st == "AVAILABLE":
+                    self.log("🎯 检测到可购买（AVAILABLE），触发批量抢单！")
+                    triggered = True
+                    break
+                # 可被打断地等待 interval 秒
+                for _ in range(int(self.interval)):
+                    if self._stopped():
+                        break
+                    time.sleep(1)
+            if self._stopped() and not triggered:
+                self.summary = "监控已手动停止（尚未放货）"
+                self.log(self.summary)
+                self.done = True
+                return
+
+            # 阶段 3：触发并发批次（全部导入账号，含第一个）
+            self.phase = "rushing"
+            self.log("===== 触发批量：对全部 %d 个导入账号并发 注册→存凭证→买0元 ====="
+                     % len(self.accounts))
+            job = Job(self.accounts, self.proxy, "rush",
+                      interval=1.0, duration=600.0, use_saved=False,
+                      bundle=DEFAULT_BUNDLE, parallel=self.parallel,
+                      abort_if_soldout=True)
+            # 挂到 api.job，UI 的 poll() 会自动渲染表格与日志
+            self.api.job = job
+            threading.Thread(target=job.run, daemon=True).start()
+            # 等批次跑完（monitor 线程本就是后台）
+            while not self._stopped() and not job.done:
+                time.sleep(0.5)
+            self.phase = "done"
+            ok = sum(1 for r in job.rows if r["ok"])
+            self.summary = "放货批量完成：%d/%d 成功（监控结束）" % (ok, len(job.rows))
+            self.log("===== " + self.summary + " =====")
+        except Exception as e:
+            self.log("监控异常：%s" % e)
+            self.summary = "监控异常：" + str(e)
+        finally:
+            self.done = True
+
+
 # ---------------- 给界面的门面 ----------------
 class Api(object):
     """每个方法都 try/except 返回 {'ok':bool,...}，异常不越过桥。"""
@@ -803,6 +1038,8 @@ class Api(object):
         self.window = None
         self.job = None
         self.thread = None
+        self.monitor = None
+        self.thread_mon = None
         self._last_accounts = []
 
     # 解析预览
@@ -916,8 +1153,93 @@ class Api(object):
         except Exception as e:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
+    # ---------------- 放货监控 ----------------
+    def monitor_start(self, text, proxy, interval, parallel):
+        try:
+            if self.monitor and not self.monitor.done:
+                return {"ok": False, "error": "监控已在运行"}
+            if self.job and not self.job.done:
+                return {"ok": False, "error": "已有任务在跑，请先停止"}
+            accs = parse_accounts(text)
+            if not accs:
+                return {"ok": False, "error": "没有账号（请粘贴或导入 txt）"}
+            self.job = None   # 清掉上一次批次残留，避免轮询阶段显示旧表格
+            self.monitor = Monitor(accs, upgrade_socks_scheme(proxy), interval, parallel, self)
+            self.thread_mon = threading.Thread(target=self.monitor.run, daemon=True)
+            self.thread_mon.start()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def monitor_stop(self):
+        try:
+            if self.monitor and not self.monitor.done:
+                self.monitor.stop()
+                return {"ok": True}
+            return {"ok": False, "error": "没有运行中的监控"}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def monitor_status(self):
+        try:
+            if not self.monitor:
+                return {"ok": True, "running": False, "active": False}
+            m = self.monitor
+            return {"ok": True, "running": not m.done, "active": True,
+                    "phase": m.phase, "last_state": m.last_state,
+                    "last_check": m.last_check, "summary": m.summary, "done": m.done}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # ---------------- 部署指令（界面可编辑，全流程部署时发送给机器人）----------------
+    def deploy_msg_get(self):
+        try:
+            p = deploy_msg_path()
+            return {"ok": True, "text": deploy_msg(),
+                    "path": p, "saved": os.path.isfile(p)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def deploy_msg_set(self, text):
+        try:
+            t = (text or "").strip()
+            if not t:
+                return {"ok": False, "error": "部署命令不能为空"}
+            p = save_deploy_msg(t)
+            return {"ok": True, "path": p, "len": len(t)}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def deploy_msg_reset(self):
+        try:
+            return {"ok": True, "text": reset_deploy_msg()}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
     def poll(self):
         try:
+            # 监控优先：有监控在跑（或刚跑完、留着批次结果），展示监控视图
+            if self.monitor and (not self.monitor.done or self.job):
+                m = self.monitor
+                job = self.job
+                logs = list(m.logs)
+                rows = []
+                running = not m.done
+                if job:
+                    logs = logs + list(job.logs)
+                    rows = [dict(r) for r in job.rows]
+                    running = running or (not job.done)
+                return {"ok": True,
+                        "logs": logs, "rows": rows,
+                        "running": running,
+                        "done": (m.done and (not job or job.done)),
+                        "summary": (job.summary if job else m.summary),
+                        "monitor": {"running": not m.done, "phase": m.phase,
+                                    "last_state": m.last_state,
+                                    "last_check": m.last_check,
+                                    "summary": m.summary,
+                                    "bundle": DEFAULT_BUNDLE}}
+            # 无监控：走原逻辑
             if not self.job:
                 return {"ok": True, "logs": [], "rows": [], "done": True, "summary": "", "running": False}
             snap = self.job.snapshot()
