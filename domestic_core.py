@@ -343,6 +343,60 @@ def _is_noise_line(s):
     return bool(_NOISE_PAT.search(s))
 
 
+# ---- 面板日志精简：业务行里有价值的留、啰嗦的丢、关键的改写 ----
+# 订阅阶段里「候选套餐 / 下单 / 老接口」这些中间过程行，对老大没用，直接丢
+_SUBSCRIBE_DROP = ("候选套餐", "dianshi/order-and-pay", "POST /v1/passes")
+# 建Bot / 模型 / 部署 / REST / 凭证回显 等过程行与回显，丢
+_BUILD_DROP = (
+    "BOT=", "[建Bot] 复用", "[建Bot] 查询", "[建Bot] POST",
+    "[模型] 设主模型", "[部署] 待发消息", "[REST]", "[回复全文长度]",
+    "DOMESTIC_CRED_JSON=",
+)
+
+
+def _panel_line(s):
+    """面板日志行：返回改写后的文本；返回 None 表示丢。
+
+    老大要求「简洁明快 一目了然」——只保留「正在进行的步骤」：
+      ① 协议/调试噪音（_is_noise_line）直接丢；
+      ② bot.js 业务行里的中间过程（候选套餐、BOT=、POST /v1、REST、凭证回显…）丢；
+      ③ 关键节点改写成人话：
+         - [订阅] …复核通过，有效订阅: xxx        →  [订阅] ✅ 复核通过
+         - [模型] 主模型已设为: …                 →  正在部署
+         - RESULT=OK|deploy_success…              →  ✅ 部署成功
+         - RESULT=FAIL|… / RESULT=ERROR|…         →  ❌ 部署失败
+    """
+    if not s or not s.strip():
+        return None
+    if _is_noise_line(s):
+        return None
+    # 业务过程噪音行
+    for pat in _BUILD_DROP:
+        if pat in s:
+            return None
+    # 订阅阶段：中间行丢，成功行统一成「[订阅] ✅ 复核通过」
+    if s.startswith("[订阅]"):
+        if any(p in s for p in _SUBSCRIBE_DROP):
+            return None
+        if "已有有效订阅" in s or "复核通过" in s:
+            return "[订阅] ✅ 复核通过"
+        return None  # 其它 [订阅] 行不显示
+    # 建Bot 只留最终那一行「[建Bot] 实例=… 最终状态=…」（BOT= 已在上面丢）
+    if s.startswith("[建Bot] 实例="):
+        return s
+    # 模型 / 部署结果
+    if s.startswith("[模型] 主模型已设为"):
+        return "正在部署"
+    if s.startswith("RESULT=OK"):
+        return "✅ 部署成功"
+    if s.startswith("RESULT=FAIL") or s.startswith("RESULT=ERROR"):
+        return "❌ 部署失败"
+    # SUBSCRIBE= 状态行（OK/RETRY）丢
+    if s.startswith("SUBSCRIBE="):
+        return None
+    return s
+
+
 def _append_log(line, prefix=""):
     with _lock:
         _state["log"].append((prefix + line).rstrip("\n"))
@@ -352,6 +406,10 @@ def _append_log(line, prefix=""):
 
 def _run_one(idx, acc, mode, accounts_file):
     """单账号子进程：spawn node bot.js --account-idx idx [--login-only]，实时读日志。"""
+    # ★ 全局停止闸门①：线程被调度到时若已停止，连子进程都不起，占位（姓名+身份证）原样保留
+    with _lock:
+        if not _state["running"]:
+            return None
     args = [NODE_BIN, BOT, "--account-idx", str(idx)]
     if mode == "login":
         args.append("--login-only")
@@ -370,15 +428,25 @@ def _run_one(idx, acc, mode, accounts_file):
         fd = None
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             env=env, cwd=BASE, text=True, bufsize=1)
+    # ★ 全局停止闸门②：Popen 之后到入列之前的窗口里被停止，立即杀掉，不让它跑
     with _lock:
+        if not _state["running"]:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            if fd:
+                fd.close()
+            return None
         _state["procs"].append(proc)
     cred = {}
     exit_code = None
     try:
         for line in proc.stdout:
             s = line.rstrip("\n")
-            if not _is_noise_line(s):
-                _append_log(s, "[%02d %s] " % (idx, acc["name"]))
+            cleaned = _panel_line(s)
+            if cleaned is not None:
+                _append_log(cleaned, "[%02d %s] " % (idx, acc["name"]))
             if fd:
                 fd.write(line)
             m = CRED_RE.search(line)
@@ -441,9 +509,15 @@ def _run_thread(accounts, mode):
             _state["log"] = []
             _state["procs"] = []
         for i in range(0, total, CONCURRENCY):
+            # ★ 全局停止：每批开始前检查，停止后不再启动排队账号
+            if not _state["running"]:
+                break
             batch = []
             for k in range(CONCURRENCY):
                 if i + k >= total:
+                    break
+                # ★ 本批内若中途被停止，也不补起剩余线程
+                if not _state["running"]:
                     break
                 t = threading.Thread(target=_run_one, args=(i + k, accounts[i + k], mode, tmp), daemon=True)
                 batch.append(t)
@@ -463,7 +537,7 @@ def start(mode, text, concurrency=None):
     """启动一次运行（后台线程）。mode='login'|'full'。返回 {ok, total}。"""
     accs = parse_accounts(text)
     if not accs:
-        return {"ok": False, "error": "没有解析到账号（格式：姓名----身份证，每行一条）"}
+        return {"ok": False, "error": "没有解析到账号（支持空格/----/——/|/、/逗号等任意分隔，每行一条：姓名 身份证）"}
     with _lock:
         if _state["running"]:
             return {"ok": False, "error": "已有任务在运行，请先停止"}
@@ -479,8 +553,11 @@ def start(mode, text, concurrency=None):
 
 
 def stop():
+    """全局停止：杀掉所有正在跑的子进程，并置 running=False。
+    配合 _run_thread 批循环与 _run_one 的 running 闸门，排队中的账号也不会再被启动。"""
     with _lock:
         procs = list(_state["procs"])
+        _state["procs"] = []
         _state["running"] = False
     for p in procs:
         try:
