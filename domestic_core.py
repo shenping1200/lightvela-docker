@@ -394,6 +394,9 @@ def _panel_line(s):
     # SUBSCRIBE= 状态行（OK/RETRY）丢
     if s.startswith("SUBSCRIBE="):
         return None
+    # 成功行去掉竖线后的调试尾巴（uid / attemptId 等，对老大没用）
+    if s.startswith("✅ 登录成功") or s.startswith("✅ 实名成功"):
+        return s.split(" | ")[0]
     return s
 
 
@@ -441,10 +444,24 @@ def _run_one(idx, acc, mode, accounts_file):
         _state["procs"].append(proc)
     cred = {}
     exit_code = None
+    # ★ 部署阶段区间压缩：打印「正在部署」后，直到最终的 ✅/❌ 判定行之前，
+    #   中间的「安装脚本/部署报告/检测结果」等过程行一律不进面板（仍写文件备查）。
+    in_deploy = False
     try:
         for line in proc.stdout:
             s = line.rstrip("\n")
-            cleaned = _panel_line(s)
+            if in_deploy:
+                # 部署过程中：只放行最终判定行，其余（安装输出/部署报告/检测明细）全丢
+                if s.startswith("RESULT=OK"):
+                    cleaned = "✅ 部署成功"; in_deploy = False
+                elif s.startswith("RESULT=FAIL") or s.startswith("RESULT=ERROR"):
+                    cleaned = "❌ 部署失败"; in_deploy = False
+                else:
+                    cleaned = None
+            else:
+                cleaned = _panel_line(s)
+                if cleaned == "正在部署":
+                    in_deploy = True  # 进入部署阶段，后续过程行压掉
             if cleaned is not None:
                 _append_log(cleaned, "[%02d %s] " % (idx, acc["name"]))
             if fd:
