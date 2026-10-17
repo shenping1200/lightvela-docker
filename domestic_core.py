@@ -410,14 +410,9 @@ def _panel_line(s):
     # （下一行「验证码: 893213」才带真码，那行照常保留）
     if "cooldownSeconds" in s:
         return re.sub(r"\s*[:：].*$", "", s)
-    # [建Bot] 结果行：实例ID 截短成老大确认过的「ins-106e...」形式、去掉「名称=」，
-    # 只留「实例=ins-XXXX... 最终状态=Running」；其余 [建Bot] 行不显示
+    # [建Bot] 结果行整行丢：老大明确不要这行（实例ID/最终状态/名称=… 全是无用字符串；
+    # 结果表已带实例ID，面板日志只留状态文字即可）。曾一度改成「截短保留」属倒退，已改回。
     if s.startswith("[建Bot]"):
-        m = re.match(r"\[建Bot\]\s*实例=(ins-[^\s]+)\s+最终状态=(\S+)", s)
-        if m:
-            iid = m.group(1)
-            short = (iid[:8] + "...") if len(iid) > 8 else iid
-            return "[建Bot] 实例=%s 最终状态=%s" % (short, m.group(2))
         return None
     # 成功行去掉竖线后的调试尾巴（uid / attemptId 等，对老大没用）
     if s.startswith("✅ 登录成功") or s.startswith("✅ 实名成功"):
