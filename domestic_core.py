@@ -406,9 +406,18 @@ def _panel_line(s):
     # SUBSCRIBE= 状态行（OK/RETRY）丢
     if s.startswith("SUBSCRIBE="):
         return None
+    # 已发验证码行的 JSON 调试尾巴（cooldownSeconds）无用，整行丢
+    # （下一行的「验证码: 893213」已带真码，这行纯属调试噪声）
+    if "cooldownSeconds" in s:
+        return None
+    # 建 Bot 行整行丢（实例ID/最终状态/名称对老大都是无用字符串，结果表已带实例ID）
+    if s.lstrip().startswith("[建Bot]"):
+        return None
     # 成功行去掉竖线后的调试尾巴（uid / attemptId 等，对老大没用）
-    if s.startswith("✅ 登录成功") or s.startswith("✅ 实名成功"):
-        return s.split(" | ")[0]
+    # 关键：用 lstrip() 容错 bot.js 输出的「  ✅」前导缩进（之前漏了这个 bug 导致一直没生效）
+    s_stripped = s.lstrip()
+    if s_stripped.startswith("✅ 登录成功") or s_stripped.startswith("✅ 实名成功"):
+        return s_stripped.split(" | ")[0]
     return s
 
 
