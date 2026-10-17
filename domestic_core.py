@@ -383,9 +383,9 @@ def _panel_line(s):
     # 余额行：去掉括号里的充值提示
     if s.startswith("[豪猪] 当前余额"):
         return re.sub(r"\s*[（(].*$", "", s).rstrip()
-    # 账号分隔行：去掉身份证号（前缀/结果表已有，没必要在日志重复）
+    # 账号分隔行整行丢：前缀「[00 范益民]」已带账号名，这行纯重复、零信息量
     if s.startswith("===== 账号:"):
-        return re.sub(r"\s*\(\d{17}[\dXx]\)", "", s)
+        return None
     # 凭证追加行：去掉路径与身份证，只留状态
     if s.startswith("[凭证] 已追加"):
         return "[凭证] 已追加"
