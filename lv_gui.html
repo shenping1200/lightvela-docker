@@ -81,6 +81,7 @@
   #rowsWrap{flex:1;overflow:auto;border:1px solid var(--line);border-radius:8px;min-height:120px}
   #log{flex:1;overflow:auto;background:#fbfcfd;border:1px solid var(--line);border-radius:8px;
     padding:8px;font:12px/1.6 var(--mono);white-space:pre-wrap;word-break:break-all;min-height:120px}
+  #domLog{white-space:pre-wrap;word-break:break-all;font:12px/1.6 var(--mono)}
   .foot{font-size:12px;color:var(--tx3);margin-top:8px}
   .hint{font-size:12px;color:var(--tx3);margin-top:6px}
   .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -916,7 +917,7 @@ async function domStop() { await API.domestic_stop(); }
 async function domExportFailed() {
   const s = lastDomStatus;
   if (!s || !s.results) { appendDomLog(['[导出失败] 还没有运行记录']); return; }
-  const failed = (s.results || []).filter(r => r && !r.ok);
+  const failed = (s.results || []).filter(r => r && r.ok === false);
   if (!failed.length) { appendDomLog(['[导出失败] 没有失败账号 ✓']); return; }
   const lines = failed.map(r => (r.name || '') + ' ' + (r.idCard || ''));
   appendDomLog(['=== 失败账号（姓名 身份证，可直接复制重新导入）===']);
@@ -938,7 +939,7 @@ function renderDomRows(s) {
   for (let i = 0; i < total; i++) {
     const r = byIdx[i];
     let stageCls, stageTxt, detail;
-    if (!r) {
+    if (!r || r.ok === undefined) {
       stageCls = 't-wait'; stageTxt = '等待中'; detail = '';
     } else if (r.ok) {
       stageCls = 't-ok';

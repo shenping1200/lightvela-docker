@@ -437,7 +437,7 @@ def _run_thread(accounts, mode):
         with _lock:
             _state["total"] = total
             _state["done"] = 0
-            _state["results"] = [None] * total
+            _state["results"] = [{"idx": i, "name": a["name"], "idCard": a["idCard"]} for i, a in enumerate(accounts)]
             _state["log"] = []
             _state["procs"] = []
         for i in range(0, total, CONCURRENCY):
