@@ -19,7 +19,9 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY lv_gui_core.py webapp.py lv_gui.html \
-     lightvela-purecode.js lv-proxy.js lv-ptystart-fn.js ./
+     lightvela-purecode.js lv-proxy.js lv-ptystart-fn.js \
+     domestic_core.py domestic_lightvela_bot.js domestic_lightvela_batch.js \
+     _probe_full.js _probe_instances.js _recheck_probe.js ./
 
 RUN mkdir -p /data \
  && echo "node: $(node -v)" \
