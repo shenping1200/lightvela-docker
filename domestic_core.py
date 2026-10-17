@@ -350,6 +350,9 @@ def _run_one(idx, acc, mode, accounts_file):
     env["LIGHTVELA_DOMESTIC_TOKENS"] = token_path()
     # ★ 注入国内版配置（接码平台账密 / 出口代理），子进程 bot.js 按 env 解析
     env.update(_env_from_config(_read_config()))
+    # ★ 部署命令文件路径对齐：面板把部署命令存到数据盘 domestic-deploy-msg.txt，
+    #   必须显式告诉 bot.js（否则它默认去脚本目录找 deploy_cmd.txt，容器里没有 → 部署阶段报"文件不存在"）
+    env["LIGHTVELA_DEPLOY_FILE"] = _dom_deploy_msg_path()
     log_file = os.path.join(BASE, "run_domestic_%02d_%s.log" % (idx, acc["name"]))
     try:
         fd = open(log_file, "w", encoding="utf-8")
