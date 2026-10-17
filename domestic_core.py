@@ -238,6 +238,57 @@ def reset_deploy_msg():
     return {"ok": True, "text": DOMESTIC_DEPLOY_MSG_DEFAULT}
 
 
+def _fmt_proxy(p):
+    """把单个代理配置规整成 bot.js(normalizeProxy) 期望的字段 {type,host,port,username,password}。"""
+    if not isinstance(p, dict):
+        return None
+    host = p.get("host") or p.get("proxyHost") or p.get("proxyServer")
+    port = int(p.get("port") or p.get("proxyPort") or 0)
+    if not host or not port:
+        return None
+    return {
+        "type": (p.get("type") or p.get("proxyTypeName") or "socks5"),
+        "host": host,
+        "port": port,
+        "username": p.get("username") or p.get("user") or p.get("proxyAccount") or p.get("proxyUserName") or "",
+        "password": p.get("password") or p.get("pass") or p.get("proxyPassword") or "",
+    }
+
+
+def _normalize_proxy_cfg(px):
+    """把 GUI 的 proxy 配置（dict / list / 字符串）转成 LIGHTVELA_EGRESS_PROXY(JSON)。
+    支持：单对象、代理池(数组)、"host:port" 字符串、JSON 字符串。"""
+    if isinstance(px, list):
+        arr = [_fmt_proxy(x) for x in px]
+        arr = [x for x in arr if x]
+        return json.dumps(arr) if arr else None
+    if isinstance(px, dict):
+        f = _fmt_proxy(px)
+        return json.dumps(f) if f else None
+    if isinstance(px, str):
+        s = px.strip()
+        if not s:
+            return None
+        # ① 先尝试当 JSON 解析（可能是数组/对象字符串）
+        try:
+            return _normalize_proxy_cfg(json.loads(s))
+        except Exception:
+            pass
+        # ② 兜底：host:port / host:port:user:pass / scheme://user:pass@host:port
+        body = re.sub(r'^(socks5|http|https)://', '', s)
+        hp = body.rsplit(':', 1)
+        if len(hp) == 2 and hp[1].isdigit():
+            host = hp[0]
+            port = int(hp[1])
+            user = passwd = ""
+            if '@' in host:
+                auth, host = host.rsplit('@', 1)
+                if ':' in auth:
+                    user, passwd = auth.split(':', 1)
+            return json.dumps({"type": "socks5", "host": host, "port": port, "username": user, "password": passwd})
+    return None
+
+
 def _env_from_config(cfg):
     """把国内版配置转成子进程环境变量（SMS+proxy）。"""
     env = {}
@@ -250,15 +301,9 @@ def _env_from_config(cfg):
         env["LIGHTVELA_SMS_PASS"] = sms["apiPass"]
     if sms.get("projectId"):
         env["LIGHTVELA_SMS_PROJECT_ID"] = str(sms["projectId"])
-    px = (cfg or {}).get("proxy") or {}
-    if px.get("host"):
-        env["LIGHTVELA_EGRESS_PROXY"] = json.dumps({
-            "type": px.get("type") or "socks5",
-            "host": px.get("host"),
-            "port": int(px.get("port") or 0),
-            "username": px.get("user") or "",
-            "password": px.get("pass") or "",
-        })
+    px = (cfg or {}).get("proxy")
+    if px:
+        env["LIGHTVELA_EGRESS_PROXY"] = _normalize_proxy_cfg(px)
     # 部署策略（面板「部署策略」卡的开关，子进程 bot.js 按 env 解析）
     dep = (cfg or {}).get("deploy") or {}
     if "verify" in dep:

@@ -67,23 +67,35 @@ const CFG = {
   noAutoclose:   process.env.LIGHTVELA_NO_AUTOCLOSE === '1',  // 1=跑完不自动关环境（由外层编排统一关）
 };
 
-// ★ 出口代理（老大指定，2026-10-16）：所有 LightVela 请求 + TAT 隧道都走这个 socks5
-//   代理池格式 host:port:username:password = a.rr2.kdns.fr:10800:6582443:6582443
-//   每个账号都用同一个 IP（不轮换）。环境变量 LIGHTVELA_EGRESS_PROXY(JSON) 可覆盖。
+// ★ 出口代理（2026-10-16 起支持代理池）：所有 LightVela API 请求走这里。
+//   支持两种格式：单个代理对象 或 数组（代理池）；数组时每次请求随机挑一个 → 实现"每请求换 IP"。
+//   环境变量 LIGHTVELA_EGRESS_PROXY(JSON) 可覆盖；未设置则用内置默认 a.rr2.kdns.fr:10800。
 const DEFAULT_EGRESS_PROXY = {
   type: 'socks5', host: 'a.rr2.kdns.fr', port: 10800, username: '6582443', password: '6582443',
 };
+let EGRESS_AGENTS = [];   // 代理池对应的 https.Agent 列表（池>1 时每次请求随机挑一个）
+function pickEgressAgent() {
+  if (!EGRESS_AGENTS.length) return undefined;
+  if (EGRESS_AGENTS.length === 1) return EGRESS_AGENTS[0];
+  return EGRESS_AGENTS[Math.floor(Math.random() * EGRESS_AGENTS.length)];
+}
 {
   let src = DEFAULT_EGRESS_PROXY;
   if (process.env.LIGHTVELA_EGRESS_PROXY) {
     try { src = JSON.parse(process.env.LIGHTVELA_EGRESS_PROXY); }
     catch (e) { console.log('[代理] LIGHTVELA_EGRESS_PROXY 解析失败，改用内置默认代理:', e.message); }
   }
-  const p = normalizeProxy(src);
-  if (p) { CFG.egressProxy = p; console.log('[代理] 出口代理:', p.kind + '://' + p.host + ':' + p.port + (p.username ? ' (带认证)' : '')); }
-  else { console.log('[代理] 未配置代理（直连）'); }
+  // src 可能是单个代理对象，也可能是代理池（数组）
+  const pool = (Array.isArray(src) ? src : [src]).map(normalizeProxy).filter(Boolean);
+  EGRESS_AGENTS = pool.map(makeHttpsAgent).filter(Boolean);
+  if (EGRESS_AGENTS.length) {
+    CFG.egressProxy = pool[0];  // 保留一个用于 WS 隧道等单代理场景
+    const list = pool.map(p => p.kind + '://' + p.host + ':' + p.port + (p.username ? ' (带认证)' : '')).join(' | ');
+    console.log('[代理] 出口代理池(' + EGRESS_AGENTS.length + '): ' + list);
+  } else {
+    console.log('[代理] 未配置代理（直连）');
+  }
 }
-const EGRESS_AGENT = makeHttpsAgent(CFG.egressProxy);
 
 // ===================== 通用小工具 =====================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -535,10 +547,16 @@ async function domesticLogin(acc) {
         }
       }
       if (!sentOk) {
-        throw new Error('验证码发送过于频繁，已用同一号码重试 ' + RESEND_MAX + ' 次仍被限频: ' + JSON.stringify(lastRateJson).slice(0, 200));
+        // ★ 限频拉黑：同一号码重试上限仍被限频 → 拉黑该号（不再分配，防止二手号回收复用），换号重试
+        lastErr = new Error('验证码发送过于频繁，已用同一号码重试 ' + RESEND_MAX + ' 次仍被限频: ' + JSON.stringify(lastRateJson).slice(0, 200));
+        if (phone) { try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（限频重试耗尽）:', phone); } catch (_) {} }
+        console.log('  ⚠️ 该号限频重试耗尽，换号重试…');
+        continue;   // 走 attempt++ 换号（至多 MAX_RENT 个号）
       }
       const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
       console.log('  验证码:', code);
+      // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
+      try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（已成功取码，号源即用即弃）:', phone); } catch (_) {}
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
       const token = v.json && v.json.session && v.json.session.sessionToken;
       if (!token) throw new Error('登录失败（拿不到 sessionToken）: ' + JSON.stringify(v.json).slice(0, 240));
@@ -593,7 +611,7 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
     if (bearer) h['Authorization'] = 'Bearer ' + bearer;
     if (cookie) h['Cookie'] = cookie;
     if (data) { h['Content-Type'] = 'application/json'; h['Content-Length'] = Buffer.byteLength(data); }
-    const req = https.request({ method, hostname: u.hostname, path: u.pathname + u.search, headers: h, agent: EGRESS_AGENT }, (res) => {
+    const req = https.request({ method, hostname: u.hostname, path: u.pathname + u.search, headers: h, agent: pickEgressAgent() }, (res) => {
       let chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
