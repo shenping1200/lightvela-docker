@@ -532,7 +532,7 @@ def _run_one(idx, acc, mode, accounts_file):
     return res
 
 
-def _run_thread(accounts, mode):
+def _run_thread(accounts, mode, prelude=None):
     tmp = os.path.join(BASE, "accounts_run_tmp.js")
     try:
         try:
@@ -548,7 +548,8 @@ def _run_thread(accounts, mode):
             _state["total"] = total
             _state["done"] = 0
             _state["results"] = [{"idx": i, "name": a["name"], "idCard": a["idCard"]} for i, a in enumerate(accounts)]
-            _state["log"] = []
+            # 续跑时 prelude 是「[跳过] 某某：原因」明细，放在日志最前面
+            _state["log"] = list(prelude or [])
             _state["procs"] = []
         for i in range(0, total, CONCURRENCY):
             # ★ 全局停止：每批开始前检查，停止后不再启动排队账号
@@ -575,11 +576,46 @@ def _run_thread(accounts, mode):
             _state["running"] = False
 
 
+def _resume_pick(accs):
+    """续跑筛选（老大 2026-10-17 定）：必须三条同时满足才跑——
+       ① 账号区（面板粘贴的清单）里有这个人
+       ② 已保存凭证里有这个人（有凭证 = 已实名完成，因为凭证是实名通过后才落盘的）
+       ③ 这个人上一轮是「部署失败」
+       其余一律不跑。返回 (可跑列表, [(姓名, 不跑原因), ...])。
+    """
+    saved = _read_tokens()          # {idCard: 该账号最后一条记录}（按身份证合并，后写覆盖先写）
+    run, skip = [], []
+    for a in accs:
+        idc = a.get("idCard")
+        rec = saved.get(idc) if idc else None
+        if not rec:
+            skip.append((a.get("name"), "凭证里没有他"))
+            continue
+        ok = rec.get("deployOk")
+        if ok is True:
+            skip.append((a.get("name"), "已部署成功"))
+            continue
+        if ok is False:
+            run.append(a)
+            continue
+        skip.append((a.get("name"), "没跑过部署"))   # deployOk 缺失 = 只做了登录/实名，没做后续
+    return run, skip
+
+
 def start(mode, text, concurrency=None):
-    """启动一次运行（后台线程）。mode='login'|'full'。返回 {ok, total}。"""
+    """启动一次运行（后台线程）。mode='login'|'full'|'resume'。返回 {ok, total}。"""
     accs = parse_accounts(text)
     if not accs:
         return {"ok": False, "error": "没有解析到账号（支持空格/----/——/|/、/逗号等任意分隔，每行一条：姓名 身份证）"}
+    # ★ 续跑：先把账号区名单拿去跟已保存凭证比对，只留「两边都有 + 上轮部署失败」的
+    prelude = []
+    if mode == "resume":
+        accs, skipped = _resume_pick(accs)
+        prelude = ["[跳过] %s：%s" % (nm, why) for nm, why in skipped]
+        if not accs:
+            brief = "；".join("%s(%s)" % (nm, why) for nm, why in skipped[:8])
+            return {"ok": False, "error": "没有符合续跑条件的账号（须同时满足：账号区有 + 凭证里有 + 上轮部署失败）。共 %d 个被跳过：%s"
+                    % (len(skipped), brief)}
     with _lock:
         if _state["running"]:
             return {"ok": False, "error": "已有任务在运行，请先停止"}
@@ -589,7 +625,7 @@ def start(mode, text, concurrency=None):
         _state["running"] = True
         _state["mode"] = mode
         _state["started_at"] = int(time.time())
-        _state["thread"] = threading.Thread(target=_run_thread, args=(accs, mode), daemon=True)
+        _state["thread"] = threading.Thread(target=_run_thread, args=(accs, mode, prelude), daemon=True)
         _state["thread"].start()
     return {"ok": True, "total": len(accs), "mode": mode}
 

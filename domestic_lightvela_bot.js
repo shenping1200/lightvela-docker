@@ -1307,7 +1307,7 @@ function saveDomesticToken(cred) {
 // ★ 续跑：从凭证文件取回某账号最新一条记录（按姓名匹配，后写覆盖先写）
 //   用于「已登录+已实名，只差订阅/部署」的场景：不再取号、不再发码、不再实名，
 //   直接复用上次落盘的 bearer，省掉豪猪接码费也不会换号（换号 = 变成另一个全新账号）。
-function readDomesticToken(name) {
+function readDomesticToken(name, idCard) {
   const fs = require('fs');
   const base = process.env.LIGHTVELA_DOMESTIC_TOKENS || (__dirname + '/domestic-tokens');
   const nd = base.replace(/\.json$/, '') + '.ndjson';
@@ -1317,7 +1317,9 @@ function readDomesticToken(name) {
     for (const line of txt.split('\n')) {
       if (!line.trim()) continue;
       let o; try { o = JSON.parse(line); } catch (e) { continue; }
-      if (o && o.name === name) hit = o;   // 取最后一条（最新）
+      // ★ 优先按身份证匹配（唯一，重名也不会串号）；没有身份证才退回按姓名
+      const match = idCard ? (o && o.idCard === idCard) : (o && o.name === name);
+      if (match) hit = o;   // 取最后一条（最新）
     }
   } catch (e) { return null; }
   return hit;
@@ -1353,7 +1355,7 @@ async function main() {
       //    ★ 续跑模式：整段跳过，直接复用上次落盘的 bearer（不取号 / 不花钱 / 不换号）
       let uid, phone;
       if (resume) {
-        const saved = readDomesticToken(acc.name);
+        const saved = readDomesticToken(acc.name, acc.idCard);
         if (!saved || !saved.bearer) throw new Error('续跑失败：凭证里没有 ' + acc.name + ' 的 bearer，请先跑一次完整流程');
         CFG.bearer = saved.bearer;
         if (saved.instanceId) CFG.instanceId = saved.instanceId;
