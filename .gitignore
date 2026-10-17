@@ -28,3 +28,9 @@ _deploy_msg.txt
 
 # ===== 脱敏前的部署说明（README 已覆盖）=====
 部署说明.md
+
+# ===== 国内版真实账号 / 凭证（只提交 .example 模板，绝不提交真实数据）=====
+accounts.js
+accounts_retry.js
+deploy_cmd.txt
+# 凭证账本在仓库外（../domestic-tokens.ndjson），本目录内不落盘，无需忽略

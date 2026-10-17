@@ -84,6 +84,13 @@
   .foot{font-size:12px;color:var(--tx3);margin-top:8px}
   .hint{font-size:12px;color:var(--tx3);margin-top:6px}
   .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  /* ---- 双 Tab 切换（国际版 / 国内版）---- */
+  .tabbar{display:flex;gap:6px;margin-left:6px}
+  .tabbtn{border:1px solid var(--line2);background:#fff;color:var(--tx2);border-radius:8px;
+    padding:5px 16px;font-size:13px;cursor:pointer;white-space:nowrap}
+  .tabbtn:hover{border-color:var(--blue);color:var(--blue)}
+  .tabbtn.active{background:var(--blue);border-color:var(--blue);color:#fff}
+  .tabpane{display:none}
   #login{position:absolute;inset:0;background:var(--bg);display:none;
     align-items:center;justify-content:center;z-index:99}
   #login .box{background:var(--card);border:1px solid var(--line);border-radius:12px;
@@ -107,13 +114,17 @@
 
 <header>
   <h1>LightVela 抢名额</h1>
+  <span class="tabbar">
+    <button class="tabbtn active" id="tabIntlBtn" onclick="switchTab('intl')">国际版</button>
+    <button class="tabbtn" id="tabDomBtn" onclick="switchTab('domestic')">国内版</button>
+  </span>
   <span id="status" class="chip off">检查登录…</span>
   <span class="spacer"></span>
   <span id="summary" style="color:var(--tx3);font-size:12px"></span>
   <button class="btn sm" id="btnLogout" style="display:none">退出登录</button>
 </header>
 
-<main>
+<main id="tab-intl">
   <div class="col left" id="colLeft">
     <div class="card" style="flex:1;min-height:212px">
       <h2>账号 <span class="sub">邮箱----密码----用户名----2FA----创建时间</span></h2>
@@ -263,6 +274,167 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
   </div>
 </main>
 
+<!-- ============ 国内版 Tab（与国际版逻辑隔离，凭证走 domestic-tokens.json） ============ -->
+<div id="tab-domestic" class="tabpane" style="display:none">
+  <div style="display:flex;gap:12px;padding:12px;height:calc(100vh - 92px)">
+    <div class="col left">
+      <div class="card" style="flex:1;min-height:212px">
+        <h2>国内版账号 <span class="sub">姓名----身份证（每行一条）</span></h2>
+        <textarea id="domAcc" spellcheck="false" placeholder="每行一个账号：&#10;张璐----321111198812046140&#10;陈哲莹----310110197712276260"></textarea>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn sm" id="domBtnImport">导入 txt</button>
+          <button class="btn sm" id="domBtnClear">清空</button>
+          <span id="domParseStat" class="stat"></span>
+        </div>
+      </div>
+
+      <!-- ★ 接码平台 API 配置（账密 / 项目 ID） -->
+      <div class="card">
+        <h2>接码平台 API <span class="sub" id="domSmsStat">默认账密</span></h2>
+        <div class="row">
+          <label>API 地址</label>
+          <input type="text" id="domSmsBase" spellcheck="false" placeholder="https://api.haozhuma.com">
+        </div>
+        <div class="pgrid">
+          <label>账号</label>
+          <input type="text" id="domSmsUser" spellcheck="false" placeholder="h5.haozhuma.com API-配置里复制">
+          <label>密码</label>
+          <input type="text" id="domSmsPass" spellcheck="false" placeholder="同上">
+        </div>
+        <div class="row">
+          <label>项目 ID</label>
+          <input type="number" id="domSmsSid" value="21986" min="1" step="1">
+          <span class="sub" style="color:var(--tx3)">腾讯云短信=21986</span>
+        </div>
+        <div class="bar" style="margin-top:4px">
+          <button class="btn primary sm" id="domBtnSmsSave">保存配置</button>
+          <button class="btn sm" id="domBtnSmsTest">测试连接 + 查余额</button>
+          <span id="domSmsHint" class="stat"></span>
+        </div>
+        <div class="hint">改完点「保存配置」对新账号生效；「测试连接」会调一次豪猪登录 + 查余额确认账密。</div>
+      </div>
+
+      <!-- ★ 代理（与国内版 bot 子进程一起透传） -->
+      <div class="card">
+        <h2>代理 <span class="sub" id="domProxyStat">默认 socks5</span></h2>
+        <div class="row">
+          <label>类型</label>
+          <select id="domPType" style="width:96px">
+            <option value="socks5" selected>socks5</option>
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+          <button class="btn sm" id="domBtnProxyTest">测试出口 IP</button>
+        </div>
+        <div class="pgrid">
+          <label>地址</label>
+          <input type="text" id="domPHost" spellcheck="false" value="a.rr2.kdns.fr" placeholder="a.rr2.kdns.fr">
+          <label>端口</label>
+          <input type="text" id="domPPort" spellcheck="false" value="10800" placeholder="10800">
+          <label>账号</label>
+          <input type="text" id="domPUser" spellcheck="false" value="6582443" placeholder="可留空">
+          <label>密码</label>
+          <input type="text" id="domPPass" spellcheck="false" value="6582443" placeholder="可留空">
+        </div>
+        <div class="bar" style="margin-top:4px">
+          <button class="btn primary sm" id="domBtnProxySave">保存配置</button>
+        </div>
+        <div class="hint" id="domProxyHint">socks5 会自动按 socks5h 远端解析。地址栏也可直接粘整段 <code>user:pass@host:port</code>。保存后立即对后续账号生效。</div>
+      </div>
+
+      <!-- ★ 部署命令（全流程模式原样发给机器人） -->
+      <div class="card">
+        <h2>部署命令 <span class="sub" id="domDepStat">读取中…</span></h2>
+        <textarea id="domDeployMsg" spellcheck="false" placeholder="把要发给机器人的部署指令原文粘到这里（例如探针安装命令 + 提示话术）。点「保存并生效」后，全流程部署时会原样发送。"></textarea>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn primary sm" id="domBtnDepSave">保存并生效</button>
+          <button class="btn sm" id="domBtnDepReset">恢复默认</button>
+        </div>
+        <div class="hint">全流程模式抢到名额后，程序会把这段文本<b>原样发给机器人</b>执行。保存后<b>立即生效</b>，无需重启；内容存于服务器数据盘，容器重建也不丢。</div>
+      </div>
+
+      <!-- ★ 部署策略开关（F 主动验证 / D 免费重试 / 取码超时 / 换号次数） -->
+      <div class="card">
+        <h2>部署策略 <span class="sub" id="domStratStat">读取中…</span></h2>
+        <div class="row">
+          <label>主动验证</label>
+          <input type="checkbox" id="domStratVerify" checked style="width:16px;flex:none">
+          <span class="sub" style="color:var(--tx3)">判失败后让机器人自查探针进程，真在跑就改判成功</span>
+        </div>
+        <div class="row">
+          <label>免费重试</label>
+          <input type="number" id="domStratRetry" value="2" min="0" max="5" step="1" style="width:64px;flex:none">
+          <span class="sub" style="color:var(--tx3)">次 · 判失败后同一机器人重发部署命令（0=关，不花钱）</span>
+        </div>
+        <div class="row">
+          <label>取码超时</label>
+          <input type="number" id="domStratSmsTimeout" value="180" min="30" max="900" step="10" style="width:80px;flex:none">
+          <span class="sub" style="color:var(--tx3)">秒 · 超时即拉黑该号并换号（官方建议 180）</span>
+        </div>
+        <div class="row">
+          <label>换号次数</label>
+          <input type="number" id="domStratSmsMaxRent" value="3" min="1" max="10" step="1" style="width:64px;flex:none">
+          <span class="sub" style="color:var(--tx3)">个 · 取码超时最多换几个号</span>
+        </div>
+        <div class="bar" style="margin-top:4px">
+          <button class="btn primary sm" id="domBtnStratSave">保存策略</button>
+          <button class="btn sm" id="domBtnStratReset">恢复默认</button>
+          <span id="domStratHint" class="stat"></span>
+        </div>
+        <div class="hint">保存后对<b>新起的账号</b>立即生效（正在跑的账号不中断）；批量调度器下次启动也会读这里的配置。</div>
+      </div>
+
+      <div class="card">
+        <h2>参数模式</h2>
+        <div class="row">
+          <label>模式</label>
+          <select id="domMode" style="flex:1">
+            <option value="login" selected>① 登录 + 拿凭证（不下单）</option>
+            <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>并发</label>
+          <input type="number" id="domParallel" value="5" min="1" max="20" step="1">
+          <span class="sub" style="color:var(--tx3)">同时处理几个账号（默认 5）</span>
+        </div>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn primary" id="domBtnStart">▶ 开始</button>
+          <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
+          <span id="domRunStat" class="stat"></span>
+        </div>
+        <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
+      </div>
+      <div class="card">
+        <h2>凭证管理 <span class="sub">独立文件 domestic-tokens.json</span></h2>
+        <div class="bar">
+          <button class="btn sm" id="domBtnTkInfo">查看凭证数</button>
+          <button class="btn sm" id="domBtnTkExport">导出凭证</button>
+          <button class="btn sm danger" id="domBtnTkDel">删除全部凭证</button>
+          <span id="domTkStat" class="stat"></span>
+        </div>
+      </div>
+    </div>
+    <div class="splitter" id="domSplitter" title="拖动调整左右宽度，双击复位"></div>
+    <div class="col right">
+      <div class="card" style="flex:none;max-height:44%">
+        <h2>结果 <span class="sub" id="domRowCount"></span></h2>
+        <div id="domRowsWrap">
+          <table>
+            <thead><tr><th style="width:34px">#</th><th style="width:110px">姓名</th><th style="width:60px">状态</th><th style="width:90px">实例ID</th><th>详情</th></tr></thead>
+            <tbody id="domRows"><tr><td colspan="5" style="color:var(--tx3);padding:14px">还没有任务。填好账号后点「开始」。</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card" style="flex:1">
+        <h2>日志</h2>
+        <div id="domLog"></div>
+      </div>
+    </div>
+  </div>
+  <input type="file" id="fileDomTxt" style="display:none">
+</div>
+
 <input type="file" id="fileTxt" style="display:none">
 <input type="file" id="fileJson" style="display:none">
 
@@ -271,6 +443,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 let pollTimer = null, logLen = 0, running = false, booted = false;
+let currentTab = 'intl', domRunning = false, domLogLen = 0;
 
 /* ---------- 后端桥：把 window.pywebview.api 换成 fetch ---------- */
 const API = new Proxy({}, {
@@ -576,7 +749,7 @@ async function poll() {
   }
 }
 
-/* ---------- 左右栏拖动分隔条 ---------- */
+/* ---------- 左右栏拖动分隔条（国际版 + 国内版 共用，根据当前可见的左栏自动适配）---------- */
 function setLeftWidth(px) {
   const max = Math.max(320, Math.min(window.innerWidth - 340, 1100));
   px = Math.max(320, Math.min(max, px));
@@ -588,25 +761,35 @@ function initSplitter() {
     const saved = parseInt(localStorage.getItem('lv_left_w') || '', 10);
     if (saved) setLeftWidth(saved);
   } catch (e) {}
-  const sp = $('splitter');
-  if (!sp) return;
-  sp.addEventListener('mousedown', e => {
-    e.preventDefault();
-    const startX = e.clientX, startW = $('colLeft').getBoundingClientRect().width;
-    document.body.classList.add('resizing');
-    const move = ev => setLeftWidth(startW + (ev.clientX - startX));
-    const up = () => {
-      document.body.classList.remove('resizing');
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
-    };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
+  // 找当前可见的左栏（切 tab 后自动定位到对应那个）
+  function visibleLeft() {
+    return Array.from(document.querySelectorAll('.col.left'))
+      .find(el => el.offsetParent !== null);
+  }
+  document.querySelectorAll('.splitter').forEach(sp => {
+    sp.addEventListener('mousedown', e => {
+      e.preventDefault();
+      const leftCol = visibleLeft();
+      if (!leftCol) return;
+      const startX = e.clientX, startW = leftCol.getBoundingClientRect().width;
+      document.body.classList.add('resizing');
+      const move = ev => setLeftWidth(startW + (ev.clientX - startX));
+      const up = () => {
+        document.body.classList.remove('resizing');
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', up);
+      };
+      window.addEventListener('mousemove', move);
+      window.addEventListener('mouseup', up);
+    });
+    sp.addEventListener('dblclick', () => setLeftWidth(460));
   });
-  sp.addEventListener('dblclick', () => setLeftWidth(460));
   window.addEventListener('resize', () => {
-    const w = $('colLeft').getBoundingClientRect().width;
-    if (w) setLeftWidth(w);
+    const leftCol = visibleLeft();
+    if (leftCol) {
+      const w = leftCol.getBoundingClientRect().width;
+      if (w) setLeftWidth(w);
+    }
   });
 }
 
@@ -617,9 +800,9 @@ function boot() {
   $('btnImport').onclick = doImport;
   $('btnClear').onclick = () => { $('acc').value = ''; doParse(); };
   $('btnTest').onclick = doTestProxy;
-  $('btnStart').onclick = () => { doStart(); if (!pollTimer) pollTimer = setInterval(poll, 700); };
+  $('btnStart').onclick = () => { doStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnStop').onclick = doStop;
-  $('btnMonStart').onclick = () => { doMonStart(); if (!pollTimer) pollTimer = setInterval(poll, 700); };
+  $('btnMonStart').onclick = () => { doMonStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnMonStop').onclick = doMonStop;
   $('btnExpAll').onclick = () => doExport('all');
   $('btnExpOk').onclick = () => doExport('ok');
@@ -638,6 +821,30 @@ function boot() {
   doParse();
   doTkInfo();
   loadDeployMsg();
+  // ---- 国内版 Tab 绑定 ----
+  $('tabIntlBtn').onclick = () => switchTab('intl');
+  $('tabDomBtn').onclick = () => switchTab('domestic');
+  $('domBtnImport').onclick = domImport;
+  $('domBtnClear').onclick = () => { $('domAcc').value = ''; domParse(); };
+  $('domBtnStart').onclick = domStart;
+  $('domBtnStop').onclick = domStop;
+  $('domBtnTkInfo').onclick = domTkInfo;
+  $('domBtnTkExport').onclick = domTkExport;
+  $('domBtnTkDel').onclick = domTkDel;
+  $('domBtnSmsSave').onclick = domSmsSave;
+  $('domBtnSmsTest').onclick = domSmsTest;
+  $('domBtnProxySave').onclick = domProxySave;
+  $('domBtnProxyTest').onclick = domProxyTest;
+  $('domBtnStratSave').onclick = domStrategySave;
+  $('domBtnStratReset').onclick = domStrategyReset;
+  $('domBtnDepSave').onclick = domDepSave;
+  $('domBtnDepReset').onclick = domDepReset;
+  $('domAcc').addEventListener('input', domParse);
+  loadDomConfig();
+  loadDomStrategy();
+  loadDomDeployMsg();
+  switchTab('intl');
+  if (!pollTimer) pollTimer = setInterval(pollDispatch, 700);
   initSplitter();
 }
 /* 登录按钮必须在"未登录"时也绑上（不能放进 boot，否则登录页点不动） */
@@ -645,6 +852,263 @@ function wireLogin() {
   $('btnLogin').onclick = doLogin;
   $('pw').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 }
+
+/* ================= 国内版（与国际版逻辑隔离，凭证走 domestic-tokens.json） ================= */
+function switchTab(tab) {
+  currentTab = tab;
+  $('tabIntlBtn').classList.toggle('active', tab === 'intl');
+  $('tabDomBtn').classList.toggle('active', tab === 'domestic');
+  $('tab-intl').style.display = (tab === 'intl') ? 'flex' : 'none';
+  $('tab-domestic').style.display = (tab === 'domestic') ? 'block' : 'none';
+}
+
+/* 统一轮询分发：按当前 Tab 决定刷国际版还是国内版，避免两套日志互相覆盖 */
+function pollDispatch() {
+  if (currentTab === 'intl') { poll(); }
+  else if (currentTab === 'domestic') { domPoll(); }
+}
+
+function appendDomLog(lines) {
+  if (!lines || !lines.length) return;
+  const el = $('domLog');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+  el.textContent += lines.join('\n') + '\n';
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+async function domParse() {
+  const r = await API.domestic_parse($('domAcc').value);
+  if (!r || !r.ok) { $('domParseStat').textContent = '解析失败'; return; }
+  $('domParseStat').innerHTML = '共 <b>' + r.count + '</b> 个';
+}
+
+async function domImport() {
+  const text = await pickFile($('fileDomTxt'));
+  if (text == null) return;
+  $('domAcc').value = text;
+  appendDomLog(['[已导入] ' + text.split('\n').filter(Boolean).length + ' 行']);
+  domParse();
+}
+
+async function domStart() {
+  await domParse();
+  const mode = $('domMode').value;
+  const conc = parseInt($('domParallel').value, 10) || 5;
+  const r = await API[(mode === 'login' ? 'domestic_login' : 'domestic_run')]($('domAcc').value, conc);
+  if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
+  $('domLog').textContent = ''; domLogLen = 0;
+  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false;
+  switchTab('domestic');
+  appendDomLog(['[已启动] 模式=' + (mode === 'login' ? '① 登录+拿凭证' : '② 全流程') + ' · 并发=' + conc + ' · 共 ' + r.total + ' 个']);
+}
+
+async function domStop() { await API.domestic_stop(); }
+
+function renderDomRows(s) {
+  const total = s.total || 0;
+  const byIdx = {};
+  (s.results || []).forEach(r => { byIdx[r.idx] = r; });
+  const tb = $('domRows');
+  if (!total) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:var(--tx3);padding:14px">还没有任务。填好账号后点「开始」。</td></tr>';
+    $('domRowCount').textContent = '';
+    return;
+  }
+  let html = '';
+  for (let i = 0; i < total; i++) {
+    const r = byIdx[i];
+    let stageCls, stageTxt, detail;
+    if (!r) {
+      stageCls = 't-wait'; stageTxt = '等待中'; detail = '';
+    } else if (r.ok) {
+      stageCls = 't-ok';
+      stageTxt = (s.mode === 'login') ? '✅ 已拿凭证' : '✅ 部署成功';
+      detail = '手机 ' + esc(r.phone || '') + ' · uid ' + esc((r.uid || '').slice(0, 12));
+      if (s.mode !== 'login' && r.instanceId) detail += ' · 实例 ' + esc((r.instanceId || '').slice(0, 16));
+    } else {
+      stageCls = 't-bad'; stageTxt = '❌ 失败';
+      detail = '手机 ' + esc(r.phone || '') + '（详见日志）';
+    }
+    html += '<tr><td class="mono">' + i + '</td>' +
+      '<td class="mono">' + esc(r ? r.name : '') + '</td>' +
+      '<td><span class="tag ' + stageCls + '">' + stageTxt + '</span></td>' +
+      '<td class="mono">' + esc(r && r.instanceId || '') + '</td>' +
+      '<td style="color:var(--tx2)">' + detail + '</td></tr>';
+  }
+  tb.innerHTML = html;
+  const okN = (s.results || []).filter(r => r && r.ok).length;
+  $('domRowCount').textContent = '共 ' + total + ' 个 · 成功 ' + okN;
+}
+
+async function domPoll() {
+  if (!domRunning) return;
+  const s = await API.domestic_status();
+  if (!s || !s.ok) return;
+  if (s.logs) {
+    if (s.logs.length < domLogLen) { $('domLog').textContent = ''; domLogLen = 0; }
+    if (s.logs.length > domLogLen) { appendDomLog(s.logs.slice(domLogLen)); domLogLen = s.logs.length; }
+  }
+  renderDomRows(s);
+  $('domRunStat').innerHTML = '共 <b>' + (s.total || 0) + '</b> · 完成 <b>' + (s.done || 0) + '</b>' +
+    (s.running ? ' · 运行中…' : ' · 已结束');
+  if (!s.running) {
+    domRunning = false;
+    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true;
+    appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
+    doTkInfo();
+  }
+}
+
+async function domTkInfo() {
+  const r = await API.domestic_tokens();
+  if (!r || !r.ok) { $('domTkStat').textContent = (r && r.error) || ''; return; }
+  $('domTkStat').innerHTML = '当前 <b>' + r.count + '</b> 条';
+}
+
+async function domTkExport() {
+  const r = await API.domestic_export_tokens();
+  if (!r || !r.ok) { appendDomLog(['[凭证导出] ✗ ' + (r && r.error)]); return; }
+  download(r.filename || ('domestic-tokens-' + stamp() + '.json'), r.text, 'application/json');
+  appendDomLog(['[凭证导出] ✓ 已下载 ' + r.count + ' 条']);
+}
+
+async function domTkDel() {
+  if (!confirm('确定删除【全部】国内版凭证吗？（不可恢复，删除后需重新登录拿凭证）')) return;
+  const r = await API.domestic_delete_tokens();
+  if (!r || !r.ok) { appendDomLog(['[凭证删除] ✗ ' + (r && r.error)]); return; }
+  appendDomLog(['[凭证删除] ✓ 已清空']);
+  domTkInfo();
+}
+
+/* ---------- 国内版配置（接码平台 / 代理 / 部署指令）---------- */
+async function loadDomConfig() {
+  const r = await API.domestic_config_get();
+  if (!r || !r.ok || !r.config) return;
+  const s = r.config.sms || {};
+  $('domSmsBase').value = s.apiBase || 'https://api.haozhuma.com';
+  $('domSmsUser').value = s.apiUser || '';
+  $('domSmsPass').value = s.apiPass || '';
+  $('domSmsSid').value  = s.projectId || 21986;
+  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密');
+  const p = r.config.proxy || {};
+  $('domPType').value = p.type || 'socks5';
+  $('domPHost').value = p.host || '';
+  $('domPPort').value = p.port || '';
+  $('domPUser').value = p.user || '';
+  $('domPPass').value = p.pass || '';
+  if (p.host) $('domProxyStat').textContent = '已配置 ' + p.type + '://' + p.host + ':' + p.port;
+}
+
+async function domSmsSave() {
+  const r = await API.domestic_sms_set(
+    $('domSmsBase').value.trim(),
+    $('domSmsUser').value.trim(),
+    $('domSmsPass').value.trim(),
+    parseInt($('domSmsSid').value, 10) || 21986
+  );
+  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败：' + esc(r && r.error) + '</span>'; return; }
+  $('domSmsStat').textContent = '已保存';
+  $('domSmsHint').innerHTML = '✓ 已保存（对新任务生效）';
+  setTimeout(() => { $('domSmsHint').textContent = ''; }, 2500);
+}
+
+async function domSmsTest() {
+  const btn = $('domBtnSmsTest');
+  btn.disabled = true; btn.textContent = '查询中…';
+  $('domSmsHint').textContent = '';
+  await domSmsSave();  // 先存最新值再测
+  const r = await API.domestic_sms_balance();
+  btn.disabled = false; btn.textContent = '测试连接 + 查余额';
+  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(r && r.error) + '</span>'; return; }
+  $('domSmsHint').innerHTML = '✓ 登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
+}
+
+async function domProxySave() {
+  const r = await API.domestic_proxy_set(
+    $('domPType').value,
+    $('domPHost').value.trim(),
+    $('domPPort').value.trim(),
+    $('domPUser').value.trim(),
+    $('domPPass').value.trim()
+  );
+  if (!r || !r.ok) { $('domProxyHint').innerHTML = '<span style="color:var(--red)">保存失败：' + esc(r && r.error) + '</span>'; return; }
+  $('domProxyStat').textContent = '已保存 ' + $('domPType').value + '://' + $('domPHost').value + ':' + $('domPPort').value;
+  $('domProxyHint').innerHTML = '✓ 已保存，<b>新账号立即生效</b>';
+}
+
+async function domProxyTest() {
+  const btn = $('domBtnProxyTest');
+  btn.disabled = true; btn.textContent = '测试中…';
+  const r = await API.domestic_test_proxy(
+    $('domPType').value,
+    $('domPHost').value.trim(),
+    $('domPPort').value.trim(),
+    $('domPUser').value.trim(),
+    $('domPPass').value.trim()
+  );
+  btn.disabled = false; btn.textContent = '测试出口 IP';
+  if (!r || !r.ok) { $('domProxyHint').innerHTML = '<span style="color:var(--red)">代理不通：' + esc(r && r.error) + '</span>'; return; }
+  const ips = r.ips && r.ips.length ? r.ips.join(', ') : (r.proxy || 'OK');
+  $('domProxyStat').textContent = '✓ 出口 ' + ips;
+  $('domProxyHint').innerHTML = '✓ 代理通，出口：<b>' + esc(ips) + '</b>' + (r.rotate ? '（轮换 ✓）' : '（固定）');
+}
+
+/* ---------- 国内版部署策略开关（主动验证 / 免费重试 / 取码超时 / 换号次数）---------- */
+async function loadDomStrategy() {
+  const r = await API.domestic_config_get();
+  if (!r || !r.ok || !r.config) return;
+  const d = r.config.deploy || {};
+  $('domStratVerify').checked = d.verify !== false;
+  $('domStratRetry').value = d.retry != null ? d.retry : 2;
+  $('domStratSmsTimeout').value = d.smsTimeoutSec != null ? d.smsTimeoutSec : 180;
+  $('domStratSmsMaxRent').value = d.smsMaxRent != null ? d.smsMaxRent : 3;
+  $('domStratStat').textContent = (d.verify !== false ? '验证开' : '验证关') + ' · 重试 ' + (d.retry != null ? d.retry : 2) + ' 次';
+}
+
+async function domStrategySave() {
+  const r = await API.domestic_deploy_set(
+    $('domStratVerify').checked,
+    parseInt($('domStratRetry').value, 10) || 0,
+    parseInt($('domStratSmsTimeout').value, 10) || 180,
+    parseInt($('domStratSmsMaxRent').value, 10) || 3
+  );
+  if (!r || !r.ok) { $('domStratHint').innerHTML = '<span style="color:var(--red)">保存失败：' + esc(r && r.error) + '</span>'; return; }
+  $('domStratHint').innerHTML = '✓ 已保存，对<b>新账号</b>立即生效';
+  setTimeout(() => { $('domStratHint').textContent = ''; }, 2500);
+  loadDomStrategy();
+}
+
+async function domStrategyReset() {
+  $('domStratVerify').checked = true;
+  $('domStratRetry').value = 2;
+  $('domStratSmsTimeout').value = 180;
+  $('domStratSmsMaxRent').value = 3;
+  await domStrategySave();
+}
+
+async function loadDomDeployMsg() {
+  const r = await API.domestic_deploy_msg_get();
+  if (!r || !r.ok) { $('domDepStat').textContent = '读取失败'; return; }
+  $('domDeployMsg').value = r.text || '';
+  $('domDepStat').textContent = r.saved ? '已保存' : '默认模板';
+}
+
+async function domDepSave() {
+  const r = await API.domestic_deploy_msg_set($('domDeployMsg').value);
+  if (!r || !r.ok) { appendDomLog(['[部署命令] ✗ ' + (r && r.error)]); return; }
+  $('domDepStat').textContent = '已保存';
+  appendDomLog(['[部署命令] ✓ 已保存并生效（' + r.len + ' 字）']);
+}
+
+async function domDepReset() {
+  if (!confirm('恢复默认部署命令？当前保存的内容会被清除。')) return;
+  const r = await API.domestic_deploy_msg_reset();
+  if (!r || !r.ok) { appendDomLog(['[部署命令] ✗ ' + (r && r.error)]); return; }
+  $('domDeployMsg').value = r.text || '';
+  $('domDepStat').textContent = '默认模板';
+  appendDomLog(['[部署命令] 已恢复默认']);
+}
+
 window.addEventListener('load', async () => {
   wireLogin();
   try {

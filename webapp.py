@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 import lv_gui_core as core
+import domestic_core as dcore
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -247,6 +248,35 @@ HANDLERS = {
     "export_tokens":     lambda a: _export_tokens(),
     "import_tokens_text": lambda a: _import_tokens_text(a[0] if a else ""),
     "delete_tokens":     lambda a: _delete_tokens(a[0] if a else ""),
+    # ---- 国内版（与国际版逻辑隔离，凭证走 domestic-tokens.json）----
+    "domestic_parse":   lambda a: (lambda t: {"ok": True, "accounts": t, "count": len(t)})(dcore.parse_accounts(a[0] if a else "")),
+    "domestic_login":   lambda a: dcore.start("login", a[0] if a else "", a[1] if len(a) > 1 else None),
+    "domestic_run":     lambda a: dcore.start("full", a[0] if a else "", a[1] if len(a) > 1 else None),
+    "domestic_stop":    lambda a: dcore.stop(),
+    "domestic_status":  lambda a: dcore.status(),
+    "domestic_tokens":  lambda a: dcore.tokens_info(),
+    "domestic_export_tokens": lambda a: dcore.export_tokens_text(),
+    "domestic_delete_tokens":  lambda a: dcore.delete_tokens(),
+    # ---- 国内版配置（接码平台 / 代理 / 部署指令）----
+    "domestic_config_get":       lambda a: dcore.get_config(),
+    "domestic_sms_set":          lambda a: dcore.set_sms_config(a[0] if a else "", a[1] if len(a) > 1 else "",
+                                                                a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""),
+    "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
+                                                                  a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
+                                                                  a[4] if len(a) > 4 else ""),
+    "domestic_test_sms":         lambda a: dcore.test_sms(),
+    "domestic_test_proxy":       lambda a: dcore.test_proxy(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
+                                                            a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
+                                                            a[4] if len(a) > 4 else ""),
+    "domestic_sms_balance":      lambda a: dcore.sms_balance(),
+    "domestic_deploy_set":       lambda a: dcore.set_deploy_config(
+        a[0] if len(a) > 0 else True,
+        a[1] if len(a) > 1 else 2,
+        a[2] if len(a) > 2 else 180,
+        a[3] if len(a) > 3 else 3),
+    "domestic_deploy_msg_get":   lambda a: dcore.get_deploy_msg(),
+    "domestic_deploy_msg_set":   lambda a: dcore.set_deploy_msg(a[0] if a else ""),
+    "domestic_deploy_msg_reset": lambda a: dcore.reset_deploy_msg(),
 }
 
 
