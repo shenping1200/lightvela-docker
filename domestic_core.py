@@ -374,6 +374,18 @@ def _panel_line(s):
     for pat in _BUILD_DROP:
         if pat in s:
             return None
+    # 启动头部（单账号模式那行，前缀已有账号名，纯冗余）
+    if s.startswith("[单账号模式]"):
+        return None
+    # 余额行：去掉括号里的充值提示
+    if s.startswith("[豪猪] 当前余额"):
+        return re.sub(r"\s*[（(].*$", "", s).rstrip()
+    # 账号分隔行：去掉身份证号（前缀/结果表已有，没必要在日志重复）
+    if s.startswith("===== 账号:"):
+        return re.sub(r"\s*\(\d{17}[\dXx]\)", "", s)
+    # 凭证追加行：去掉路径与身份证，只留状态
+    if s.startswith("[凭证] 已追加"):
+        return "[凭证] 已追加"
     # 订阅阶段：中间行丢，成功行统一成「[订阅] ✅ 复核通过」
     if s.startswith("[订阅]"):
         if any(p in s for p in _SUBSCRIBE_DROP):
