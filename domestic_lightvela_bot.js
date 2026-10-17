@@ -451,7 +451,9 @@ function parseVerifyResult(text) {
 }
 
 // 国内版登录全流程：取号 → 发码 → 取码 → 验码 → 实名 → Bearer 写进 CFG
-// 取码重试：取到号但等满 timeout 仍收不到验证码 → 拉黑该号 → 重新取号再来（最多 MAX_RENT 次）
+// 号源重试（最多 MAX_RENT 次）：① 取到号但等满 timeout 仍收不到验证码 → 拉黑该号 → 重新取号；
+//   ② 取号本身失败（豪猪「没有取到号码」= 项目临时无号源/限流，纯瞬时）→ 退避后重新取号。
+//   只有验码/实名/网络等非号源错误才直接抛出（换号没用）。
 async function domesticLogin(acc) {
   console.log(`\n===== 账号: ${acc.name} (${acc.idCard}) =====`);
   const MAX_RENT = Number(process.env.LIGHTVELA_SMS_MAX_RENT || 3);          // 最多换几个号
@@ -480,22 +482,32 @@ async function domesticLogin(acc) {
       return { token, uid, phone };
     } catch (e) {
       lastErr = e;
+      // ★ 可重试的「号源类」失败（不归实名/验码/网络错误）：
+      //   ① 取到号但超时收不到验证码 → 拉黑该号，换号重试
+      //   ② 取号本身失败（豪猪「没有取到号码」= 项目临时无号源/限流，纯瞬时）→ 退避后重试
       const isCodeTimeout = /取码超时|无验证码/.test(e.message || '');
+      const isRentFail    = /豪猪取号失败|没有取到号码/.test(e.message || '');
       if (isCodeTimeout && phone) {
         // 取到号但没收到验证码 → 拉黑这个号（避免下次再分到它），然后换号重试
         try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（超时未收到验证码）:', phone); } catch (_) {}
       }
-      if (!isCodeTimeout) {
-        // 验码/实名/网络等非取码问题，换号没用，直接抛出
+      if (!isCodeTimeout && !isRentFail) {
+        // 验码/实名/网络等非号源问题，换号没用，直接抛出
         throw e;
       }
       if (attempt < MAX_RENT) {
-        console.log(`  ⚠️ 取号#${attempt} 等满 ${CODE_TIMEOUT_MS / 1000}s 仍无验证码，重新取号重试…`);
+        // 取号失败（无号源）走退避重试，让平台库存恢复；收码超时则立即换号
+        const backoff = isRentFail ? Number(process.env.LIGHTVELA_SMS_RENT_BACKOFF_MS || 8000) : 0;
+        const why = isRentFail
+          ? '取号失败（项目临时无号源/限流）'
+          : `取号#${attempt} 等满 ${CODE_TIMEOUT_MS / 1000}s 仍无验证码`;
+        if (backoff) { console.log(`  ⚠️ ${why}，退避 ${backoff / 1000}s 后重试…`); await sleep(backoff); }
+        else { console.log(`  ⚠️ ${why}，重新取号重试…`); }
         continue;
       }
     }
   }
-  throw new Error('登录失败（已换 ' + MAX_RENT + ' 个号仍收不到验证码）: ' + (lastErr && lastErr.message));
+  throw new Error('登录失败（已换 ' + MAX_RENT + ' 个号仍收不到验证码/取不到号）: ' + (lastErr && lastErr.message));
 }
 
 // ===================== REST 引导 =====================
