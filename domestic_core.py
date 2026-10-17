@@ -368,6 +368,9 @@ def _panel_line(s):
     """
     if not s or not s.strip():
         return None
+    # ★ 根因修复：bot.js 很多行带前导缩进（如「  ✅ 登录成功」「  已发验证码」），
+    #   不先 strip 会让下面所有 startswith 判断全部失效（之前 uid/attemptId 尾巴砍不掉就是这原因）
+    s = s.strip()
     if _is_noise_line(s):
         return None
     # 业务过程噪音行
@@ -393,9 +396,6 @@ def _panel_line(s):
         if "已有有效订阅" in s or "复核通过" in s:
             return "[订阅] ✅ 复核通过"
         return None  # 其它 [订阅] 行不显示
-    # 建Bot 只留最终那一行「[建Bot] 实例=… 最终状态=…」（BOT= 已在上面丢）
-    if s.startswith("[建Bot] 实例="):
-        return s
     # 模型 / 部署结果
     if s.startswith("[模型] 主模型已设为"):
         return "正在部署"
@@ -406,18 +406,22 @@ def _panel_line(s):
     # SUBSCRIBE= 状态行（OK/RETRY）丢
     if s.startswith("SUBSCRIBE="):
         return None
-    # 已发验证码行的 JSON 调试尾巴（cooldownSeconds）无用，整行丢
-    # （下一行的「验证码: 893213」已带真码，这行纯属调试噪声）
+    # 「已发验证码: {"cooldownSeconds":60}」——老大要留「已发验证码」这句，只砍冒号后的 JSON 尾巴
+    # （下一行「验证码: 893213」才带真码，那行照常保留）
     if "cooldownSeconds" in s:
-        return None
-    # 建 Bot 行整行丢（实例ID/最终状态/名称对老大都是无用字符串，结果表已带实例ID）
-    if s.lstrip().startswith("[建Bot]"):
+        return re.sub(r"\s*[:：].*$", "", s)
+    # [建Bot] 结果行：实例ID 截短成老大确认过的「ins-106e...」形式、去掉「名称=」，
+    # 只留「实例=ins-XXXX... 最终状态=Running」；其余 [建Bot] 行不显示
+    if s.startswith("[建Bot]"):
+        m = re.match(r"\[建Bot\]\s*实例=(ins-[^\s]+)\s+最终状态=(\S+)", s)
+        if m:
+            iid = m.group(1)
+            short = (iid[:8] + "...") if len(iid) > 8 else iid
+            return "[建Bot] 实例=%s 最终状态=%s" % (short, m.group(2))
         return None
     # 成功行去掉竖线后的调试尾巴（uid / attemptId 等，对老大没用）
-    # 关键：用 lstrip() 容错 bot.js 输出的「  ✅」前导缩进（之前漏了这个 bug 导致一直没生效）
-    s_stripped = s.lstrip()
-    if s_stripped.startswith("✅ 登录成功") or s_stripped.startswith("✅ 实名成功"):
-        return s_stripped.split(" | ")[0]
+    if s.startswith("✅ 登录成功") or s.startswith("✅ 实名成功"):
+        return s.split(" | ")[0]
     return s
 
 
