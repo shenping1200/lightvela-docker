@@ -417,6 +417,9 @@ def _panel_line(s):
     # 成功行去掉竖线后的调试尾巴（uid / attemptId 等，对老大没用）
     if s.startswith("✅ 登录成功") or s.startswith("✅ 实名成功"):
         return s.split(" | ")[0]
+    # 续跑模式提示行：统一成一句人话（不带 uid/手机号）
+    if s.startswith("[续跑]"):
+        return "正在续跑（复用已登录凭证）"
     return s
 
 
@@ -436,6 +439,8 @@ def _run_one(idx, acc, mode, accounts_file):
     args = [NODE_BIN, BOT, "--account-idx", str(idx)]
     if mode == "login":
         args.append("--login-only")
+    if mode == "resume":
+        args.append("--resume")
     env = dict(os.environ)
     env["LIGHTVELA_ACCOUNTS_FILE"] = accounts_file
     env["LIGHTVELA_DOMESTIC_TOKENS"] = token_path()

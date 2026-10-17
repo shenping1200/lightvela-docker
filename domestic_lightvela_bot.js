@@ -1304,11 +1304,31 @@ function saveDomesticToken(cred) {
   console.log('[凭证] 已追加 -> ' + nd + ' (' + (cred.idCard || cred.name) + ')');
 }
 
+// ★ 续跑：从凭证文件取回某账号最新一条记录（按姓名匹配，后写覆盖先写）
+//   用于「已登录+已实名，只差订阅/部署」的场景：不再取号、不再发码、不再实名，
+//   直接复用上次落盘的 bearer，省掉豪猪接码费也不会换号（换号 = 变成另一个全新账号）。
+function readDomesticToken(name) {
+  const fs = require('fs');
+  const base = process.env.LIGHTVELA_DOMESTIC_TOKENS || (__dirname + '/domestic-tokens');
+  const nd = base.replace(/\.json$/, '') + '.ndjson';
+  let hit = null;
+  try {
+    const txt = fs.readFileSync(nd, 'utf8');
+    for (const line of txt.split('\n')) {
+      if (!line.trim()) continue;
+      let o; try { o = JSON.parse(line); } catch (e) { continue; }
+      if (o && o.name === name) hit = o;   // 取最后一条（最新）
+    }
+  } catch (e) { return null; }
+  return hit;
+}
+
 // 取号登录 → 实名 →（模式①仅到此拿凭证）→ 抢套餐 → 建机器人 → 把部署消息发给机器人 → 抓回复 → 判那句话
 async function main() {
   const args = process.argv.slice(2);
   const msgArg = (args.find((a) => a === '--message') && args[args.indexOf('--message') + 1]) || '';
   const loginOnly = args.includes('--login-only');   // 模式①：只登录拿凭证，不部署
+  const resume = args.includes('--resume');           // 模式③：续跑（复用已登录凭证，跳过取号/登录/实名）
 
   // 批量并发：每个账号由独立子进程跑（--account-idx N），主进程只调度。
   const idxPos = args.indexOf('--account-idx');
@@ -1330,10 +1350,22 @@ async function main() {
   for (const acc of runList) {
     try {
       // 1) 取号 → 发码 → 取码 → 验码 → 实名（Bearer 写进 CFG）
-      const { uid, phone } = await domesticLogin(acc);
+      //    ★ 续跑模式：整段跳过，直接复用上次落盘的 bearer（不取号 / 不花钱 / 不换号）
+      let uid, phone;
+      if (resume) {
+        const saved = readDomesticToken(acc.name);
+        if (!saved || !saved.bearer) throw new Error('续跑失败：凭证里没有 ' + acc.name + ' 的 bearer，请先跑一次完整流程');
+        CFG.bearer = saved.bearer;
+        if (saved.instanceId) CFG.instanceId = saved.instanceId;
+        uid = saved.uid; phone = saved.phone;
+        console.log('[续跑] 复用已登录凭证：' + acc.name + '（跳过取号/实名）');
+      } else {
+        const lg = await domesticLogin(acc);
+        uid = lg.uid; phone = lg.phone;
+      }
       // 凭证落盘（与国际版隔离），供 UI/后续复用
       const cred = { name: acc.name, idCard: acc.idCard, phone, uid, bearer: CFG.bearer };
-      saveDomesticToken(cred);
+      if (!resume) saveDomesticToken(cred);   // 续跑不重复追加，避免同一账号凭证刷屏
       console.log('DOMESTIC_CRED_JSON=' + JSON.stringify(cred));
       if (loginOnly) { results.push({ uid, phone, loginOk: true }); continue; }   // 模式①：只拿凭证
       // 2) 抢套餐（0 元包；实抓确认用 bundle_launch_ai_01）
