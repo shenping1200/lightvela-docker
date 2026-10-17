@@ -449,6 +449,8 @@ def _run_one(idx, acc, mode, accounts_file):
     # ★ 部署命令文件路径对齐：面板把部署命令存到数据盘 domestic-deploy-msg.txt，
     #   必须显式告诉 bot.js（否则它默认去脚本目录找 deploy_cmd.txt，容器里没有 → 部署阶段报"文件不存在"）
     env["LIGHTVELA_DEPLOY_FILE"] = _dom_deploy_msg_path()
+    # ★ 把并发数传给 bot.js：仅当并发>1 时才启用发码错峰门控（单账号无需错峰）
+    env["LIGHTVELA_DOMESTIC_CONCURRENCY"] = str(CONCURRENCY)
     log_file = os.path.join(BASE, "run_domestic_%02d_%s.log" % (idx, acc["name"]))
     try:
         fd = open(log_file, "w", encoding="utf-8")
@@ -472,46 +474,106 @@ def _run_one(idx, acc, mode, accounts_file):
     # ★ 部署阶段区间压缩：打印「正在部署」后，直到最终的 ✅/❌ 判定行之前，
     #   中间的「安装脚本/部署报告/检测结果」等过程行一律不进面板（仍写文件备查）。
     in_deploy = False
-    try:
-        for line in proc.stdout:
-            s = line.rstrip("\n")
-            if in_deploy:
-                # 部署过程中：只放行最终判定行，其余（安装输出/部署报告/检测明细）全丢
-                if s.startswith("RESULT=OK"):
-                    cleaned = "✅ 部署成功"; in_deploy = False
-                elif s.startswith("RESULT=FAIL") or s.startswith("RESULT=ERROR"):
-                    cleaned = "❌ 部署失败"; in_deploy = False
+    last_output = [time.time()]          # 静默看门狗：记录最近一次收到子进程输出的时间
+    fail_reason = [None]                 # 捕获 bot.js 打印的「❌ 账号失败: ...」原因
+    log_done = threading.Event()
+
+    def _reader():
+        nonlocal in_deploy
+        try:
+            for line in proc.stdout:
+                last_output[0] = time.time()
+                s = line.rstrip("\n")
+                if "❌ 账号失败:" in s:
+                    fail_reason[0] = s.split("❌ 账号失败:", 1)[1].strip()
+                if in_deploy:
+                    # 部署过程中：只放行最终判定行，其余（安装输出/部署报告/检测明细）全丢
+                    if s.startswith("RESULT=OK"):
+                        cleaned = "✅ 部署成功"; in_deploy = False
+                    elif s.startswith("RESULT=FAIL") or s.startswith("RESULT=ERROR"):
+                        cleaned = "❌ 部署失败"; in_deploy = False
+                    else:
+                        cleaned = None
                 else:
-                    cleaned = None
-            else:
-                cleaned = _panel_line(s)
-                if cleaned == "正在部署":
-                    in_deploy = True  # 进入部署阶段，后续过程行压掉
-            if cleaned is not None:
-                _append_log(cleaned, "[%02d %s] " % (idx, acc["name"]))
+                    cleaned = _panel_line(s)
+                    if cleaned == "正在部署":
+                        in_deploy = True  # 进入部署阶段，后续过程行压掉
+                if cleaned is not None:
+                    _append_log(cleaned, "[%02d %s] " % (idx, acc["name"]))
+                if fd:
+                    fd.write(line)
+                m = CRED_RE.search(line)
+                if m:
+                    try:
+                        cred.update(json.loads(m.group(1)))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
             if fd:
-                fd.write(line)
-            m = CRED_RE.search(line)
-            if m:
                 try:
-                    cred = json.loads(m.group(1))
+                    fd.close()
                 except Exception:
                     pass
-    except Exception:
-        pass
-    finally:
-        if fd:
-            fd.close()
-    try:
-        proc.wait(timeout=PER_ACCT_TIMEOUT)
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
+            log_done.set()
+
+    rt = threading.Thread(target=_reader, daemon=True)
+    rt.start()
+
+    # ★ 看门狗：整体超时(PER_ACCT_TIMEOUT) + 静默超时(子进程长时间不出任何输出) + 用户停止
+    #   三者任一触发立即杀掉子进程，避免某个账号卡死把整批(batch)拖死、面板“不再往下进行”。
+    overall_deadline = time.time() + PER_ACCT_TIMEOUT
+    silence_timeout = float(os.environ.get("LIGHTVELA_ACCT_SILENCE_TIMEOUT") or 600)  # 默认10分钟静默判定
+    killed = None
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        now = time.time()
+        if now > overall_deadline:
+            killed = "TIMEOUT"
+            break
+        if now - last_output[0] > silence_timeout:
+            killed = "TIMEOUT_SILENCE"
+            break
+        if not _state["running"]:
+            killed = "STOPPED"
+            break
+        time.sleep(1)
+    if killed:
         try:
             proc.kill()
         except Exception:
             pass
-        exit_code = "TIMEOUT"
+        exit_code = killed
+    else:
+        try:
+            proc.wait(timeout=10)
+            exit_code = proc.returncode
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            exit_code = "TIMEOUT"
+    try:
+        rt.join(timeout=5)
+    except Exception:
+        pass
     ok = (exit_code == 0)
+    if ok:
+        err_msg = None
+    elif fail_reason[0]:
+        err_msg = fail_reason[0]
+    elif exit_code == "TIMEOUT":
+        err_msg = "执行超时（超过 %d 分钟）" % (PER_ACCT_TIMEOUT // 60)
+    elif exit_code == "TIMEOUT_SILENCE":
+        err_msg = "子进程长时间无响应，已被看门狗终止"
+    elif exit_code == "STOPPED":
+        err_msg = "用户手动停止"
+    else:
+        err_msg = "执行失败（详见日志）"
     res = {
         "idx": idx,
         "name": acc["name"],
@@ -522,6 +584,7 @@ def _run_one(idx, acc, mode, accounts_file):
         "bearer": cred.get("bearer"),
         "instanceId": None,
         "deployOk": (ok if mode == "full" else None),
+        "error": err_msg,
         "log": os.path.basename(log_file),
     }
     with _lock:

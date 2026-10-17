@@ -454,18 +454,89 @@ function parseVerifyResult(text) {
 // 号源重试（最多 MAX_RENT 次）：① 取到号但等满 timeout 仍收不到验证码 → 拉黑该号 → 重新取号；
 //   ② 取号本身失败（豪猪「没有取到号码」= 项目临时无号源/限流，纯瞬时）→ 退避后重新取号。
 //   只有验码/实名/网络等非号源错误才直接抛出（换号没用）。
+
+// ★ 并发发码错峰门控：多账号同时跑时，两次发短信请求之间至少间隔 SEND_GAP_MS（默认 30s），
+//   避免一起打平台触发「发送过于频繁」。基于 /data 下的原子锁 + 时间戳文件（各账号子进程跨进程共享）。
+const SMS_GATE_DIR = process.env.LIGHTVELA_SMS_GATE_DIR || '/data';
+const SMS_GATE_LOCK = SMS_GATE_DIR + '/.domestic_sms_gate.lock';
+const SMS_GATE_TS = SMS_GATE_DIR + '/.domestic_sms_gate.ts';
+function _smsGateCleanStale() {
+  try {
+    const st = fs.statSync(SMS_GATE_LOCK);
+    if (Date.now() - st.mtimeMs > 180000) { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }  // 清理残留锁（>3min）
+  } catch (e) {}
+}
+async function smsSendGate(gapMs) {
+  try { fs.mkdirSync(SMS_GATE_DIR, { recursive: true }); } catch (e) {}  // 确保门控目录存在
+  for (let i = 0; i < 1500; i++) {          // 最多等 1500*0.2s = 300s
+    try {
+      _smsGateCleanStale();
+      fs.mkdirSync(SMS_GATE_LOCK);          // 原子拿锁
+      let last = 0;
+      try { last = JSON.parse(fs.readFileSync(SMS_GATE_TS, 'utf8')).t || 0; } catch (e) {}
+      const wait = last + gapMs - Date.now();
+      if (wait > 0) {
+        console.log(`  ⏳ 发码错峰等待 ${Math.ceil(wait / 1000)}s（距上次发码不足间隔，避免被官方限频）…`);
+        await sleep(wait);      // 距上次发码不足 gap 则补齐间隔
+      }
+      return;
+    } catch (e) {
+      await sleep(200);
+    }
+  }
+  throw new Error('发码错峰门控获取超时');
+}
+function smsSendGateRelease() { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }
+function smsSendGateTouch() { try { fs.writeFileSync(SMS_GATE_TS, JSON.stringify({ t: Date.now() })); } catch (e) {} }
+function isSendRateLimited(json) {
+  if (!json) return false;
+  return /verification_provider_rate_limited|发送过于频繁|rate_limit|too many/i.test(JSON.stringify(json));
+}
+
 async function domesticLogin(acc) {
   console.log(`\n===== 账号: ${acc.name} (${acc.idCard}) =====`);
   const MAX_RENT = Number(process.env.LIGHTVELA_SMS_MAX_RENT || 3);          // 最多换几个号
   const CODE_TIMEOUT_MS = Number(process.env.LIGHTVELA_SMS_CODE_TIMEOUT_MS || 180000); // 官方：超三分钟未收到验证码即拉黑重取
+  const RESEND_WAIT_MS = Number(process.env.LIGHTVELA_SMS_RESEND_WAIT_MS || 60000);  // 发码限频后等 60s 同号重发
+  const RESEND_MAX = Number(process.env.LIGHTVELA_SMS_RESEND_MAX || 5);             // 同号重发上限
+  const SEND_GAP_MS = Number(process.env.LIGHTVELA_SMS_SEND_GAP_MS || 30000);       // 并发账号发码间隔 30s
+  // 仅当并发>1 时才需要错峰；单账号（并发=1）无需等待，否则首账号会莫名其妙等最多30s
+  const _domConc = Number(process.env.LIGHTVELA_DOMESTIC_CONCURRENCY || 1);
+  const EFF_GAP_MS = _domConc > 1 ? SEND_GAP_MS : 0;
   let lastErr = null;
   for (let attempt = 1; attempt <= MAX_RENT; attempt++) {
     let phone = null;
     try {
       phone = await SMS.rentNumber();
       console.log(`  手机号(取号#${attempt}):`, phone);
-      const sr = await httpsReq('POST', '/auth/sms/send', { body: { phone } });
-      console.log('  已发验证码:', JSON.stringify(sr.json).slice(0, 120));
+      // —— 发码错峰门控 + 限频同号重发 ——
+      // 门控：并发账号之间发短信请求至少间隔 SEND_GAP_MS（默认30s），避免被官方限频
+      // 限频：若返回“发送过于频繁”，等 RESEND_WAIT_MS（默认60s）后用同一号码重发，最多 RESEND_MAX 次
+      let sentOk = false;
+      let lastRateJson = null;
+      for (let resend = 0; resend <= RESEND_MAX; resend++) {
+        if (resend > 0) {
+          console.log(`  ⏳ 限频重发等待 ${RESEND_WAIT_MS / 1000}s（同一号码 ${phone}）…`);
+          await sleep(RESEND_WAIT_MS);
+        }
+        await smsSendGate(EFF_GAP_MS);          // 拿锁并等够错峰间隔（仅并发>1 时生效）
+        try {
+          const sr = await httpsReq('POST', '/auth/sms/send', { body: { phone } });
+          smsSendGateTouch();                     // 记录本次发码时间（成功/限频都记），供并发账号错峰
+          if (isSendRateLimited(sr.json)) {
+            lastRateJson = sr.json;
+            continue;                             // 下一轮 resend（带60s等待）用同一号码重发
+          }
+          console.log('  已发验证码:', JSON.stringify(sr.json).slice(0, 120));
+          sentOk = true;
+          break;
+        } finally {
+          smsSendGateRelease();                   // 无论成功/失败都释放门控，避免死锁
+        }
+      }
+      if (!sentOk) {
+        throw new Error('验证码发送过于频繁，已用同一号码重试 ' + RESEND_MAX + ' 次仍被限频: ' + JSON.stringify(lastRateJson).slice(0, 200));
+      }
       const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
       console.log('  验证码:', code);
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });

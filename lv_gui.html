@@ -953,7 +953,8 @@ function renderDomRows(s) {
       if (s.mode !== 'login' && r.instanceId) detail += ' · 实例 ' + esc((r.instanceId || '').slice(0, 16));
     } else {
       stageCls = 't-bad'; stageTxt = '❌ 失败';
-      detail = '手机 ' + esc(r.phone || '') + '（详见日志）';
+      const why = (r.error && String(r.error).trim()) ? String(r.error) : '详见日志';
+      detail = (r.phone ? ('手机 ' + esc(r.phone) + ' · ') : '') + esc(why);
     }
     html += '<tr><td class="mono">' + i + '</td>' +
       '<td class="mono">' + esc(r ? r.name : '') + '</td>' +
