@@ -673,6 +673,13 @@ async function doCopy(which) {
   try { await navigator.clipboard.writeText(r.text); appendLog(['[复制] ✓ 已复制 ' + r.count + ' 个账号']); }
   catch (e) { appendLog(['[复制] ✗ ' + e.message + '（可改用「导出」下载）']); }
 }
+async function doDump(which) {
+  const r = await API.export_text(which);
+  if (!r || !r.ok) { appendLog(['[导出] ✗ ' + (r && r.error)]); return; }
+  const label = {all: '全部', ok: '仅成功', fail: '仅失败'}[which] || which;
+  appendLog(['=== 导出 ' + label + '：' + r.count + ' 个账号（可直接鼠标拖选复制）===']);
+  appendLog([r.text]);
+}
 async function doTkInfo() {
   const r = await API.tokens_info();
   if (!r || !r.ok) { $('tkStat').textContent = ''; return; }
@@ -804,9 +811,9 @@ function boot() {
   $('btnStop').onclick = doStop;
   $('btnMonStart').onclick = () => { doMonStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnMonStop').onclick = doMonStop;
-  $('btnExpAll').onclick = () => doExport('all');
-  $('btnExpOk').onclick = () => doExport('ok');
-  $('btnExpFail').onclick = () => doExport('fail');
+  $('btnExpAll').onclick = () => doDump('all');
+  $('btnExpOk').onclick = () => doDump('ok');
+  $('btnExpFail').onclick = () => doDump('fail');
   $('btnExpCopy').onclick = () => doCopy('all');
   $('btnTkExport').onclick = doTkExport;
   $('btnTkImport').onclick = doTkImport;

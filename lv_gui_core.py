@@ -678,7 +678,18 @@ class Job(object):
             self.row(idx, stage="失败", detail=str(e)[:160], ok=False, result="error")
 
     def _rush(self, idx, tag, s, has_pass):
-        """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。"""
+        """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。
+
+        ★ 仿浏览器真实行为：下单只发一次 → 然后耐心轮询等生效；确认没抢到才发下一单。
+          老版把"下单"和"等生效"揉进一个急循环（每次下单只等 0.8s 就查，未生效立刻重发），
+          而 pass 正常要数秒才 provision 到 /v1/passes，于是几乎必然误判"未生效"、
+          每 ~1.8s 重复下单：要么顶掉/重置 pending 订单，要么触发服务端频控，
+          导致本来一单能成的事要抢很多发才中一次。拆成两阶段后：
+            A. 发一单（200=已下单/待生效；非200=没抢到，隔 interval 再试；401=凭证死）
+            B. 下单成功后只轮询 live_passes 不重发，递增等待(2s→…→8s)最多 PATIENCE 秒，
+               生效即成功；超窗口仍未生效才回 A 重发下一单。
+        """
+        PATIENCE = 15.0
         if has_pass:
             return True
         # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
@@ -693,30 +704,20 @@ class Job(object):
         deadline = time.time() + self.duration
         n = 0
         while time.time() < deadline and not self._stopped():
+            # ---- A. 发一单 ----
             n += 1
             try:
                 st, code, msg = order(s, self.bundle)
             except Exception as e:
                 if n == 1 or n % 10 == 0:
-                    self.log(tag + " 第 %d 发网络异常，重连重试：%s" % (n, str(e)[:60]))
+                    self.log(tag + " 第 %d 发网络异常，稍后重试：%s" % (n, str(e)[:60]))
                 time.sleep(self.interval)
                 continue
-            if 200 <= st < 300:
-                time.sleep(0.8)
-                live = live_passes(s)
-                if live:
-                    pid = live[0].get("pass_id", "")
-                    bid = live[0].get("bundle_id", "")
-                    self.log(tag + " 🎉 抢到！第 %d 发 | %s | pass=%s" % (n, bid, pid))
-                    self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="grabbed")
-                    return True
-                self.log(tag + " 第 %d 发下单成功但未生效，继续 ..." % n)
-                self.row(idx, stage="抢单中", detail="第 %d 发已下单待生效" % n)
-            elif st == 401:
+            if st == 401:
                 self.log(tag + " ❌ 凭证失效(401)")
                 self.row(idx, stage="失败", detail="凭证失效(401)", ok=False, result="error")
                 return False
-            else:
+            if not (200 <= st < 300):
                 # 监控批次：下单失败且已回售罄 → 立即终止后续账号
                 if self.abort_if_soldout and bundle_state(self.proxy, self.bundle) == "SOLD_OUT":
                     self.log(tag + " 🛑 下单失败且已售罄，终止本账号")
@@ -725,6 +726,29 @@ class Job(object):
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
                 self.row(idx, stage="抢单中", detail="已发 %d 次｜%s" % (n, code or msg))
+                time.sleep(self.interval)
+                continue
+            # ---- B. 下单成功 → 耐心等生效（只轮询，不重发订单）----
+            self.log(tag + " 第 %d 发下单成功，等待生效 ..." % n)
+            self.row(idx, stage="抢单中", detail="第 %d 发已下单，等待生效" % n)
+            waited = 0.0
+            step = 2.0
+            while waited < PATIENCE and time.time() < deadline and not self._stopped():
+                time.sleep(step)
+                waited += step
+                live = live_passes(s)
+                if live:
+                    pid = live[0].get("pass_id", "")
+                    bid = live[0].get("bundle_id", "")
+                    self.log(tag + " 🎉 抢到！第 %d 发 | %s | pass=%s（等待 %.1fs 生效）"
+                             % (n, bid, pid, waited))
+                    self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="grabbed")
+                    return True
+                step = min(step + 1.0, 8.0)
+            if self._stopped() or time.time() >= deadline:
+                break
+            # 耐心窗口耗尽仍未生效 → 这一单没成，回 A 重发下一单
+            self.log(tag + " 第 %d 发等待 %.0fs 仍未生效，重发下一单 ..." % (n, waited))
             time.sleep(self.interval)
         if self._stopped():
             self.row(idx, stage="已停止", detail="用户停止", ok=False, result="stopped")
@@ -886,8 +910,7 @@ class Job(object):
             row = next((r for r in self.rows if r["idx"] == a["idx"]), None)
             if row is None or not sel(row):
                 continue
-            if a["ok"]:
-                lines.append(to_line(a))
+            lines.append(to_line(a))
         return lines
 
 
