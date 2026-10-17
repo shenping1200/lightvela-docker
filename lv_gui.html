@@ -401,6 +401,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <div class="bar" style="margin-top:8px">
           <button class="btn primary" id="domBtnStart">▶ 开始</button>
           <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
+          <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
           <span id="domRunStat" class="stat"></span>
         </div>
         <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
@@ -443,7 +444,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 let pollTimer = null, logLen = 0, running = false, booted = false;
-let currentTab = 'intl', domRunning = false, domLogLen = 0;
+let currentTab = 'intl', domRunning = false, domLogLen = 0, lastDomStatus = null;
 
 /* ---------- 后端桥：把 window.pywebview.api 换成 fetch ---------- */
 const API = new Proxy({}, {
@@ -835,6 +836,7 @@ function boot() {
   $('domBtnClear').onclick = () => { $('domAcc').value = ''; domParse(); };
   $('domBtnStart').onclick = domStart;
   $('domBtnStop').onclick = domStop;
+  $('domBtnExportFailed').onclick = domExportFailed;
   $('domBtnTkInfo').onclick = domTkInfo;
   $('domBtnTkExport').onclick = domTkExport;
   $('domBtnTkDel').onclick = domTkDel;
@@ -904,12 +906,23 @@ async function domStart() {
   const r = await API[(mode === 'login' ? 'domestic_login' : 'domestic_run')]($('domAcc').value, conc);
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
-  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false;
+  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true;
   switchTab('domestic');
   appendDomLog(['[已启动] 模式=' + (mode === 'login' ? '① 登录+拿凭证' : '② 全流程') + ' · 并发=' + conc + ' · 共 ' + r.total + ' 个']);
 }
 
 async function domStop() { await API.domestic_stop(); }
+
+async function domExportFailed() {
+  const s = lastDomStatus;
+  if (!s || !s.results) { appendDomLog(['[导出失败] 还没有运行记录']); return; }
+  const failed = (s.results || []).filter(r => r && !r.ok);
+  if (!failed.length) { appendDomLog(['[导出失败] 没有失败账号 ✓']); return; }
+  const lines = failed.map(r => (r.name || '') + ' ' + (r.idCard || ''));
+  appendDomLog(['=== 失败账号（姓名 身份证，可直接复制重新导入）===']);
+  appendDomLog(lines);
+  appendDomLog(['[导出失败] 共 ' + failed.length + ' 个（已显示在上方，未生成文件）']);
+}
 
 function renderDomRows(s) {
   const total = s.total || 0;
@@ -951,6 +964,7 @@ async function domPoll() {
   if (!domRunning) return;
   const s = await API.domestic_status();
   if (!s || !s.ok) return;
+  lastDomStatus = s;
   if (s.logs) {
     if (s.logs.length < domLogLen) { $('domLog').textContent = ''; domLogLen = 0; }
     if (s.logs.length > domLogLen) { appendDomLog(s.logs.slice(domLogLen)); domLogLen = s.logs.length; }
@@ -960,7 +974,7 @@ async function domPoll() {
     (s.running ? ' · 运行中…' : ' · 已结束');
   if (!s.running) {
     domRunning = false;
-    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true;
+    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportFailed').disabled = false;
     appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
     doTkInfo();
   }

@@ -311,26 +311,36 @@ def _read_tokens():
 
 
 def parse_accounts(text):
-    """解析「姓名----身份证」文本（每行一条）。返回 [{name, idCard}]。"""
+    """解析「姓名 + 身份证」文本（每行一条，姓名与身份证之间可用空格/----/——/|/、/逗号等任意分隔）。
+    返回 [{name, idCard}]。优先按 18 位身份证特征抓取，姓名取其前的文字。"""
     out = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
             continue
-        # 兼容 ---- / —— / 两个以上连字符
-        m = re.split(r"-{2,}", line, maxsplit=1)
-        if len(m) != 2:
-            m2 = line.split("——")
-            if len(m2) == 2:
-                m = m2
-            else:
-                continue
-        name = m[0].strip()
-        idc = m[1].strip()
-        if not name or not idc:
+        # 身份证：18 位，前 17 位数字、末位为数字或 X
+        m = re.search(r"(\d{17}[\dXx])", line)
+        if not m:
+            continue
+        idc = m.group(1)
+        # 姓名 = 身份证之前的文字，清掉残留的分隔符/标点
+        name = line[:m.start()].strip()
+        name = re.sub(r"[\s\-—_|,:，。、；;]+", "", name)
+        if not name:
             continue
         out.append({"name": name, "idCard": idc})
     return out
+
+
+_NOISE_PAT = re.compile(
+    r"\[WS\]|\[TAT\]|\[Hermes\]|\[代理\]|\[发送\]|\[回复全文长度|\[回复\]\s*$|"
+    r"HTTP/1\.1|TLS 就绪|PtyStart|PtyProxyNew|BSON|字节|session\.create|"
+    r"session_id|函数长度|代理通道就绪|WS 握手|Sec-WebSocket"
+)
+
+def _is_noise_line(s):
+    """底层协议/调试行（WS 帧、TAT 中继、Hermes token、TLS、BSON 等）拦截，不进面板日志。"""
+    return bool(_NOISE_PAT.search(s))
 
 
 def _append_log(line, prefix=""):
@@ -366,7 +376,9 @@ def _run_one(idx, acc, mode, accounts_file):
     exit_code = None
     try:
         for line in proc.stdout:
-            _append_log(line.rstrip("\n"), "[%02d %s] " % (idx, acc["name"]))
+            s = line.rstrip("\n")
+            if not _is_noise_line(s):
+                _append_log(s, "[%02d %s] " % (idx, acc["name"]))
             if fd:
                 fd.write(line)
             m = CRED_RE.search(line)
