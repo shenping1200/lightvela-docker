@@ -527,6 +527,29 @@ async function restCreateBot(name) {
 }
 
 // ===================== 设主模型（纯代码复刻前端【Set as primary model】）=====================
+
+// 等实例变成 active/running：实例处于 Creating 期间 debug/exec 必回 409 DEBUG_NOT_SUPPORTED。
+// 抓包实测窗口约 8 秒：建实例 15:28:05 → 设模型 15:28:05.7 / 15:28:09.9 两次 409 → 15:28:13.6 才 200。
+async function waitInstanceReady(instanceId, maxMs) {
+  const t0 = Date.now();
+  let status = '';
+  while (Date.now() - t0 < maxMs) {
+    try {
+      const r = await httpsReq('GET', '/v1/instances');
+      const its = pickArray(unwrapData(r.json), ['items', 'instances']) || [];
+      const hit = its.find((x) => (x.instance_id || x.id) === instanceId);
+      if (hit && hit.status) status = String(hit.status);
+    } catch (e) { /* 忽略单次查询失败 */ }
+    if (/active|running/i.test(status)) {
+      console.log('[模型] 实例已就绪: ' + status);
+      return true;
+    }
+    await sleep(3000);
+  }
+  console.log('[模型] 等实例就绪超时，最后状态=' + (status || '?') + '（仍会尝试设模型）');
+  return false;
+}
+
 // 失败即抛错（方案甲）：不设主模型机器人不会回话，部署无意义，按方案C保留环境等排查。
 async function restSetPrimaryModel(instanceId) {
   if (process.env.LIGHTVELA_NO_SET_MODEL) {
@@ -556,12 +579,25 @@ async function restSetPrimaryModel(instanceId) {
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="python3"; fi\n' +
     'printf \'%s\n\' \'' + bootstrap + "' | \"$HERMES_PYTHON\" - \"" + payload + "\" \"" + HERMES_MODEL_CFG_SCRIPT_B64 + "\"";
 
-  console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec)');
-  const r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
-    body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
-  });
-  if (!r.json || r.json.code !== 'OK') {
-    throw new Error('debug/exec HTTP 层失败: ' + (r.text || '').slice(0, 240));
+  // 先等实例就绪（Creating 期间发必吃 409），再发；仍 409 就退避重试
+  await waitInstanceReady(instanceId, 90000);
+
+  let r = null;
+  let lastCode = '';
+  for (let i = 1; i <= 5; i++) {
+    console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec) 第 ' + i + ' 次');
+    r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
+      body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
+    });
+    if (r.json && r.json.code === 'OK') break;
+    lastCode = String((r.json && (r.json.code || r.json.message)) || '');
+    // 只有「实例还没准备好」这一类 409 才值得重试，其它错误照原样抛出
+    if (!/DEBUG_NOT_SUPPORTED/i.test(lastCode)) break;
+    console.log('[模型] 实例尚未就绪(409 DEBUG_NOT_SUPPORTED)，3s 后重试');
+    await sleep(3000);
+  }
+  if (!r || !r.json || r.json.code !== 'OK') {
+    throw new Error('debug/exec HTTP 层失败: ' + ((r && r.text) || '').slice(0, 240));
   }
   const data = r.json.data || {};
   const output = typeof data.output === 'string' ? data.output : '';

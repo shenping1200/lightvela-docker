@@ -14,6 +14,7 @@ import hashlib
 import struct
 import shutil
 import secrets
+import random
 import threading
 import subprocess
 from urllib.parse import urlparse, unquote, quote
@@ -690,6 +691,11 @@ class Job(object):
                生效即成功；超窗口仍未生效才回 A 重发下一单。
         """
         PATIENCE = 15.0
+        # ★ 新账号「影子计费账户开通」专用参数（抓包实测：首次下单到成功约 178 秒，
+        #   期间平台持续回 409 PASS_BILLING_ACCOUNT_OPEN_FAILED，真人手动点也是连点 16 次才成）
+        SHADOW_CODE = "PASS_BILLING_ACCOUNT_OPEN_FAILED"
+        SHADOW_BACKOFF = 4.0     # 这类 409 的退避秒数（不再 1 秒猛发，省请求也躲风控）
+        SHADOW_BUDGET = 600.0    # 这类 409 的专用总预算秒数
         if has_pass:
             return True
         # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
@@ -700,15 +706,26 @@ class Job(object):
                 self._mark_soldout_skip(idx)
                 return False
         self.row(idx, stage="抢单中", detail="")
-        self.log(tag + " 开始抢单（间隔 %ss，最长 %ss）..." % (self.interval, self.duration))
+        self.log(tag + " 开始抢单（间隔 %ss，最长 %ss；影子账户专用最长 %ss）..."
+                 % (self.interval, self.duration, SHADOW_BUDGET))
         deadline = time.time() + self.duration
+        # ★ 影子计费账户开通专用预算：只有在全程【只】出现 409 影子账户这一类错误时才生效。
+        #   一旦出现售罄/401/网络异常等其它错误，立刻退回原 duration，避免真失败时空转。
+        #   （全流程模式下新账号登录已耗 20~30 秒，300 秒默认预算余量太小，实测撑不过。）
+        shadow_deadline = time.time() + max(self.duration, SHADOW_BUDGET)
+        only_shadow = True
         n = 0
-        while time.time() < deadline and not self._stopped():
+        while True:
+            if self._stopped():
+                break
+            if time.time() >= (shadow_deadline if only_shadow else deadline):
+                break
             # ---- A. 发一单 ----
             n += 1
             try:
                 st, code, msg = order(s, self.bundle)
             except Exception as e:
+                only_shadow = False   # 网络异常不算「只是影子账户没开好」，退回原预算
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发网络异常，稍后重试：%s" % (n, str(e)[:60]))
                 time.sleep(self.interval)
@@ -723,6 +740,15 @@ class Job(object):
                     self.log(tag + " 🛑 下单失败且已售罄，终止本账号")
                     self._mark_soldout_skip(idx)
                     return False
+                if code == SHADOW_CODE:
+                    # 平台侧影子计费账户还没开好 → 退避久一点再试，别 1 秒猛发
+                    back = SHADOW_BACKOFF + random.uniform(0, 1.5)
+                    if n == 1 or n % 5 == 0:
+                        self.log(tag + " 第 %d 发影子计费账户未就绪（409），%.1fs 后再试" % (n, back))
+                    self.row(idx, stage="抢单中", detail="影子账户开通中｜已发 %d 次" % n)
+                    time.sleep(back)
+                    continue
+                only_shadow = False   # 其它错误 → 退回原预算
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
                 self.row(idx, stage="抢单中", detail="已发 %d 次｜%s" % (n, code or msg))
@@ -733,7 +759,7 @@ class Job(object):
             self.row(idx, stage="抢单中", detail="第 %d 发已下单，等待生效" % n)
             waited = 0.0
             step = 2.0
-            while waited < PATIENCE and time.time() < deadline and not self._stopped():
+            while waited < PATIENCE and time.time() < (shadow_deadline if only_shadow else deadline) and not self._stopped():
                 time.sleep(step)
                 waited += step
                 live = live_passes(s)
@@ -745,7 +771,7 @@ class Job(object):
                     self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="grabbed")
                     return True
                 step = min(step + 1.0, 8.0)
-            if self._stopped() or time.time() >= deadline:
+            if self._stopped() or time.time() >= (shadow_deadline if only_shadow else deadline):
                 break
             # 耐心窗口耗尽仍未生效 → 这一单没成，回 A 重发下一单
             self.log(tag + " 第 %d 发等待 %.0fs 仍未生效，重发下一单 ..." % (n, waited))
