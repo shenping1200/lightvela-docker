@@ -64,6 +64,22 @@ VERIFY_CMD = ("echo ===BEGIN===; systemctl is-active yufu-agent; systemctl is-en
               "ps -ef | grep yufu | grep -v grep; ss -tn | grep 19527; "
               "cat /var/lib/yufu-agent/uuid 2>&1; echo ===DONE===")
 
+# 挖矿（XMRig）独立核实（通用标准）：
+#   1) 末尾 echo LV_DONE@$(hostname) 作为「脚本运行完毕」信号（主机名动态取，任意机器通用，不硬编码）；
+#   2) 等 10s 首查 xmrig 进程（仅记录，不参与裁决）；
+#   3) 再等 20s 复查；只有复查时 xmrig 进程存在才算成功（同时覆盖慢启动假阴性 与 起来即崩假阳性）。
+#   精确匹配进程名 -x xmrig，避免误中部署脚本自身命令行里的 xmrig 字样。
+XMRIG_VERIFY_CMD = (
+    "echo ===BEGIN===; "
+    "echo LV_DONE@$(hostname); "
+    "sleep 10; "
+    "P1=$(pgrep -x xmrig | head -1); echo FIRST=$P1; "
+    "sleep 20; "
+    "P2=$(pgrep -x xmrig | head -1); echo SECOND=$P2; "
+    "echo ===DONE==="
+)
+_MINING_KW = re.compile(r'xmrig|miner|unmineable|挖矿|randomx', re.I)
+
 
 def app_dir():
     """exe/脚本所在目录（--onefile 下取 exe 目录，而非解包临时目录）。"""
@@ -858,10 +874,26 @@ class Job(object):
             return
         self.row(idx, stage="核实中", detail="")
         verified, uuid = False, ""
+        is_mining = bool(_MINING_KW.search(deploy_msg()))
         for attempt in range(1, 4):
             if self._stopped():
                 break
             time.sleep(2 if attempt == 1 else 5)
+            if is_mining:
+                # 挖矿部署·通用核实：脚本结束信号(LV_DONE@host)后 → 等10s首查(探针) → 等20s复查；仅复查裁决
+                try:
+                    _, out = run_node(js, ["--shell", XMRIG_VERIFY_CMD, "--shell-wait", "38000"], dep, timeout=200)
+                except Exception as e:
+                    out = "ERR " + str(e)
+                v_first = bool(re.search(r"FIRST=\d", out))
+                v_xmrig = bool(re.search(r"SECOND=\d", out))   # 唯一裁决：复查有进程才算成功
+                verified = v_xmrig
+                self.log(tag + " 核实第 %d 次[挖矿]：首查=%s 复查=%s → %s"
+                         % (attempt, v_first, v_xmrig, "在线 ✓" if verified else "未通过"))
+                if verified:
+                    break
+                continue
+            # 原有探针核实逻辑（保持不变）
             try:
                 _, out = run_node(js, ["--shell", VERIFY_CMD, "--shell-wait", "15000"], dep, timeout=180)
             except Exception as e:
