@@ -37,6 +37,7 @@ const net = require('net');
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const { normalizeProxy, connectTunnel, makeHttpsAgent } = require('./lv-proxy');
 
 // ===================== 设主模型脚本(hermes 官方模型配置, gzip+base64, 通用) =====================
@@ -500,12 +501,139 @@ async function smsSendGate(gapMs) {
 }
 function smsSendGateRelease() { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }
 function smsSendGateTouch() { try { fs.writeFileSync(SMS_GATE_TS, JSON.stringify({ t: Date.now() })); } catch (e) {} }
-function isSendRateLimited(json) {
-  if (!json) return false;
-  return /verification_provider_rate_limited|发送过于频繁|rate_limit|too many/i.test(JSON.stringify(json));
+// 返回限流类型代码（字符串），非限流返回 null。
+//   'verification_provider_rate_limited' —— 出口IP被官方（腾讯云短信）限频（脏IP），重发换IP可解
+//   其他（发送过于频繁 / rate_limit / too many 等）—— 非IP类限流，等满手机号冷却后通常可恢复
+function getSendRateLimitType(json) {
+  if (!json) return null;
+  const s = JSON.stringify(json);
+  if (/verification_provider_rate_limited/i.test(s)) return 'verification_provider_rate_limited';
+  if (/发送过于频繁|rate_limit|too many/i.test(s)) return 'other';
+  return null;
+}
+function isSendRateLimited(json) { return getSendRateLimitType(json) !== null; }
+
+// ===================== 实名补救·跨进程身份占用标记 =====================
+// 背景：接码登录成功后，原身份的 姓名/身份证 不匹配（realname_mismatch）时，要从「号码库」里再取一条
+//       「排队中、还没被注册」的身份补做实名的。多个账号是并发的子进程，必须保证：
+//       ① 被补救占用的身份，不能再被它「自己的」注册子进程拿去注册（否则同一身份证绑两个账号）；
+//       ② 一条脏数据（本身姓名/身份证就不匹配）不会反复被不同账号当补救候选浪费次数。
+// 实现：一个共享的 domestic-claims.json（按账号序号索引），配 .lock 文件锁做互斥；谁先抢到标记谁用。
+const CLAIMS_FILE = process.env.LIGHTVELA_DOMESTIC_CLAIMS
+  || path.join(path.dirname(process.env.LIGHTVELA_ACCOUNTS_FILE || __filename), 'domestic-claims.json');
+const CLAIMS_LOCK = CLAIMS_FILE + '.lock';
+
+function _loadClaims() {
+  try { return JSON.parse(fs.readFileSync(CLAIMS_FILE, 'utf8')); } catch (e) { return {}; }
+}
+function _saveClaims(obj) {
+  // 原子写：先写临时文件再 rename，避免并发半写导致 JSON 损坏
+  const tmp = CLAIMS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, CLAIMS_FILE);
+}
+async function _withClaimsLock(fn) {
+  // 简单文件锁：wx 独占创建，拿不到就短 sleep 重试；Linux/Windows 都支持
+  const deadline = Date.now() + 15000;
+  for (;;) {
+    try { const fd = fs.openSync(CLAIMS_LOCK, 'wx'); fs.closeSync(fd); break; }
+    catch (e) {
+      if (Date.now() > deadline) throw new Error('获取实名补救锁超时');
+      await sleep(20);
+    }
+  }
+  try { return fn(); }
+  finally { try { fs.unlinkSync(CLAIMS_LOCK); } catch (e) {} }
 }
 
-async function domesticLogin(acc) {
+// 子进程启动时调用：把自己这条身份标记为「本进程自行注册中」；若已被别的账号补救占用 → 返回 'skipped' 直接跳过
+async function markSelfRunning(idx) {
+  return _withClaimsLock(() => {
+    const claims = _loadClaims();
+    if (claims[idx] && claims[idx].status === 'consumed') return 'skipped';
+    claims[idx] = { status: 'self_registering', at: Date.now() };
+    _saveClaims(claims);
+    return 'ok';
+  });
+}
+// 标记某条身份为「已作废」（脏数据：本身姓名/身份证不匹配，任何人都不该再拿它注册或补救）
+async function markIdentityBad(idx) {
+  return _withClaimsLock(() => {
+    const claims = _loadClaims();
+    claims[idx] = { status: 'bad', at: Date.now(), reason: 'realname_mismatch' };
+    _saveClaims(claims);
+  });
+}
+// 释放某条被补救占用的身份（仅在「请求异常、不等于脏数据」时调用，让其可被其他账号继续尝试）
+async function releaseIdentity(idx) {
+  return _withClaimsLock(() => {
+    const claims = _loadClaims();
+    if (claims[idx] && claims[idx].status === 'consumed' && claims[idx].reason === 'realname_recovery') {
+      delete claims[idx];
+      _saveClaims(claims);
+    }
+  });
+}
+async function markIdentityDone(idx) {
+  return _withClaimsLock(() => {
+    const claims = _loadClaims();
+    claims[idx] = { status: 'done', at: Date.now() };
+    _saveClaims(claims);
+  });
+}
+// 补救时扫描号码库：取一条「完全空闲（无任何标记）」的身份占用之；优先取靠后的序号（更可能还在排队未启动）
+// 返回 {idx,name,idCard} 或 null（没有可用排队身份）
+async function claimNextQueuedIdentity(selfIdx) {
+  return _withClaimsLock(() => {
+    const claims = _loadClaims();
+    const free = [];
+    for (let k = 0; k < ACCOUNTS.length; k++) {
+      if (k === selfIdx) continue;
+      if (claims[k]) continue;          // 任何已标记（占用/注册中/作废/完成）都跳过
+      free.push(k);
+    }
+    if (!free.length) return null;
+    free.sort((a, b) => b - a);         // 靠后的优先：前面的批次大概率已在跑，留给它们自己注册更稳
+    const k = free[0];
+    claims[k] = { status: 'consumed', by: selfIdx, at: Date.now(), reason: 'realname_recovery' };
+    _saveClaims(claims);
+    return { idx: k, name: ACCOUNTS[k].name, idCard: ACCOUNTS[k].idCard };
+  });
+}
+
+// 实名补救：原身份不匹配时，循环从号码库取排队身份补做实名，直到成功或耗尽
+// 返回 {name,idCard,attemptId,claimedIdx}；无可用身份或多次仍不匹配则抛错（终止本次注册）
+async function recoverRealname(selfIdx) {
+  // 先把「原身份」标记为作废，避免它沦为别人的补救候选（它是脏数据）
+  await markIdentityBad(selfIdx);
+  const MAX_RECOVERY = Number(process.env.LIGHTVELA_REALNAME_RECOVERY_MAX || 5);
+  for (let n = 1; n <= MAX_RECOVERY; n++) {
+    const claim = await claimNextQueuedIdentity(selfIdx);
+    if (!claim) {
+      throw new Error('实名补救失败：号码库已无可用的排队身份（其余均已占用/已注册/已作废），终止本次注册');
+    }
+    console.log(`  🔁 实名补救#${n}：原身份不匹配，改用排队身份 ${claim.name}(${claim.idCard}) 重试实名…`);
+    try {
+      const rn = await httpsReq('POST', '/auth/realname/faceid/attempts', {
+        body: { name: claim.name, idCard: claim.idCard, consent: true },
+      });
+      if (rn.json && rn.json.state === 'succeeded') {
+        console.log('  ✅ 实名补救成功 | attemptId=', rn.json.attemptId, ' 实际身份=', claim.name);
+        return { name: claim.name, idCard: claim.idCard, attemptId: rn.json.attemptId, claimedIdx: claim.idx };
+      }
+      // 该候选也不匹配 → 标记作废，继续下一个排队身份
+      await markIdentityBad(claim.idx);
+      console.log('  ⚠️ 补救候选', claim.name, '也不匹配，继续下一个排队身份…');
+    } catch (e) {
+      // 请求异常（网络等）≠ 脏数据，释放占用让其可被其他账号继续尝试
+      await releaseIdentity(claim.idx);
+      console.log('  ⚠️ 补救候选', claim.name, '实名请求异常：', e.message, '，释放后继续下一个…');
+    }
+  }
+  throw new Error('实名补救失败：已尝试 ' + MAX_RECOVERY + ' 个排队身份仍无法完成实名，终止本次注册');
+}
+
+async function domesticLogin(acc, idx) {
   console.log(`\n===== 账号: ${acc.name} (${acc.idCard}) =====`);
   const MAX_RENT = Number(process.env.LIGHTVELA_SMS_MAX_RENT || 3);          // 最多换几个号
   const CODE_TIMEOUT_MS = Number(process.env.LIGHTVELA_SMS_CODE_TIMEOUT_MS || 180000); // 官方：超三分钟未收到验证码即拉黑重取
@@ -535,9 +663,17 @@ async function domesticLogin(acc) {
         try {
           const sr = await httpsReq('POST', '/auth/sms/send', { body: { phone } });
           smsSendGateTouch();                     // 记录本次发码时间（成功/限频都记），供并发账号错峰
-          if (isSendRateLimited(sr.json)) {
+          const rlType = getSendRateLimitType(sr.json);
+          if (rlType) {
             lastRateJson = sr.json;
-            continue;                             // 下一轮 resend（带60s等待）用同一号码重发
+            if (rlType === 'verification_provider_rate_limited') {
+              // 脏IP限流：代理池每次请求自动换出口IP，下一轮重发即换新IP；但仍须等满手机号冷却，否则网站照样限
+              console.log(`  ⚠️ 限流类型=IP脏(${rlType})：出口IP被官方限频 → 重发时代理池自动换IP，但仍须等满 ${RESEND_WAIT_MS / 1000}s 手机号冷却`);
+            } else {
+              // 其他限流：非IP问题，保持原等待后重发即可
+              console.log(`  ⚠️ 限流类型=其他(${rlType})：非IP类限流，保持 ${RESEND_WAIT_MS / 1000}s 等待后重发`);
+            }
+            continue;                             // 下一轮 resend（带 60s 等待）用同一号码重发
           }
           console.log('  已发验证码:', JSON.stringify(sr.json).slice(0, 120));
           sentOk = true;
@@ -566,9 +702,19 @@ async function domesticLogin(acc) {
       const rn = await httpsReq('POST', '/auth/realname/faceid/attempts', {
         body: { name: acc.name, idCard: acc.idCard, consent: true },
       });
-      if (!rn.json || rn.json.state !== 'succeeded') throw new Error('实名失败: ' + JSON.stringify(rn.json).slice(0, 240));
-      console.log('  ✅ 实名成功 | attemptId=', rn.json.attemptId);
-      return { token, uid, phone };
+      if (rn.json && rn.json.state === 'succeeded') {
+        console.log('  ✅ 实名成功 | attemptId=', rn.json.attemptId);
+        return { token, uid, phone, realname: { name: acc.name, idCard: acc.idCard } };
+      }
+      // ★ 实名没过：区分「身份不匹配」和「其他错误」
+      if (rn.json && rn.json.code === 'realname_mismatch') {
+        // 原身份 姓名/身份证 不匹配（已接码登录成功，仅实名信息错）→ 从号码库取排队身份补救
+        console.log('  ⚠️ 原身份实名不匹配（', (rn.json.message || ''), '），进入补救流程…');
+        const recovered = await recoverRealname(idx);   // 内部无可用身份会抛错终止本次注册
+        return { token, uid, phone, realname: recovered };
+      }
+      // 其他实名错误（网络/风控/未知）→ 维持原行为抛出
+      throw new Error('实名失败: ' + JSON.stringify(rn.json).slice(0, 240));
     } catch (e) {
       lastErr = e;
       // ★ 可重试的「号源类」失败（不归实名/验码/网络错误）：
@@ -1427,8 +1573,18 @@ async function main() {
   if (singleIdx >= 0 && (isNaN(singleIdx) || singleIdx < 0 || singleIdx >= ACCOUNTS.length)) {
     throw new Error('--account-idx 越界: ' + args[idxPos + 1] + ' (共 ' + ACCOUNTS.length + ' 个)');
   }
-  const runList = singleIdx >= 0 ? [ACCOUNTS[singleIdx]] : ACCOUNTS;
+  const runPairs = singleIdx >= 0
+    ? [{ acc: ACCOUNTS[singleIdx], idx: singleIdx }]
+    : ACCOUNTS.map((a, i) => ({ acc: a, idx: i }));
   if (singleIdx >= 0) console.log('[单账号模式] idx=' + singleIdx + ' name=' + ACCOUNTS[singleIdx].name + (loginOnly ? ' [仅登录]' : ''));
+
+  // ★ 单进程全量模式（未传 --account-idx）由本进程统一调度，启动时清空上轮残留的「身份占用标记」，避免误跳过；
+  //   子进程模式（带 --account-idx）由 domestic_core.py 在每轮运行开头统一清空，这里不重复清，避免并发竞态。
+  if (singleIdx < 0) {
+    for (const f of [CLAIMS_FILE, CLAIMS_LOCK]) {
+      try { fs.unlinkSync(f); } catch (e) {}
+    }
+  }
 
   try { console.log('[豪猪] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
   catch (e) { console.warn('[豪猪] 查余额失败:', e.message); }
@@ -1438,24 +1594,33 @@ async function main() {
   console.log('[部署] 待发消息 ' + deployMsg.length + ' 字符，来源=' + (msgArg ? '--message 参数' : DEPLOY_MSG_FILE));
 
   const results = [];
-  for (const acc of runList) {
+  for (const { acc, idx } of runPairs) {
+    // ★ 实名补救跨进程协调：本身份若已被别的账号补救占用（consumed），本子进程直接跳过，不再注册本身份
+    const selfStatus = await markSelfRunning(idx);
+    if (selfStatus === 'skipped') {
+      console.log(`[跳过] idx=${idx} ${acc.name}：本身份已被其他账号实名占用（补救），不再注册本身份`);
+      results.push({ idx, name: acc.name, idCard: acc.idCard, skipped: true });
+      continue;
+    }
     try {
       // 1) 取号 → 发码 → 取码 → 验码 → 实名（Bearer 写进 CFG）
       //    ★ 续跑模式：整段跳过，直接复用上次落盘的 bearer（不取号 / 不花钱 / 不换号）
-      let uid, phone;
+      let uid, phone, realname = { name: acc.name, idCard: acc.idCard };
       if (resume) {
         const saved = readDomesticToken(acc.name, acc.idCard);
         if (!saved || !saved.bearer) throw new Error('续跑失败：凭证里没有 ' + acc.name + ' 的 bearer，请先跑一次完整流程');
         CFG.bearer = saved.bearer;
         if (saved.instanceId) CFG.instanceId = saved.instanceId;
         uid = saved.uid; phone = saved.phone;
+        if (saved.idCard) realname = { name: saved.name || acc.name, idCard: saved.idCard };
         console.log('[续跑] 复用已登录凭证：' + acc.name + '（跳过取号/实名）');
       } else {
-        const lg = await domesticLogin(acc);
-        uid = lg.uid; phone = lg.phone;
+        const lg = await domesticLogin(acc, idx);
+        uid = lg.uid; phone = lg.phone; realname = lg.realname;
       }
       // 凭证落盘（与国际版隔离），供 UI/后续复用
-      const cred = { name: acc.name, idCard: acc.idCard, phone, uid, bearer: CFG.bearer };
+      // ★ 用「实际实名身份」realname 落盘：补救后可能是另一条排队身份，按它存才能保证续跑/去重正确
+      const cred = { name: realname.name, idCard: realname.idCard, phone, uid, bearer: CFG.bearer };
       if (!resume) saveDomesticToken(cred);   // 续跑不重复追加，避免同一账号凭证刷屏
       console.log('DOMESTIC_CRED_JSON=' + JSON.stringify(cred));
       if (loginOnly) { results.push({ uid, phone, loginOk: true }); continue; }   // 模式①：只拿凭证
@@ -1474,6 +1639,7 @@ async function main() {
       if (r && r.verified) extra.verified = true;               // F 主动验证改判成功（机器人自述没命中，但探针确实在跑）
       saveDomesticToken(Object.assign({}, cred, { instanceId: CFG.instanceId, deployOk: ok }, extra));
       results.push(Object.assign({ uid, phone, instanceId: CFG.instanceId, deployOk: ok, replyLen: r && r.replyLen }, extra));
+      await markIdentityDone(idx);
     } catch (e) {
       console.error('  ❌ 账号失败:', acc.name, e.message);
     }

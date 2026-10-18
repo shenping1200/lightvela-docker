@@ -641,6 +641,15 @@ def _run_one(idx, acc, mode, accounts_file):
 
 
 def _run_thread(accounts, mode, prelude=None):
+    # ★ 实名补救跨进程协调：每轮运行开头清空上轮残留的「身份占用标记」(domestic-claims.json/lock)，
+    #   否则上一轮标记的 consumed/bad 会让本轮同序号（同一人）被误跳过或无法补救。
+    for _f in ("domestic-claims.json", "domestic-claims.json.lock"):
+        try:
+            os.remove(os.path.join(BASE, _f))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
     tmp = os.path.join(BASE, "accounts_run_tmp.js")
     try:
         try:
