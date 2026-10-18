@@ -34,3 +34,12 @@ accounts.js
 accounts_retry.js
 deploy_cmd.txt
 # 凭证账本在仓库外（../domestic-tokens.ndjson），本目录内不落盘，无需忽略
+
+# ===== 运行时产物 / 本地状态（程序运行生成，勿提交）=====
+accounts_run_tmp.js
+domestic-claims.json
+domestic-claims.json.lock
+domestic-deploy-msg.txt
+domestic-tokens.ndjson
+lv-tokens.json
+*.bak*
