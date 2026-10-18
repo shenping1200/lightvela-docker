@@ -32,7 +32,22 @@ DEFAULT_PROXY_PORT = "10800"
 DEFAULT_PROXY_USER = "6582443"
 DEFAULT_PROXY_PASS = "6582443"
 DEFAULT_PROXY = "6582443:6582443@a.rr2.kdns.fr:10800"   # 兼容旧写法
-DEFAULT_BUNDLE = "bundle_launch_ai_01"
+DEFAULT_BUNDLE = "bundle_launch_ai_01"   # 默认主套餐（4500 积分，常售罄）
+
+# 国际版订阅策略：映射到（主套餐, 降级套餐）。套餐 ID 全在此处维护一份。
+BUNDLE_LAUNCH_AI = "bundle_launch_ai_01"   # 4500 积分
+BUNDLE_LAUNCH    = "bundle_launch_01"      # 100 积分
+BUNDLE_STRATEGIES = {
+    "launch_ai":        (BUNDLE_LAUNCH_AI, None),              # 只订 4500
+    "launch":           (BUNDLE_LAUNCH,    None),              # 只订 100
+    "auto_ai_fallback": (BUNDLE_LAUNCH_AI, BUNDLE_LAUNCH),     # 优先 4500，售罄降级 100
+}
+
+
+def resolve_bundle_strategy(s):
+    """把前端传来的策略字符串解析成 (主套餐, 降级套餐)；非法值回退默认。"""
+    s = (s or "launch_ai").strip()
+    return BUNDLE_STRATEGIES.get(s, BUNDLE_STRATEGIES["launch_ai"])
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/147.0.7727.22 Safari/537.36")
 
@@ -567,7 +582,7 @@ def bundle_state(proxy_url, bundle_id=DEFAULT_BUNDLE, token=None):
 # ---------------- 任务 ----------------
 class Job(object):
     def __init__(self, accounts, proxy, mode, interval=1.0, duration=300.0,
-                 use_saved=False, bundle=DEFAULT_BUNDLE, parallel=1,
+                 use_saved=False, bundle=DEFAULT_BUNDLE, bundle_fallback=None, parallel=1,
                  flow_rush=True, bot_prefix="agent", bot_retry=3, deploy_retry=3,
                  skip_verify=False):
         self.accounts = accounts
@@ -577,6 +592,7 @@ class Job(object):
         self.duration = float(duration or 300.0)
         self.use_saved = bool(use_saved)
         self.bundle = bundle or DEFAULT_BUNDLE
+        self.bundle_fallback = bundle_fallback    # 降级套餐（主套餐售罄时改订）
         self.parallel = max(1, int(parallel or 1))
         # 监控批次专用开关
         self.abort_if_soldout = False   # 一旦售罄立即终止后续账号
@@ -736,6 +752,32 @@ class Job(object):
             self.log(tag + " ❌ 失败：%s" % e)
             self.row(idx, stage="失败", detail=str(e)[:160], ok=False, result="error")
 
+    # --- 订阅策略辅助：主套餐 + 降级套餐 ---
+    def _primary_unavailable(self):
+        """主套餐是否真的不可买：主套餐售罄，且无降级套餐可用（或降级也售罄）。
+        有降级套餐且降级可买时返回 False（应继续走降级，不应整批跳过）。"""
+        if bundle_state(self.proxy, self.bundle) != "SOLD_OUT":
+            return False
+        if not self.bundle_fallback:
+            return True
+        return bundle_state(self.proxy, self.bundle_fallback) == "SOLD_OUT"
+
+    def _choose_bundle(self):
+        """按策略选本次下单的套餐：主套餐售罄且降级确实可买 → 走降级；否则走主套餐。"""
+        if self.bundle_fallback \
+           and bundle_state(self.proxy, self.bundle) == "SOLD_OUT" \
+           and bundle_state(self.proxy, self.bundle_fallback) != "SOLD_OUT":
+            return self.bundle_fallback
+        return self.bundle
+
+    def _attempt_order(self, s, tag):
+        """下单（带降级）。返回 (st, code, msg, used_bundle)。"""
+        used = self._choose_bundle()
+        if used != self.bundle:
+            self.log(tag + " 主套餐 %s 售罄，降级下单 %s ..." % (self.bundle, used))
+        st, code, msg = order(s, used)
+        return st, code, msg, used
+
     def _rush(self, idx, tag, s, has_pass):
         """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。
 
@@ -758,8 +800,7 @@ class Job(object):
             return True
         # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
         if self.abort_if_soldout:
-            st0 = bundle_state(self.proxy, self.bundle)
-            if st0 == "SOLD_OUT":
+            if self._primary_unavailable():
                 self.log(tag + " 🛑 放开后又售罄，终止本账号")
                 self._mark_soldout_skip(idx)
                 return False
@@ -778,10 +819,10 @@ class Job(object):
                 break
             if time.time() >= (shadow_deadline if only_shadow else deadline):
                 break
-            # ---- A. 发一单 ----
+            # ---- A. 发一单（含降级策略）----
             n += 1
             try:
-                st, code, msg = order(s, self.bundle)
+                st, code, msg, used = self._attempt_order(s, tag)
             except Exception as e:
                 only_shadow = False   # 网络异常不算「只是影子账户没开好」，退回原预算
                 if n == 1 or n % 10 == 0:
@@ -793,8 +834,8 @@ class Job(object):
                 self.row(idx, stage="失败", detail="凭证失效(401)", ok=False, result="error")
                 return False
             if not (200 <= st < 300):
-                # 监控批次：下单失败且已回售罄 → 立即终止后续账号
-                if self.abort_if_soldout and bundle_state(self.proxy, self.bundle) == "SOLD_OUT":
+                # 监控批次：下单失败且已回售罄（含降级也不可用）→ 立即终止后续账号
+                if self.abort_if_soldout and self._primary_unavailable():
                     self.log(tag + " 🛑 下单失败且已售罄，终止本账号")
                     self._mark_soldout_skip(idx)
                     return False
@@ -1026,12 +1067,15 @@ class Monitor(object):
       4) 批量中一旦再售罄，立即停剩余账号并打"售罄跳过"标记。
     """
 
-    def __init__(self, accounts, proxy, interval_sec, parallel, api):
+    def __init__(self, accounts, proxy, interval_sec, parallel, api,
+                 bundle=DEFAULT_BUNDLE, bundle_fallback=None):
         self.accounts = accounts
         self.proxy = proxy
         self.interval = max(1, int(interval_sec or 5))
         self.parallel = max(1, int(parallel or 1))
         self.api = api                      # 引用 Api，便于把批次挂到 api.job 供 UI 显示
+        self.bundle = bundle                # 主套餐
+        self.bundle_fallback = bundle_fallback    # 降级套餐（主套餐售罄时改订）
         self.lock = threading.Lock()
         self.logs = []
         self.stop_flag = False
@@ -1111,13 +1155,21 @@ class Monitor(object):
             triggered = False
             while not self._stopped():
                 self.last_check = time.time()
-                st = bundle_state(self.proxy, DEFAULT_BUNDLE)
-                self.last_state = st
-                self.log("轮询：%s = %s" % (DEFAULT_BUNDLE, st))
-                if st == "AVAILABLE":
-                    self.log("🎯 检测到可购买（AVAILABLE），触发批量抢单！")
+                # 按订阅策略判断是否有可购买的套餐：主套餐可买，或主售罄但降级可买
+                st_p = bundle_state(self.proxy, self.bundle)
+                st_f = bundle_state(self.proxy, self.bundle_fallback) if self.bundle_fallback else None
+                if st_p == "AVAILABLE":
+                    self.last_state = st_p
+                    self.log("🎯 轮询：%s = AVAILABLE → 触发批量抢单！" % self.bundle)
                     triggered = True
                     break
+                if self.bundle_fallback and st_f == "AVAILABLE":
+                    self.last_state = "%s售罄→降级%s可买" % (self.bundle, self.bundle_fallback)
+                    self.log("🎯 %s 售罄，但降级套餐 %s 可购买 → 触发批量抢单！" % (self.bundle, self.bundle_fallback))
+                    triggered = True
+                    break
+                self.last_state = st_p
+                self.log("轮询：%s = %s（降级 %s = %s）" % (self.bundle, st_p, self.bundle_fallback or '-', st_f or '-'))
                 # 可被打断地等待 interval 秒
                 for _ in range(int(self.interval)):
                     if self._stopped():
@@ -1135,7 +1187,7 @@ class Monitor(object):
                      % len(self.accounts))
             job = Job(self.accounts, self.proxy, "rush",
                       interval=1.0, duration=600.0, use_saved=False,
-                      bundle=DEFAULT_BUNDLE, parallel=self.parallel,
+                      bundle=self.bundle, bundle_fallback=self.bundle_fallback, parallel=self.parallel,
                       abort_if_soldout=True)
             # 挂到 api.job，UI 的 poll() 会自动渲染表格与日志
             self.api.job = job
@@ -1240,7 +1292,7 @@ class Api(object):
 
     def start(self, text, proxy, mode, interval, duration, use_saved,
               parallel=1, flow_rush=True, bot_prefix="agent",
-              bot_retry=3, deploy_retry=3, skip_verify=False):
+              bot_retry=3, deploy_retry=3, skip_verify=False, bundle_strategy="launch_ai"):
         try:
             if self.job and not self.job.done:
                 return {"ok": False, "error": "已有任务在跑"}
@@ -1248,11 +1300,12 @@ class Api(object):
             if not accs:
                 return {"ok": False, "error": "没有账号（请粘贴或导入 txt）"}
             self._last_accounts = accs
+            _primary, _fallback = resolve_bundle_strategy(bundle_strategy)
             job = Job(accs, upgrade_socks_scheme(proxy), mode,
                       interval=interval, duration=duration, use_saved=use_saved,
                       parallel=parallel, flow_rush=flow_rush, bot_prefix=bot_prefix,
                       bot_retry=bot_retry, deploy_retry=deploy_retry,
-                      skip_verify=skip_verify)
+                      skip_verify=skip_verify, bundle=_primary, bundle_fallback=_fallback)
             if use_saved:
                 p = token_path()
                 if os.path.isfile(p):
@@ -1277,7 +1330,7 @@ class Api(object):
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
     # ---------------- 放货监控 ----------------
-    def monitor_start(self, text, proxy, interval, parallel):
+    def monitor_start(self, text, proxy, interval, parallel, bundle_strategy="launch_ai"):
         try:
             if self.monitor and not self.monitor.done:
                 return {"ok": False, "error": "监控已在运行"}
@@ -1287,7 +1340,9 @@ class Api(object):
             if not accs:
                 return {"ok": False, "error": "没有账号（请粘贴或导入 txt）"}
             self.job = None   # 清掉上一次批次残留，避免轮询阶段显示旧表格
-            self.monitor = Monitor(accs, upgrade_socks_scheme(proxy), interval, parallel, self)
+            _primary, _fallback = resolve_bundle_strategy(bundle_strategy)
+            self.monitor = Monitor(accs, upgrade_socks_scheme(proxy), interval, parallel, self,
+                                   bundle=_primary, bundle_fallback=_fallback)
             self.thread_mon = threading.Thread(target=self.monitor.run, daemon=True)
             self.thread_mon.start()
             return {"ok": True}
@@ -1361,7 +1416,8 @@ class Api(object):
                                     "last_state": m.last_state,
                                     "last_check": m.last_check,
                                     "summary": m.summary,
-                                    "bundle": DEFAULT_BUNDLE}}
+                                    "bundle": m.bundle,
+                                    "bundle_fallback": m.bundle_fallback}}
             # 无监控：走原逻辑
             if not self.job:
                 return {"ok": True, "logs": [], "rows": [], "done": True, "summary": "", "running": False}

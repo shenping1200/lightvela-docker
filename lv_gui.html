@@ -190,6 +190,14 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <input type="checkbox" id="useSaved"> 复用已存令牌（有则跳过登录；缺则自动登录并保存）
         </label>
       </div>
+      <div class="row">
+        <label>订阅套餐</label>
+        <select id="bundleStrategy" style="flex:1">
+          <option value="launch_ai" selected>订购 4500 积分（Launch AI，常售罄）</option>
+          <option value="launch">订购 100 积分（Launch，现货）</option>
+          <option value="auto_ai_fallback">优先 4500，售罄降级 100</option>
+        </select>
+      </div>
       <div class="row" id="flowOpts" style="margin-bottom:0;flex-wrap:wrap;display:none">
         <label style="min-width:auto">
           <input type="checkbox" id="flowRush" checked> 先抢订阅（售罄则抢到再继续）
@@ -220,7 +228,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <button class="btn danger" id="btnMonStop" disabled>■ 停止</button>
         <span class="stat" id="monPhase"></span>
       </div>
-      <div class="hint" id="monHint">启动后用<b>导入列表的第一个账号</b>做登录检测；通过后按「轮询间隔」轮询套餐状态。一旦 <code>bundle_launch_ai_01</code> 从售罄变可购买，立即按「并发」数对<b>全部导入账号</b>（含第一个）并发 注册→存凭证→买 0 元；并发留空则沿用「参数」里的并发。批量中若再售罄，自动停剩余并标记「售罄跳过」。</div>
+      <div class="hint" id="monHint">启动后用<b>导入列表的第一个账号</b>做登录检测；通过后按「轮询间隔」轮询套餐状态。所选套餐一旦可购买（或主套餐售罄但降级套餐可买），立即按「并发」数对<b>全部导入账号</b>（含第一个）并发 注册→存凭证→买 0 元；并发留空则沿用「参数」里的并发。批量中若主套餐与降级套餐都售罄，自动停剩余并标记「售罄跳过」。</div>
     </div>
 
     <div class="card">
@@ -395,6 +403,12 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
             <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
             <option value="resume">③ 续跑（已登录+已实名，复用凭证，只跑订阅→建Bot→部署；不取号不花钱）</option>
           </select>
+        </div>
+        <div class="row">
+          <label>复用</label>
+          <label style="min-width:auto">
+            <input type="checkbox" id="domUseSaved"> 复用已存凭证（有则跳过取号/实名；缺则自动取号登录并保存）
+          </label>
         </div>
         <div class="row">
           <label>并发</label>
@@ -606,7 +620,8 @@ async function doStart() {
                             $('flowRush').checked,
                             'agent',
                             3, 3,
-                            $('skipVerify').checked);
+                            $('skipVerify').checked,
+                            $('bundleStrategy').value);
   if (!r || !r.ok) { appendLog(['[启动失败] ' + (r && r.error)]); return; }
   $('log').textContent = ''; logLen = 0;
   running = true; $('btnStart').disabled = true; $('btnStop').disabled = false;
@@ -628,7 +643,8 @@ async function doMonStart() {
   const proxy = await proxyArg();
   const r = await API.monitor_start($('acc').value, proxy,
                                     parseInt($('monInterval').value, 10) || 5,
-                                    parseInt($('monParallel').value, 10) || parseInt($('parallel').value, 10) || 1);
+                                    parseInt($('monParallel').value, 10) || parseInt($('parallel').value, 10) || 1,
+                                    $('bundleStrategy').value);
   if (!r || !r.ok) { appendLog(['[监控] ✗ 启动失败：' + (r && r.error)]); return; }
   running = true;
   $('log').textContent = ''; logLen = 0;
@@ -729,7 +745,7 @@ async function poll() {
   // 监控阶段（放货前）显示占位提示；触发后显示账号表格
   if (s.monitor && s.monitor.running && (!s.rows || !s.rows.length)) {
     $('rows').innerHTML = '<tr><td colspan="4" style="color:var(--tx3);padding:14px">监控轮询中：等待 <b>' +
-      esc(s.monitor.bundle || '目标套餐') + '</b> 放货（当前状态：<b>' + esc(s.monitor.last_state || '?') + '</b>）…</td></tr>';
+      esc((s.monitor.bundle || '目标套餐') + (s.monitor.bundle_fallback ? ' → ' + s.monitor.bundle_fallback : '')) + '</b> 放货（当前状态：<b>' + esc(s.monitor.last_state || '?') + '</b>）…</td></tr>';
     $('rowCount').textContent = '';
   } else {
     renderRows(s.rows);
@@ -906,15 +922,21 @@ async function domStart() {
   await domParse();
   const mode = $('domMode').value;
   const conc = parseInt($('domParallel').value, 10) || 5;
+  const useSaved = $('domUseSaved').checked;
   // 模式③「续跑」：复用已登录凭证，跳过取号/登录/实名（不花豪猪钱、不换号）
-  const apiName = mode === 'login' ? 'domestic_login' : (mode === 'resume' ? 'domestic_resume' : 'domestic_run');
-  const modeLabel = mode === 'login' ? '① 登录+拿凭证' : (mode === 'resume' ? '③ 续跑（复用凭证）' : '② 全流程');
-  const r = await API[apiName]($('domAcc').value, conc);
+  // 模式② + 勾选「复用已存凭证」：有凭证跳过取号/实名，缺凭证自动取号登录补全（对齐国际版"有就用、没有就登录补全并保存"）
+  const modeLabel = mode === 'login' ? '① 登录+拿凭证'
+                  : (mode === 'resume' ? '③ 续跑（复用凭证）'
+                  : (useSaved ? '② 全流程（复用凭证）' : '② 全流程'));
+  let r;
+  if (mode === 'login')        r = await API.domestic_login($('domAcc').value, conc);
+  else if (mode === 'resume') r = await API.domestic_resume($('domAcc').value, conc);
+  else                         r = await API.domestic_run($('domAcc').value, conc, useSaved);
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
   domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true;
   switchTab('domestic');
-  appendDomLog(['[已启动] 模式=' + modeLabel + ' · 并发=' + conc + ' · 共 ' + r.total + ' 个']);
+  appendDomLog(['[已启动] 模式=' + modeLabel + ' · 并发=' + conc + ' · 复用=' + (useSaved ? '是' : '否') + ' · 共 ' + r.total + ' 个']);
 }
 
 async function domStop() { await API.domestic_stop(); }
