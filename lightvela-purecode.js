@@ -326,7 +326,7 @@ function wsParseServerFrames(buf) {
 }
 
 // ===================== REST 引导 =====================
-function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {} } = {}) {
+function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {}, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(CFG.apiBase + path);
     const data = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
@@ -347,7 +347,7 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
       });
     });
     req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(new Error('REST 超时(20s): ' + method + ' ' + path)); });
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('REST 超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); });
     if (data) req.write(data);
     req.end();
   });
@@ -582,13 +582,31 @@ async function restSetPrimaryModel(instanceId) {
   // 先等实例就绪（Creating 期间发必吃 409），再发；仍 409 就退避重试
   await waitInstanceReady(instanceId, 90000);
 
+  // debug/exec 是「腾讯云 TAT 中继进实例里跑脚本」，链路比普通 REST 慢得多：
+  // 实测这台机器上 20s 会直接被打断，脚本其实还在实例里跑。所以这里单独放宽到 60s，
+  // 并且把「超时/网络异常」也当成可重试（设主模型是写配置，重复执行不会写坏）。
+  const execTimeoutMs = Number(process.env.LIGHTVELA_EXEC_TIMEOUT_MS || 60000);
+  console.log('[模型] debug/exec 超时阈值: ' + Math.round(execTimeoutMs / 1000) + 's');
+
   let r = null;
   let lastCode = '';
+  let lastErr = null;
   for (let i = 1; i <= 5; i++) {
     console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec) 第 ' + i + ' 次');
-    r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
-      body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
-    });
+    try {
+      r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
+        body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
+        timeoutMs: execTimeoutMs,
+      });
+    } catch (e) {
+      // 超时/连接类异常会以 reject 抛出（不进上面的 r 判断），这里收住并退避重打
+      lastErr = e;
+      r = null;
+      lastCode = String((e && e.message) || e || '');
+      console.log('[模型] debug/exec 请求异常(' + lastCode + ')，5s 后重试');
+      await sleep(5000);
+      continue;
+    }
     if (r.json && r.json.code === 'OK') break;
     lastCode = String((r.json && (r.json.code || r.json.message)) || '');
     // 只有「实例还没准备好」这一类 409 才值得重试，其它错误照原样抛出
@@ -597,7 +615,8 @@ async function restSetPrimaryModel(instanceId) {
     await sleep(3000);
   }
   if (!r || !r.json || r.json.code !== 'OK') {
-    throw new Error('debug/exec HTTP 层失败: ' + ((r && r.text) || '').slice(0, 240));
+    const tail = (r && r.text) ? String(r.text) : (lastCode || '');
+    throw new Error('debug/exec 失败(已重试5次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
   }
   const data = r.json.data || {};
   const output = typeof data.output === 'string' ? data.output : '';
@@ -613,6 +632,30 @@ async function restSetPrimaryModel(instanceId) {
   const snap = res.snapshot || {};
   const p = snap.primary || {};
   console.log('[模型] 主模型已设为: ' + (p.id || '?') + '@' + (p.providerKey || '?') + ' (' + (p.apiMode || '') + ')');
+}
+
+// 领一张 TAT 中继的"会话门票"（连接参数）。
+// ★ 2026-10-18 实测（34.80）：这张门票【有时效】。领完如果中间插入耗时操作
+//   （最典型就是设主模型的 debug/exec，走 TAT 中继可能几十秒），等真正去连中继时门票已过期，
+//   服务端会直接回 {"Type":"Error","Data":{"Message":"session not valid"}} 并掐断连接，
+//   后面 PtyStart / PtyProxyNew 全是对着断掉的连接发，表现为"12s 未见 ready、60s 未建通道"。
+//   → 所以：领票后要尽快用；用过久之后必须【重新领一张】（见 runChat 里的刷新与重连逻辑）。
+async function restTatSession() {
+  const r = await httpsReq('POST', `/v1/instances/${CFG.instanceId}/tat/session`, { body: {} });
+  if (!r.json) throw new Error('tat/session 响应非 JSON: ' + r.text.slice(0, 200));
+  const t = r.json.data || r.json;
+  const s = {
+    appId:      t.appId,
+    uin:        t.uin || t.ownerUin || t.loginUin,
+    instanceId: t.instanceId || CFG.instanceId,
+    sessionId:  t.sessionId || CFG.sessionId,
+    wsUrl:      t.wsUrl || `wss://${CFG.region}.forward.tat-tc.tencent.cn/ws`,
+    poolId:     t.poolId,
+    username:   t.username,
+    region:     t.region,
+  };
+  console.log('[TAT] 已领取会话门票 region=' + (s.region || '?') + ' sessionId=' + String(s.sessionId || '').slice(0, 8) + '… 有效期=' + (t.timeoutSeconds || '未告知') + 's');
+  return s;
 }
 
 async function restBootstrap() {
@@ -642,19 +685,7 @@ async function restBootstrap() {
     if (!CFG.botId) { CFG.botId = CFG.instanceId; console.log('[REST] bot(兜底=instance):', CFG.botId); }
   }
   // 4) tat/session —— 拿 TAT 中继连接参数
-  const r = await httpsReq('POST', `/v1/instances/${CFG.instanceId}/tat/session`, { body: {} });
-  if (!r.json) throw new Error('tat/session 响应非 JSON: ' + r.text.slice(0, 200));
-  const t = r.json.data || r.json;
-  return {
-    appId:     t.appId,
-    uin:       t.uin || t.ownerUin || t.loginUin,
-    instanceId: t.instanceId || CFG.instanceId,
-    sessionId: t.sessionId || CFG.sessionId,
-    wsUrl:     t.wsUrl || `wss://${CFG.region}.forward.tat-tc.tencent.cn/ws`,
-    poolId:    t.poolId,
-    username:  t.username,
-    region:    t.region,
-  };
+  return await restTatSession();
 }
 
 // ===================== 隧道 + Hermes 会话管理 =====================
@@ -679,12 +710,24 @@ async function runChat(message) {
     }
   }
 
-  // 解析 TAT wsUrl
-  const u = new URL(tat.wsUrl);
-  const host = u.hostname;
-  const port = u.port ? parseInt(u.port, 10) : (u.protocol === 'wss:' ? 443 : 80);
+  // ★ 刷新 TAT 门票：上面设主模型走了 debug/exec（TAT 中继，这台机器上实测很慢），
+  //   等它跑完，bootstrap 阶段领的那张票大概率已过期 → 连上中继会被回 "session not valid" 并掐断。
+  //   所以正式连中继前重新领一张。
+  try {
+    const fresh = await restTatSession();
+    Object.assign(tat, fresh);
+    if (fresh.sessionId) CFG.sessionId = fresh.sessionId;
+    console.log('[TAT] 连中继前已刷新门票');
+  } catch (e) {
+    console.log('[TAT] 刷新门票失败，沿用旧票: ' + e.message);
+  }
 
   let outer = null;                 // 外层 TAT WS 连接
+  let reconnectTries = 0;           // 门票失效后的重连次数
+  const MAX_RECONNECT = 3;
+  let deadline = Date.now() + 90000; // 看门狗期限（每次重连会续命）
+  let ptyStartTimer = null;          // PtyStart 延迟发送定时器
+  let readyFallbackTimer = null;     // 12s 未见 ready 的兜底定时器
   let tunnelBuf = Buffer.alloc(0);  // 隧道收包缓冲（内层 Hermes TCP 流）
   let hermesOpen = false;
   let ptyReadySeen = false;
@@ -751,7 +794,7 @@ async function runChat(message) {
   }
 
   // 外层 TAT WS
-  outer = createWSConn({ host, port, path: u.pathname + u.search || '/ws', useTls: u.protocol === 'wss:', proxy: CFG.egressProxy }, {
+  const tatHandlers = {
     onOpen() {
       console.log('[TAT] 中继已连接，发送 SessionAuth(文本 JSON 帧)');
       // ★ 实测抓包（2026-10-10 env A 现场，CDP 重载重连）：SessionAuth 是【文本帧 opcode=1 的 JSON】，
@@ -776,7 +819,7 @@ async function runChat(message) {
       //   再 PtyProxyNew 开隧道。后端启动后会在 PTY 输出里打印 `__LV_DASHBOARD_READY__:<token>`，
       //   该 token 就是 Hermes WS 的 ?token= 凭据。
       //   若不先启动后端：隧道能开(PtyProxyReady)但连 9119 会立刻被关闭(PtyProxyClose)——即上一轮的失败现象。
-      setTimeout(() => sendPtyStart(), 400);
+      ptyStartTimer = setTimeout(() => sendPtyStart(), 400);
     },
     onMessage(data, opcode) {
       // —— 诊断日志（仅 LIGHTVELA_DEBUG=1 时打印，避免刷屏）——
@@ -795,6 +838,17 @@ async function runChat(message) {
         if (!j || !j.Type) return;
         // ★ PTY 相关帧（PtyReady/PtyOutput/PtyError）都是【文本 JSON】，不是二进制 BSON——实抓已确认。
         //   PtyOutput 的 Data.Output 是 base64 终端文本，其中含 __LV_DASHBOARD_READY__:<token>。
+        // ★ 服务端错误帧：最常见就是门票过期 {"Type":"Error","Data":{"Message":"session not valid"}}，
+        //   随后连接会被掐断。识别到就重新领门票重连，而不是傻等 60s 超时。
+        if (j.Type === 'Error') {
+          const msg = (j.Data && (j.Data.Message || j.Data.message)) || j.Message || j.message || '';
+          console.log('[TAT] 服务端错误帧: ' + (msg || JSON.stringify(j).slice(0, 160)));
+          if (/session not valid|invalid session|session expired|unauthorized|not authorized/i.test(msg)) {
+            maybeReconnect('会话失效(' + msg + ')');
+            return;
+          }
+          return;
+        }
         if (j.Type === 'PtyReady') { console.log('[TAT] PTY 就绪'); return; }
         if (j.Type === 'PtyOutput') { handlePtyOutput(j); return; }
         if (j.Type === 'PtyError') { console.log('[TAT] PtyError:', JSON.stringify(j).slice(0, 300)); return; }
@@ -868,9 +922,39 @@ async function runChat(message) {
         console.log('[TAT] PtyError:', JSON.stringify(fields).slice(0, 300));
       }
     },
-    onClose() { console.log('[TAT] 连接关闭'); },
+    onClose() { console.log('[TAT] 连接关闭'); maybeReconnect('连接被关闭'); },
     onError(e) { console.error('[TAT] 错误:', e.message); },
-  });
+  };
+
+  function openTat() {
+    const u = new URL(tat.wsUrl);
+    const host = u.hostname;
+    const port = u.port ? parseInt(u.port, 10) : (u.protocol === 'wss:' ? 443 : 80);
+    outer = createWSConn({ host, port, path: u.pathname + u.search || '/ws', useTls: u.protocol === 'wss:', proxy: CFG.egressProxy }, tatHandlers);
+  }
+
+  // ★ 门票失效重连：服务端回 "session not valid"、或者通道还没建好就被断开时，
+  //   重新领一张门票再连（最多 MAX_RECONNECT 次）。这台机器上设主模型特别慢，很容易撞上过期。
+  async function maybeReconnect(why) {
+    if (hermesOpen) return;
+    if (CFG.shellCmd) return;               // --shell 模式本就不走 Hermes 通道，别瞎重连
+    if (reconnectTries >= MAX_RECONNECT) { console.log('[TAT] 已重连 ' + reconnectTries + ' 次仍未建立通道，放弃'); return; }
+    reconnectTries += 1;
+    console.log('[TAT] ' + why + ' → 第 ' + reconnectTries + '/' + MAX_RECONNECT + ' 次重连（重新领门票）');
+    if (ptyStartTimer) { clearTimeout(ptyStartTimer); ptyStartTimer = null; }
+    if (readyFallbackTimer) { clearTimeout(readyFallbackTimer); readyFallbackTimer = null; }
+    proxySent = false;
+    ptyReadySeen = false;
+    try {
+      const fresh = await restTatSession();
+      Object.assign(tat, fresh);
+      if (fresh.sessionId) CFG.sessionId = fresh.sessionId;
+    } catch (e) { console.log('[TAT] 重领门票失败: ' + e.message); return; }
+    deadline = Date.now() + 90000;          // 每次重连都给看门狗续命
+    setTimeout(() => openTat(), 800);
+  }
+
+  openTat();
 
   // 发一条文本 JSON 帧（等价前端 sendJson：SessionAuth / PtyStart / PtyStop / PtyInput 等）
   function sendTextJson(obj) { outer.send(JSON.stringify(obj), 0x1); }
@@ -956,7 +1040,7 @@ async function runChat(message) {
     // --shell 模式兜底：后端已在跑时不会再打印 ready 标记，8s 后照样敲命令
     if (CFG.shellCmd) setTimeout(() => startShellMode('8s 超时兜底'), 8000);
     // 兜底：12s 内既没拿到 token 也没开通道，就先用空 token 开通道试一把
-    setTimeout(() => {
+    readyFallbackTimer = setTimeout(() => {
       if (CFG.shellCmd) return;
       if (!ptyReadySeen && !proxySent) { console.log('[TAT] 12s 未见 ready 标记，先开代理通道（空 token 试探）'); proxySent = true; sendPtyProxyNew(); }
     }, 12000);
@@ -981,13 +1065,14 @@ async function runChat(message) {
     outer.send(frame);
   }
 
-  // 诊断看门狗：60s 内若通道未就绪，打印统计并退出（后端启动可能耗时，故给足时间）
-  setTimeout(() => {
-    if (!hermesOpen) {
-      console.log('[WATCHDOG] 60s 内未建立 Hermes 通道，诊断结束。ptyReadySeen=' + ptyReadySeen + ' hermesOpen=' + hermesOpen + ' token=' + (hermesToken ? '有' : '无'));
+  // 诊断看门狗：距上次(重)连超过 90s 仍未建立 Hermes 通道才放弃（后端启动可能耗时，且重连会续命）
+  const wdTimer = setInterval(() => {
+    if (hermesOpen) { clearInterval(wdTimer); return; }
+    if (Date.now() > deadline) {
+      console.log('[WATCHDOG] 超时未建立 Hermes 通道，诊断结束。ptyReadySeen=' + ptyReadySeen + ' hermesOpen=' + hermesOpen + ' token=' + (hermesToken ? '有' : '无') + ' 已重连=' + reconnectTries + ' 次');
       process.exit(2);
     }
-  }, 60000);
+  }, 1000);
 
   // 连接 Hermes：发 WS 握手（无论有无 token 都发，便于观察后端反应并捕获 token）
   function connectHermes() {
