@@ -251,7 +251,7 @@ HANDLERS = {
     # ---- 国内版（与国际版逻辑隔离，凭证走 domestic-tokens.json）----
     "domestic_parse":   lambda a: (lambda t: {"ok": True, "accounts": t, "count": len(t)})(dcore.parse_accounts(a[0] if a else "")),
     "domestic_login":   lambda a: dcore.start("login", a[0] if a else "", a[1] if len(a) > 1 else None),
-    "domestic_run":     lambda a: dcore.start("full", a[0] if a else "", a[1] if len(a) > 1 else None),
+    "domestic_run":     lambda a: dcore.start("full", a[0] if a else "", a[1] if len(a) > 1 else None, a[2] if len(a) > 2 else False),
     # 续跑：账号已登录+已实名，只补跑「订阅→建Bot→部署」。复用已落盘凭证，不取号、不花钱、不换号。
     "domestic_resume":  lambda a: dcore.start("resume", a[0] if a else "", a[1] if len(a) > 1 else None),
     "domestic_stop":    lambda a: dcore.stop(),

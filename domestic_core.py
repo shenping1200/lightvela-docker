@@ -475,7 +475,7 @@ def _append_log(line, prefix=""):
             _state["log"] = _state["log"][-3500:]
 
 
-def _run_one(idx, acc, mode, accounts_file):
+def _run_one(idx, acc, mode, accounts_file, use_saved=False):
     """单账号子进程：spawn node bot.js --account-idx idx [--login-only]，实时读日志。"""
     # ★ 全局停止闸门①：线程被调度到时若已停止，连子进程都不起，占位（姓名+身份证）原样保留
     with _lock:
@@ -484,8 +484,8 @@ def _run_one(idx, acc, mode, accounts_file):
     args = [NODE_BIN, BOT, "--account-idx", str(idx)]
     if mode == "login":
         args.append("--login-only")
-    if mode == "resume":
-        args.append("--resume")
+    if mode == "resume" or (mode == "full" and use_saved):
+        args.append("--resume")   # 复用/补全：bot.js 自行判断"有凭证复用、无凭证登录补全"
     env = dict(os.environ)
     env["LIGHTVELA_ACCOUNTS_FILE"] = accounts_file
     env["LIGHTVELA_DOMESTIC_TOKENS"] = token_path()
@@ -640,7 +640,7 @@ def _run_one(idx, acc, mode, accounts_file):
     return res
 
 
-def _run_thread(accounts, mode, prelude=None):
+def _run_thread(accounts, mode, prelude=None, use_saved=False):
     # ★ 实名补救跨进程协调：每轮运行开头清空上轮残留的「身份占用标记」(domestic-claims.json/lock)，
     #   否则上一轮标记的 consumed/bad 会让本轮同序号（同一人）被误跳过或无法补救。
     for _f in ("domestic-claims.json", "domestic-claims.json.lock"):
@@ -679,7 +679,7 @@ def _run_thread(accounts, mode, prelude=None):
                 # ★ 本批内若中途被停止，也不补起剩余线程
                 if not _state["running"]:
                     break
-                t = threading.Thread(target=_run_one, args=(i + k, accounts[i + k], mode, tmp), daemon=True)
+                t = threading.Thread(target=_run_one, args=(i + k, accounts[i + k], mode, tmp, use_saved), daemon=True)
                 batch.append(t)
                 t.start()
             for t in batch:
@@ -719,7 +719,7 @@ def _resume_pick(accs):
     return run, skip
 
 
-def start(mode, text, concurrency=None):
+def start(mode, text, concurrency=None, use_saved=False):
     """启动一次运行（后台线程）。mode='login'|'full'|'resume'。返回 {ok, total}。"""
     accs = parse_accounts(text)
     if not accs:
@@ -742,7 +742,7 @@ def start(mode, text, concurrency=None):
         _state["running"] = True
         _state["mode"] = mode
         _state["started_at"] = int(time.time())
-        _state["thread"] = threading.Thread(target=_run_thread, args=(accs, mode, prelude), daemon=True)
+        _state["thread"] = threading.Thread(target=_run_thread, args=(accs, mode, prelude, use_saved), daemon=True)
         _state["thread"].start()
     return {"ok": True, "total": len(accs), "mode": mode}
 

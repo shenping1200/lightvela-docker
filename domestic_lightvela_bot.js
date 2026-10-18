@@ -32,6 +32,30 @@
  */
 
 'use strict';
+// ★ 修复面板日志看不到（Windows 专属）：stdout 被重定向到管道（非 TTY）时，Node 在 Windows(libuv) 上会
+//   按块缓冲、攒到进程退出/缓冲满才一次性刷出；Python 父进程 `for line in proc.stdout` 读不到实时日志，
+//   表现为「面板只有[已启动]、run_domestic_*.log 长时间 0 字节、但后台机器其实在上线」。
+//   对照：同代码同 Node22 在 Linux(VPS, glibc) 行缓冲，日志正常——已上 VPS 比对确认是 OS 差异。
+//   根治：用 fs.writeSync(fd=1) 绕过 Node 异步缓冲，每条 console.log 同步落到 OS 管道；setBlocking 作补充保险。
+//   任何一步失败都回退原生 console.log，绝不伤业务。
+const _fs = require('fs');
+const _util = require('util');
+const _outFd = (process.stdout && typeof process.stdout.fd === 'number') ? process.stdout.fd : 1;
+if (process.stdout._handle && typeof process.stdout._handle.setBlocking === 'function') {
+  process.stdout._handle.setBlocking(true);
+}
+{
+  const _origLog = console.log.bind(console);
+  console.log = function (...a) {
+    try { _fs.writeSync(_outFd, _util.format(...a) + '\n'); }
+    catch (e) { try { _origLog(...a); } catch (_) {} }
+  };
+  const _origWarn = console.warn ? console.warn.bind(console) : _origLog;
+  console.warn = function (...a) {
+    try { _fs.writeSync(_outFd, _util.format(...a) + '\n'); }
+    catch (e) { try { _origWarn(...a); } catch (_) {} }
+  };
+}
 const tls = require('tls');
 const net = require('net');
 const https = require('https');
@@ -1605,23 +1629,28 @@ async function main() {
     try {
       // 1) 取号 → 发码 → 取码 → 验码 → 实名（Bearer 写进 CFG）
       //    ★ 续跑模式：整段跳过，直接复用上次落盘的 bearer（不取号 / 不花钱 / 不换号）
-      let uid, phone, realname = { name: acc.name, idCard: acc.idCard };
+      let uid, phone, realname = { name: acc.name, idCard: acc.idCard }, reused = false;
       if (resume) {
         const saved = readDomesticToken(acc.name, acc.idCard);
-        if (!saved || !saved.bearer) throw new Error('续跑失败：凭证里没有 ' + acc.name + ' 的 bearer，请先跑一次完整流程');
-        CFG.bearer = saved.bearer;
-        if (saved.instanceId) CFG.instanceId = saved.instanceId;
-        uid = saved.uid; phone = saved.phone;
-        if (saved.idCard) realname = { name: saved.name || acc.name, idCard: saved.idCard };
-        console.log('[续跑] 复用已登录凭证：' + acc.name + '（跳过取号/实名）');
-      } else {
+        if (saved && saved.bearer) {
+          // 有凭证 → 直接复用，跳过取号/登录/实名（不花钱、不换号）
+          CFG.bearer = saved.bearer;
+          if (saved.instanceId) CFG.instanceId = saved.instanceId;
+          uid = saved.uid; phone = saved.phone;
+          if (saved.idCard) realname = { name: saved.name || acc.name, idCard: saved.idCard };
+          reused = true;
+          console.log('[复用] 复用已存凭证：' + acc.name + '（跳过取号/实名）');
+        }
+      }
+      if (!reused) {
+        // 无凭证（或没勾复用）→ 正常取号→实名登录；复用模式缺凭证则自动补全并保存（对齐国际版"有就用、没有就登录补全并保存"）
         const lg = await domesticLogin(acc, idx);
         uid = lg.uid; phone = lg.phone; realname = lg.realname;
       }
       // 凭证落盘（与国际版隔离），供 UI/后续复用
       // ★ 用「实际实名身份」realname 落盘：补救后可能是另一条排队身份，按它存才能保证续跑/去重正确
       const cred = { name: realname.name, idCard: realname.idCard, phone, uid, bearer: CFG.bearer };
-      if (!resume) saveDomesticToken(cred);   // 续跑不重复追加，避免同一账号凭证刷屏
+      if (!reused) saveDomesticToken(cred);   // 复用且有凭证不重复追加；登录/补全都存盘
       console.log('DOMESTIC_CRED_JSON=' + JSON.stringify(cred));
       if (loginOnly) { results.push({ uid, phone, loginOk: true }); continue; }   // 模式①：只拿凭证
       // 2) 抢套餐（0 元包；实抓确认用 bundle_launch_ai_01）
