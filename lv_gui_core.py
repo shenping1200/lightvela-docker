@@ -407,6 +407,35 @@ def gh_login(login, password, tfa, proxy, log=None):
     return tok
 
 
+def gh_login_retry(login, password, tfa, proxy, log=None, max_attempts=5, retry_delay=4.0):
+    """GitHub 登录 + 换 IP 重试。
+
+    只重试「连接层/传输层」失败（代理出口 IP 脏、被 GitHub 拒连、超时等）：
+    每次调用 gh_login 都会新建 session / 代理隧道，等于让出口池重新抽一个 IP，
+    多数情况下再试一两次就能抽到干净 IP 登录成功。
+
+    密码错 / 2FA 不过 / GitHub 拒登 / 没拿到 token 等「真失败」一律不重试，直接抛出。
+    """
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return gh_login(login, password, tfa, proxy, log=log)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_exc = e
+            if attempt < max_attempts:
+                jit = retry_delay + (abs(hash(login)) % 3)   # 轻微错峰，避免多账号同时重抽
+                if log:
+                    log("  ⚠️ 登录连接失败（出口IP可能脏/被GitHub拒连）：%s — %ds后换隧道重试（第%d/%d次）"
+                        % (str(e)[:90], jit, attempt, max_attempts))
+                time.sleep(jit)
+            else:
+                if log:
+                    log("  ❌ 登录连续%d次连接失败，放弃（出口池持续发脏IP？）" % max_attempts)
+        except Exception:
+            raise   # 真失败（密码/2FA/拒登/无token）不重试，直接抛给上层判账号失败
+    raise last_exc
+
+
 def live_passes(s):
     r = s.get(API + "/v1/passes", timeout=40)
     try:
@@ -551,7 +580,7 @@ class Job(object):
         self.parallel = max(1, int(parallel or 1))
         # 监控批次专用开关
         self.abort_if_soldout = False   # 一旦售罄立即终止后续账号
-        self.saved_fallback = False     # use_saved 但缺令牌时退回登录（而非失败）
+        self.saved_fallback = True      # use_saved 但缺令牌时退回登录并保存令牌（而非失败）
         self.soldout_flag = False       # 批次内售罄标记（一旦置位，后续账号跳过）
         # 全流程参数
         self.flow_rush = bool(flow_rush)
@@ -615,6 +644,21 @@ class Job(object):
         self.row(idx, stage="售罄跳过", detail="放开后又售罄，已自动终止", ok=False, result="soldout_skip")
         self.log("[%d] 🛑 售罄：已终止后续账号并标记跳过" % idx)
 
+    # --- 单账号：正常登录并保存令牌（复用模式缺令牌时的退回路径，也是普通登录路径） ---
+    def _do_login(self, idx, tag, acc, px, name):
+        """执行一次正常登录：成功后写入 self.tokens[name] 并返回 token。
+        登录失败（密码/2FA/拒登/连续连接失败）直接抛异常，由 run_one 的 try 兜底判账号失败。
+        token 会在任务结束时经 run() 的 finally → save_tokens() 自动落盘。"""
+        self.row(idx, stage="登录中", detail="")
+        self.log(tag + " 开始登录 ...")
+        t0 = time.time()
+        token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
+                               log=lambda m: self.log(tag + m))
+        self.tokens[name] = token
+        self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
+        self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
+        return token
+
     # --- 单账号 ---
     def run_one(self, acc):
         idx = acc["idx"]
@@ -634,20 +678,18 @@ class Job(object):
             token = ""
             if self.use_saved:
                 token = self.tokens.get(name) or self.tokens.get(acc.get("email", "")) or ""
-                if not token:
+                if token:
+                    self.log(tag + " 复用已存令牌，跳过登录")
+                elif self.saved_fallback:
+                    # 复用模式但本账号没令牌 → 退回正常登录并保存，下次直接复用
+                    self.log(tag + " 复用模式缺令牌，退回登录并保存 ...")
+                    token = self._do_login(idx, tag, acc, px, name)
+                else:
                     self.row(idx, stage="失败", detail="无已存令牌", ok=False)
                     self.log(tag + " ❌ 没有已存令牌（请先跑一次预登录）")
                     return
-                self.log(tag + " 复用已存令牌，跳过登录")
             else:
-                self.row(idx, stage="登录中", detail="")
-                self.log(tag + " 开始登录 ...")
-                t0 = time.time()
-                token = gh_login(acc["login"], acc["password"], acc["tfa"], px,
-                                 log=lambda m: self.log(tag + m))
-                self.tokens[name] = token
-                self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
-                self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
+                token = self._do_login(idx, tag, acc, px, name)
 
             s = api_session(token, px)
             self.row(idx, stage="查订阅", detail="")
@@ -1031,8 +1073,8 @@ class Monitor(object):
         px = proxy_of(acc, self.proxy)
         t0 = time.time()
         try:
-            token = gh_login(acc["login"], acc["password"], acc["tfa"], px,
-                             log=lambda m: self.log(tag + m))
+            token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
+                                   log=lambda m: self.log(tag + m))
         except Exception as e:
             self.log(tag + " ❌ 登录异常：%s" % e)
             return False
