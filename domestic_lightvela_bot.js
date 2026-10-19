@@ -1054,6 +1054,24 @@ async function restSetPrimaryModel(instanceId) {
   console.log('[模型] 主模型已设为: ' + (p.id || '?') + '@' + (p.providerKey || '?') + ' (' + (p.apiMode || '') + ')');
 }
 
+async function restTatSession() {
+  const r = await httpsReq('POST', `/v1/instances/${CFG.instanceId}/tat/session`, { body: {} });
+  if (!r.json) throw new Error('tat/session 响应非 JSON: ' + r.text.slice(0, 200));
+  const t = r.json.data || r.json;
+  const s = {
+    appId:      t.appId,
+    uin:        t.uin || t.ownerUin || t.loginUin,
+    instanceId: t.instanceId || CFG.instanceId,
+    sessionId:  t.sessionId || CFG.sessionId,
+    wsUrl:      t.wsUrl || `wss://${CFG.region}.forward.tat-tc.tencent.cn/ws`,
+    poolId:     t.poolId,
+    username:   t.username,
+    region:     t.region,
+  };
+  console.log('[TAT] 已领取会话门票 region=' + (s.region || '?') + ' sessionId=' + String(s.sessionId || '').slice(0, 8) + '…');
+  return s;
+}
+
 async function restBootstrap() {
   // 1) 拿 Bearer
   await ensureBearer();
@@ -1146,11 +1164,29 @@ async function runChat(message) {
     }
   }
 
+  // ★ 刷新 TAT 门票：上面设主模型走了 debug/exec（TAT 中继，慢机器上实测很慢），
+  //   等它跑完，bootstrap 阶段领的那张票大概率已过期 → 连上中继会被回 "session not valid" 并掐断。
+  //   所以正式连中继前重新领一张（与国际版 34.80 修复一致，根治 session not valid）。
+  try {
+    const fresh = await restTatSession();
+    Object.assign(tat, fresh);
+    if (fresh.sessionId) CFG.sessionId = fresh.sessionId;
+    console.log('[TAT] 连中继前已刷新门票');
+  } catch (e) {
+    console.log('[TAT] 刷新门票失败，沿用旧票: ' + e.message);
+  }
+
   // 解析 TAT wsUrl
   const u = new URL(tat.wsUrl);
   const host = u.hostname;
   const port = u.port ? parseInt(u.port, 10) : (u.protocol === 'wss:' ? 443 : 80);
 
+  // ★ 门票失效重连相关（根治 session not valid，与国际版 34.80 一致）
+  let reconnectTries = 0;           // 门票失效后的重连次数
+  const MAX_RECONNECT = 3;
+  let deadline = Date.now() + 90000; // 看门狗期限（每次重连会续命）
+  let ptyStartTimer = null;          // PtyStart 延迟发送定时器
+  let readyFallbackTimer = null;     // 12s 未见 ready 的兜底定时器
   let tunnelBuf = Buffer.alloc(0);  // 隧道收包缓冲（内层 Hermes TCP 流）
   let hermesOpen = false;
   let ptyReadySeen = false;
@@ -1216,8 +1252,8 @@ async function runChat(message) {
     eventHandlers.forEach((cb) => cb(msg));
   }
 
-  // 外层 TAT WS
-  outer = createWSConn({ host, port, path: u.pathname + u.search || '/ws', useTls: u.protocol === 'wss:', proxy: CFG.egressProxy }, {
+  // 外层 TAT WS —— 抽成 tatHandlers（与国际版 34.80 一致，支持门票失效重连）
+  const tatHandlers = {
     onOpen() {
       console.log('[TAT] 中继已连接，发送 SessionAuth(文本 JSON 帧)');
       // ★ 实测抓包（2026-10-10 env A 现场，CDP 重载重连）：SessionAuth 是【文本帧 opcode=1 的 JSON】，
@@ -1242,7 +1278,7 @@ async function runChat(message) {
       //   再 PtyProxyNew 开隧道。后端启动后会在 PTY 输出里打印 `__LV_DASHBOARD_READY__:<token>`，
       //   该 token 就是 Hermes WS 的 ?token= 凭据。
       //   若不先启动后端：隧道能开(PtyProxyReady)但连 9119 会立刻被关闭(PtyProxyClose)——即上一轮的失败现象。
-      setTimeout(() => sendPtyStart(), 400);
+      ptyStartTimer = setTimeout(() => sendPtyStart(), 400);
     },
     onMessage(data, opcode) {
       // —— 诊断日志（仅 LIGHTVELA_DEBUG=1 时打印，避免刷屏）——
@@ -1259,8 +1295,17 @@ async function runChat(message) {
       if (opcode === 0x1) {
         let j = null; try { j = JSON.parse(data.toString('utf8')); } catch (e) {}
         if (!j || !j.Type) return;
-        // ★ PTY 相关帧（PtyReady/PtyOutput/PtyError）都是【文本 JSON】，不是二进制 BSON——实抓已确认。
-        //   PtyOutput 的 Data.Output 是 base64 终端文本，其中含 __LV_DASHBOARD_READY__:<token>。
+        // ★ 服务端错误帧：最常见就是门票过期 {"Type":"Error","Data":{"Message":"session not valid"}}，
+        //   随后连接会被掐断。识别到就重新领门票重连，而不是傻等 60s 超时。
+        if (j.Type === 'Error') {
+          const msg = (j.Data && (j.Data.Message || j.Data.message)) || j.Message || j.message || '';
+          console.log('[TAT] 服务端错误帧: ' + (msg || JSON.stringify(j).slice(0, 160)));
+          if (/session not valid|invalid session|session expired|unauthorized|not authorized/i.test(msg)) {
+            maybeReconnect('会话失效(' + msg + ')');
+            return;
+          }
+          return;
+        }
         if (j.Type === 'PtyReady') { console.log('[TAT] PTY 就绪'); return; }
         if (j.Type === 'PtyOutput') { handlePtyOutput(j); return; }
         if (j.Type === 'PtyError') { console.log('[TAT] PtyError:', JSON.stringify(j).slice(0, 300)); return; }
@@ -1334,13 +1379,39 @@ async function runChat(message) {
         console.log('[TAT] PtyError:', JSON.stringify(fields).slice(0, 300));
       }
     },
-    onClose() {
-      console.log('[TAT] 连接关闭');
-      // 通道还没建起来就断：没有重连逻辑，干等只会挂死（甚至自然退出码0被误记成功）→ 立即判失败
-      if (!hermesOpen) forceFailRun('TAT 连接中断（Hermes 通道未建立）');
-    },
+    onClose() { console.log('[TAT] 连接关闭'); maybeReconnect('连接被关闭'); },
     onError(e) { console.error('[TAT] 错误:', e.message); },
-  });
+  };
+
+  function openTat() {
+    const u = new URL(tat.wsUrl);
+    const host = u.hostname;
+    const port = u.port ? parseInt(u.port, 10) : (u.protocol === 'wss:' ? 443 : 80);
+    outer = createWSConn({ host, port, path: u.pathname + u.search || '/ws', useTls: u.protocol === 'wss:', proxy: CFG.egressProxy }, tatHandlers);
+  }
+
+  // ★ 门票失效重连：服务端回 "session not valid"、或者通道还没建好就被断开时，
+  //   重新领一张门票再连（最多 MAX_RECONNECT 次）。国内版设主模型同样很慢，容易撞上过期。
+  async function maybeReconnect(why) {
+    if (hermesOpen) return;
+    if (CFG.shellCmd) return;               // --shell 模式本就不走 Hermes 通道，别瞎重连
+    if (reconnectTries >= MAX_RECONNECT) { console.log('[TAT] 已重连 ' + reconnectTries + ' 次仍未建立通道，放弃'); return; }
+    reconnectTries += 1;
+    console.log('[TAT] ' + why + ' → 第 ' + reconnectTries + '/' + MAX_RECONNECT + ' 次重连（重新领门票）');
+    if (ptyStartTimer) { clearTimeout(ptyStartTimer); ptyStartTimer = null; }
+    if (readyFallbackTimer) { clearTimeout(readyFallbackTimer); readyFallbackTimer = null; }
+    proxySent = false;
+    ptyReadySeen = false;
+    try {
+      const fresh = await restTatSession();
+      Object.assign(tat, fresh);
+      if (fresh.sessionId) CFG.sessionId = fresh.sessionId;
+    } catch (e) { console.log('[TAT] 重领门票失败: ' + e.message); return; }
+    deadline = Date.now() + 90000;          // 每次重连都给看门狗续命
+    setTimeout(() => openTat(), 800);
+  }
+
+  openTat();
 
   // 发一条文本 JSON 帧（等价前端 sendJson：SessionAuth / PtyStart / PtyStop / PtyInput 等）
   function sendTextJson(obj) { outer.send(JSON.stringify(obj), 0x1); }
@@ -1426,7 +1497,7 @@ async function runChat(message) {
     // --shell 模式兜底：后端已在跑时不会再打印 ready 标记，8s 后照样敲命令
     if (CFG.shellCmd) setTimeout(() => startShellMode('8s 超时兜底'), 8000);
     // 兜底：12s 内既没拿到 token 也没开通道，就先用空 token 开通道试一把
-    setTimeout(() => {
+    readyFallbackTimer = setTimeout(() => {
       if (CFG.shellCmd) return;
       if (!ptyReadySeen && !proxySent) { console.log('[TAT] 12s 未见 ready 标记，先开代理通道（空 token 试探）'); proxySent = true; sendPtyProxyNew(); }
     }, 12000);
@@ -1451,10 +1522,16 @@ async function runChat(message) {
     outer.send(frame);
   }
 
-  // 诊断看门狗：60s 内若通道未就绪，只告警不退出（后端启动可能耗时，继续等）
-  setTimeout(() => {
-    if (!hermesOpen) console.log('[WATCHDOG] 60s 内未建立 Hermes 通道，继续等待… ptyReadySeen=' + ptyReadySeen + ' token=' + (hermesToken ? '有' : '无'));
-  }, 60000);
+  // 诊断看门狗：距上次(重)连超过 90s 仍未建立 Hermes 通道才放弃（后端启动可能耗时，且重连会续命）。
+  // ★ 本地化适配：国际版是「每号一个 node 进程」，看门狗可直接 process.exit(2)；
+  //   国内版是单进程批量跑多号（全量模式 for 循环），杀进程会连累整批 → 改为只判失败【当前这一号】，让批量继续下一号。
+  const wdTimer = setInterval(() => {
+    if (hermesOpen) { clearInterval(wdTimer); return; }
+    if (Date.now() > deadline) {
+      console.log('[WATCHDOG] 超时未建立 Hermes 通道，判失败当前号。ptyReadySeen=' + ptyReadySeen + ' hermesOpen=' + hermesOpen + ' token=' + (hermesToken ? '有' : '无') + ' 已重连=' + reconnectTries + ' 次');
+      forceFailRun('看门狗超时：未建立 Hermes 通道（已达重连上限或重领门票失败）');
+    }
+  }, 1000);
 
   // 连接 Hermes：发 WS 握手（无论有无 token 都发，便于观察后端反应并捕获 token）
   function connectHermes() {
