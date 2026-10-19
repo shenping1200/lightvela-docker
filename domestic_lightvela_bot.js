@@ -791,7 +791,7 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
       });
     });
     req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(new Error('REST 超时(20s): ' + method + ' ' + path)); });
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('REST 超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); });
     if (data) req.write(data);
     req.end();
   });
@@ -1002,12 +1002,41 @@ async function restSetPrimaryModel(instanceId) {
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="python3"; fi\n' +
     'printf \'%s\n\' \'' + bootstrap + "' | \"$HERMES_PYTHON\" - \"" + payload + "\" \"" + HERMES_MODEL_CFG_SCRIPT_B64 + "\"";
 
-  console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec)');
-  const r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
-    body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
-  });
-  if (!r.json || r.json.code !== 'OK') {
-    throw new Error('debug/exec HTTP 层失败: ' + (r.text || '').slice(0, 240));
+  // debug/exec 是「腾讯云 TAT 中继进实例里跑脚本」，链路比普通 REST 慢得多：
+  // 实测 20s 会直接被打断，脚本其实还在实例里跑。所以放宽到 60s（可用 LIGHTVELA_EXEC_TIMEOUT_MS 调），
+  // 并且把「超时/网络异常」也当成可重试（设主模型是写配置，重复执行不会写坏）。
+  const execTimeoutMs = Number(process.env.LIGHTVELA_EXEC_TIMEOUT_MS || 60000);
+  console.log('[模型] debug/exec 超时阈值: ' + Math.round(execTimeoutMs / 1000) + 's');
+
+  let r = null;
+  let lastCode = '';
+  let lastErr = null;
+  for (let i = 1; i <= 5; i++) {
+    console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec) 第 ' + i + ' 次');
+    try {
+      r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
+        body: { command: command, run_as_user: 'agentuser', execution_backend: 'tat' },
+        timeoutMs: execTimeoutMs,
+      });
+    } catch (e) {
+      // 超时/连接类异常会以 reject 抛出（不进上面的 r 判断），这里收住并退避重打
+      lastErr = e;
+      r = null;
+      lastCode = String((e && e.message) || e || '');
+      console.log('[模型] debug/exec 请求异常(' + lastCode + ')，5s 后重试');
+      await sleep(5000);
+      continue;
+    }
+    if (r.json && r.json.code === 'OK') break;
+    lastCode = String((r.json && (r.json.code || r.json.message)) || '');
+    // 实例尚未就绪(409) 才值得重试；其它错误照原样抛出（方案甲：不设主模型部署无意义）
+    if (!/DEBUG_NOT_SUPPORTED|not.*ready|409/i.test(lastCode)) break;
+    console.log('[模型] 实例尚未就绪，3s 后重试');
+    await sleep(3000);
+  }
+  if (!r || !r.json || r.json.code !== 'OK') {
+    const tail = (r && r.text) ? String(r.text) : (lastCode || '');
+    throw new Error('debug/exec 失败(已重试5次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
   }
   const data = r.json.data || {};
   const output = typeof data.output === 'string' ? data.output : '';
