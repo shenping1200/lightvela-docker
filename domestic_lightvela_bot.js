@@ -770,7 +770,7 @@ async function domesticLogin(acc, idx) {
 }
 
 // ===================== REST 引导 =====================
-function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {} } = {}) {
+function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {}, timeoutMs = 20000 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(CFG.apiBase + path);
     const data = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
