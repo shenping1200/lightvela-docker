@@ -251,6 +251,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <button class="btn sm" id="btnExpAll">全部</button>
         <button class="btn sm" id="btnExpOk">仅成功</button>
         <button class="btn sm" id="btnExpFail">仅失败</button>
+        <button class="btn sm" id="btnImpFail">导入失败到账号区</button>
         <button class="btn sm" id="btnExpCopy">复制到剪贴板</button>
       </div>
       <div class="bar" style="margin-top:8px">
@@ -419,6 +420,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <button class="btn primary" id="domBtnStart">▶ 开始</button>
           <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
           <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
+          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
           <span id="domRunStat" class="stat"></span>
         </div>
         <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
@@ -700,6 +702,17 @@ async function doDump(which) {
   appendLog(['=== 导出 ' + label + '：' + r.count + ' 个账号（可直接鼠标拖选复制）===']);
   appendLog([r.text]);
 }
+async function doImportFailed() {
+  // ★ 把本次运行失败的账号自动导入到账号区：先清空账号区，再填入失败账号（每行 姓名 身份证）
+  const r = await API.export_text('fail');
+  if (!r || !r.ok) { appendLog(['[导入失败] ✗ ' + (r && r.error)]); return; }
+  const text = (r.text || '').trim();
+  if (!text) { appendLog(['[导入失败] 没有失败账号 ✓']); return; }
+  $('acc').value = '';                                // 先清空账号区
+  $('acc').value = text;                              // 填入失败账号
+  $('acc').dispatchEvent(new Event('input'));         // 触发解析刷新账号数
+  appendLog(['[导入失败] 已清空账号区并填入 ' + (r.count || 0) + ' 个失败账号（可直接点开始重跑）']);
+}
 async function doTkInfo() {
   const r = await API.tokens_info();
   if (!r || !r.ok) { $('tkStat').textContent = ''; return; }
@@ -834,6 +847,7 @@ function boot() {
   $('btnExpAll').onclick = () => doDump('all');
   $('btnExpOk').onclick = () => doDump('ok');
   $('btnExpFail').onclick = () => doDump('fail');
+  $('btnImpFail').onclick = doImportFailed;
   $('btnExpCopy').onclick = () => doCopy('all');
   $('btnTkExport').onclick = doTkExport;
   $('btnTkImport').onclick = doTkImport;
@@ -856,6 +870,7 @@ function boot() {
   $('domBtnStart').onclick = domStart;
   $('domBtnStop').onclick = domStop;
   $('domBtnExportFailed').onclick = domExportFailed;
+  $('domBtnImportFailed').onclick = domImportFailed;
   $('domBtnTkInfo').onclick = domTkInfo;
   $('domBtnTkExport').onclick = domTkExport;
   $('domBtnTkDel').onclick = domTkDel;
@@ -934,7 +949,7 @@ async function domStart() {
   else                         r = await API.domestic_run($('domAcc').value, conc, useSaved);
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
-  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true;
+  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
   switchTab('domestic');
   appendDomLog(['[已启动] 模式=' + modeLabel + ' · 并发=' + conc + ' · 复用=' + (useSaved ? '是' : '否') + ' · 共 ' + r.total + ' 个']);
 }
@@ -950,6 +965,19 @@ async function domExportFailed() {
   appendDomLog(['=== 失败账号（姓名 身份证，可直接复制重新导入）===']);
   appendDomLog(lines);
   appendDomLog(['[导出失败] 共 ' + failed.length + ' 个（已显示在上方，未生成文件）']);
+}
+
+async function domImportFailed() {
+  // ★ 把本次运行失败的账号自动导入到账号区：先清空账号区，再填入失败账号（每行 姓名 身份证）
+  const s = lastDomStatus;
+  if (!s || !s.results) { appendDomLog(['[导入失败] 还没有运行记录']); return; }
+  const failed = (s.results || []).filter(r => r && r.ok === false);
+  if (!failed.length) { appendDomLog(['[导入失败] 没有失败账号 ✓']); return; }
+  const text = failed.map(r => (r.name || '') + ' ' + (r.idCard || '')).join('\n');
+  $('domAcc').value = '';                              // 先清空账号区
+  $('domAcc').value = text;                            // 填入失败账号
+  $('domAcc').dispatchEvent(new Event('input'));       // 触发解析刷新账号数
+  appendDomLog(['[导入失败] 已清空账号区并填入 ' + failed.length + ' 个失败账号（可直接点开始重跑）']);
 }
 
 function renderDomRows(s) {
@@ -1003,7 +1031,7 @@ async function domPoll() {
     (s.running ? ' · 运行中…' : ' · 已结束');
   if (!s.running) {
     domRunning = false;
-    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportFailed').disabled = false;
+    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportFailed').disabled = false; $('domBtnImportFailed').disabled = false;
     appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
     doTkInfo();
   }
