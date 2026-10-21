@@ -411,10 +411,12 @@ const SMS = {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const j = await (await fetch(url)).json();
-      if (Number(j.code) === 0 || j.code === '0') {
-        const yzm = j.yzm || (j.sms && (j.sms.match(/(\d{4,8})/) || [])[1]) || '';
-        if (yzm) return yzm;
-      }
+      // ★ 只在拿到合法验证码（4~8 位纯数字）时才返回；0 / 空 / 非数字一律视为「还没收到」，继续轮询。
+      //   修复：豪猪返回 code=0/yzm=0 这类「未收到」信号曾被误当成验证码（徐彦如案例拿到「验证码: 0」，
+      //        拿 0 去 verify 白跑、且把号拉黑废掉）；现改为只认真码，收不到就超时走换号重试。
+      const yzm = (j.yzm != null && String(j.yzm)) ||
+                  (j.sms && (j.sms.match(/(\d{4,8})/) || [])[1]) || '';
+      if (/^\d{4,8}$/.test(yzm)) return yzm;
       await sleep(intervalMs);
     }
     throw new Error('豪猪取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
@@ -719,7 +721,13 @@ async function domesticLogin(acc, idx) {
       try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（已成功取码，号源即用即弃）:', phone); } catch (_) {}
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
       const token = v.json && v.json.session && v.json.session.sessionToken;
-      if (!token) throw new Error('登录失败（拿不到 sessionToken）: ' + JSON.stringify(v.json).slice(0, 240));
+      if (!token) {
+        // ★ 诊断增强：把 HTTP 状态码与原始响应体也打出来，下次一眼看出是 502/403/还是正常 JSON 但缺 session
+        const raw = (v.json && typeof v.json === 'object')
+          ? JSON.stringify(v.json).slice(0, 240)
+          : (typeof v.text === 'string' ? v.text.slice(0, 240) : '(无响应体)');
+        throw new Error('登录失败（拿不到 sessionToken）: HTTP ' + v.status + ' | ' + raw);
+      }
       CFG.bearer = token;
       const uid = (v.json.session.user || {}).id;
       console.log('  ✅ 登录成功 | uid=', uid);
