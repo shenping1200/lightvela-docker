@@ -62,7 +62,7 @@ const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { normalizeProxy, connectTunnel, makeHttpsAgent } = require('./lv-proxy');
+const { normalizeProxy, connectTunnel, makeHttpsAgent, resetHttpsAgent } = require('./lv-proxy');
 
 // ===================== 设主模型脚本(hermes 官方模型配置, gzip+base64, 通用) =====================
 // 前端【设定主模型】实际 = 向实例 POST /v1/instances/<id>/debug/exec，命令里解压执行此脚本，
@@ -430,8 +430,8 @@ const SMS = {
 // 支持环境变量 LIGHTVELA_ACCOUNTS_FILE 覆盖（UI 传入临时账号列表时用，避免改默认 accounts.js 干扰后台批量）
 const ACCOUNTS = require(process.env.LIGHTVELA_ACCOUNTS_FILE || './accounts.js');
 
-// 要抢的套餐（实抓确认：老大上次抢的是 AI 版 bundle_launch_ai_01）
-const BUNDLE_ID = process.env.LIGHTVELA_BUNDLE_ID || 'bundle_launch_ai_01';
+// 要抢的套餐（2026-10-22 实勘：网站当前只放行 bundle_free_trial_01，故默认改它）
+const BUNDLE_ID = process.env.LIGHTVELA_BUNDLE_ID || 'bundle_launch_ai_01'; // 死代码：实际取用见 restSubscribe 里 process.env.LIGHTVELA_BUNDLE_ID；默认改为真实存在的 0 元包
 const INSTANCE_NAME = process.env.LIGHTVELA_INSTANCE_NAME || '我的 AI 伙伴';
 
 // 部署：命令/话术整段从文件读（老大自己编辑该文件，程序只负责"发出去 + 等回复"）
@@ -778,8 +778,8 @@ async function domesticLogin(acc, idx) {
 }
 
 // ===================== REST 引导 =====================
-function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {}, timeoutMs = 20000 } = {}) {
-  return new Promise((resolve, reject) => {
+function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {}, timeoutMs = 20000, retries = 2, retryBaseMs = 800 } = {}) {
+  const attempt = () => new Promise((resolve, reject) => {
     const u = new URL(CFG.apiBase + path);
     const data = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
     const h = Object.assign({
@@ -798,22 +798,64 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
         resolve({ status: res.statusCode, headers: res.headers, text, json });
       });
     });
-    req.on('error', reject);
-    req.setTimeout(timeoutMs, () => { req.destroy(new Error('REST 超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); });
+    let settled = false;
+    req.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
+    req.setTimeout(timeoutMs, () => { if (!settled) { settled = true; req.destroy(new Error('REST 超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); } });
     if (data) req.write(data);
     req.end();
   });
+  // 仅在“尚未拿到任何 HTTP 响应”的网络层错误（超时/连接重置/代理抖动/域名解析失败）才重试；
+  // 一旦收到响应（哪怕 4xx/5xx）就不再重发，避免对下单等写操作造成重复副作用。
+  return (async () => {
+    let lastErr;
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await attempt();
+      } catch (e) {
+        lastErr = e;
+        const net = /REST 超时|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|getaddrinfo|ENOTFOUND|EHOSTUNREACH|网络|代理|proxy/i.test(e.message || '');
+        if (i < retries && net) {
+          const wait = retryBaseMs * Math.pow(2, i);
+          console.log('[REST] 网络层瞬时失败，' + (wait / 1000) + 's 后重试 (' + (i + 1) + '/' + retries + '): ' + method + ' ' + path + ' | ' + e.message);
+          await sleep(wait);
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw lastErr;
+  })();
 }
 
-// 确保拿到 Bearer（没显式传 LIGHTVELA_BEARER 时，用 cookie 走 /auth/session 换）
+// 校验 bearer 是否仍有效：仅当明确鉴权失败(401/403)才判失效；
+// 网络层瞬时错误一律保守视为“仍有效”，避免一次探针抖动就把好 token 清掉导致后续全 401。
+async function probeBearerValid(token) {
+  try {
+    const r = await httpsReq('GET', '/auth/session', { bearer: token, retries: 1 });
+    if (r.status === 401 || r.status === 403) return false;
+    return true;
+  } catch (e) {
+    return true; // 探针本身网络出错 → 保守认为仍有效
+  }
+}
+
+// 确保拿到 Bearer（治本：先校验现有 token 是否还有效，失效才刷新/重登；
+// 避免“拿到旧 token 直接返回却已失效”导致后续订阅/建Bot 全 401）
 async function ensureBearer() {
-  if (CFG.bearer) return CFG.bearer;
-  const r = await httpsReq('GET', '/auth/session');
-  if (r.json && r.json.token) CFG.bearer = r.json.token;
-  else if (r.json && r.json.data && r.json.data.token) CFG.bearer = r.json.data.token;
-  else if (r.headers['authorization']) CFG.bearer = r.headers['authorization'].replace(/^Bearer /, '');
+  if (CFG.bearer) {
+    const ok = await probeBearerValid(CFG.bearer);
+    if (ok) return CFG.bearer;
+    console.log('[REST] 现有 Bearer 已失效，尝试用 Cookie 换发…');
+    CFG.bearer = '';
+  }
+  if (CFG.cookie) {
+    const r = await httpsReq('GET', '/auth/session');
+    if (r.json && r.json.token) CFG.bearer = r.json.token;
+    else if (r.json && r.json.data && r.json.data.token) CFG.bearer = r.json.data.token;
+    else if (r.headers['authorization']) CFG.bearer = r.headers['authorization'].replace(/^Bearer /, '');
+  }
   if (!CFG.bearer) throw new Error('拿不到 Bearer token，请手动设置 LIGHTVELA_BEARER 或 LIGHTVELA_COOKIE');
-  console.log('[REST] 已获取 Bearer');
+  console.log('[REST] 已获取/刷新 Bearer');
   return CFG.bearer;
 }
 
@@ -821,13 +863,13 @@ async function ensureBearer() {
 /**
  * 纯代码订阅 1 个月免费套餐（等价浏览器里"点 Free Trial → Confirm activation"）。
  *
- * ★ 2026-10-12 网站改版后实测（测试环境 1889133402 浏览器真实点击抓包）：
- *   老接口 POST /v1/passes 已废 —— 服务端只认已下线的 bundle_free_trial_01，一律 400。
- *   真实可用的免费开通 = 新版前端"点石下单即付"：
- *     POST /v1/passes/dianshi/order-and-pay { bundle_id:"bundle_launch_ai_01", period:1, time_unit:"m" }
- *   免费包是 **bundle_launch_ai_01**（Launch AI，0 元，首单免费 1 个月，送 4500 积分）。
- *   ⚠️ 别用 bundle_launch_01（非 AI 版）：同样 0 元，但走这条会卡在
- *      "paid_pending_provision / jifei returned no deals"，永不生效。
+ * ★ 套餐随官方频繁变动，且「0 元订阅」的 API 表达法会变：
+ *   - 早期：bundle 直接 real_total_cost=0（如 bundle_free_trial_01，现已 OFFLINE）；
+ *   - 现在：real_total_cost=标价 + discount=100（百分百折扣=0元），4 个包目前全是 0 元。
+ *   故不再硬编码套餐 ID，改为实时拉取 /v1/bundles，并用【折后价=real_total_cost*(100-discount)/100】判定 0 元包；
+ *   无 0 元包时【不自动订阅付费包】，需订阅付费包请显式设 LIGHTVELA_BUNDLE_ID=<包ID>。
+ *   下单端点（浏览器真实在用的那条）：POST /v1/passes/dianshi/order-and-pay，
+ *   body {bundle_id, period:1, time_unit:"m"}；异步开通后 GET /v1/passes 轮询等到 pass 即成功。
  * 成功判据：开通后 GET /v1/passes 能查到"未过期且未删除"的 pass（轮询等待生效）。
  * 失败一律返回 SUBSCRIBE=RETRY，由外层编排重订。
  * 输出：SUBSCRIBE=OK|already|<bundle>  /  SUBSCRIBE=OK|activated|<bundle>  /  SUBSCRIBE=RETRY|<原因>
@@ -845,7 +887,8 @@ async function restSubscribe() {
     const msg = String((r.json && (r.json.message || r.json.msg)) || r.text || '').replace(/\s+/g, ' ').slice(0, 160);
     return { code, msg };
   };
-  const isOk = (r, code) => r.status >= 200 && r.status < 300 && (code === '' || code === 'OK');
+  // 放宽成功判据：接受 '' / 'OK' / '0' / 'success'（不同接口返回格式不一），明确错误码才判失败
+  const isOk = (r, code) => r.status >= 200 && r.status < 300 && (code === '' || code === 'OK' || code === '0' || /success/i.test(code));
 
   // 0) 已有有效订阅 → 直接成功（幂等）
   try {
@@ -858,7 +901,9 @@ async function restSubscribe() {
     }
   } catch (e) { console.log('[订阅] 查询现有订阅失败(忽略，继续尝试激活):', e.message); }
 
-  // 1) 组装候选套餐：显式覆盖 → 0 元包（AI 优先）→ 实测有效的免费包 → 老包兜底
+  // 1) 组装候选套餐（★ 套餐 ID/价格随官方随时调整，必须实时拉取，绝不能写死）
+  //    优先级：显式覆盖(LIGHTVELA_BUNDLE_ID) → 在线 0 元包(首单免费活动在时)
+  //    无 0 元包时【不自动订阅付费包】，避免误扣费；需订阅付费包请显式设 LIGHTVELA_BUNDLE_ID
   const candidates = [];
   const push = (id) => { if (id && candidates.indexOf(id) < 0) candidates.push(id); };
   push(process.env.LIGHTVELA_BUNDLE_ID);
@@ -866,18 +911,31 @@ async function restSubscribe() {
     const rb = await httpsReq('GET', '/v1/bundles');
     const bs = pickArray(unwrapData(rb.json), ['bundles', 'items']) || [];
     const online = bs.filter((b) => !b.bundle_state || b.bundle_state === 'ONLINE');
-    const zero = online.filter((b) => b.price && Number(b.price.real_total_cost) === 0);
+    // ★ 「0 元订阅」必须用【折后价】判定：real_total_cost * (100 - discount) / 100
+    //   官方表达法会变：早期直接 real_total_cost=0；现在改成 real_total_cost=标价 + discount=100（百分百折扣=0元）。
+    //   两种写法折后都是 0 才算免费包，避免漏掉 discount=100 的 0 元包（曾因此误判"免费包已下线"→ 抢套餐失败）。
+    const effCost = (b) => {
+      const p = b.price || {};
+      const rtc = Number(p.real_total_cost);
+      if (isNaN(rtc)) return NaN;
+      const disc = Number(p.discount) || 0;
+      return rtc * (100 - disc) / 100;
+    };
+    const zero = online.filter((b) => { const e = effCost(b); return !isNaN(e) && Math.abs(e) < 0.01; });
     zero.sort((a, b) => (b.bundle_type === 'ai' ? 1 : 0) - (a.bundle_type === 'ai' ? 1 : 0));
     for (const b of zero) push(b.bundle_id);
-  } catch (e) { console.log('[订阅] 拉取套餐列表失败(用默认清单):', e.message); }
-  push('bundle_launch_ai_01'); // ★ 实测有效的 0 元免费包（Launch AI）
-  push('bundle_launch_01');    // 非 AI 版（可能卡开通，仅作兜底）
-  console.log('[订阅] 候选套餐:', candidates.join(', '));
+    if (!zero.length) {
+      console.log('[订阅] ⚠️ 当前无 0 元免费套餐（所有在线包折后均 >0，免费活动疑似已结束），在线包：' +
+        online.map((b) => b.bundle_id + '(折后￥' + (effCost(b) / 100).toFixed(2) + ')').join(', ') +
+        '；为避免过度扣费未自动订阅付费包，如需订阅请设 LIGHTVELA_BUNDLE_ID=<包ID>');
+    }
+  } catch (e) { console.log('[订阅] 拉取套餐列表失败:', e.message); }
+  console.log('[订阅] 候选套餐:', candidates.join(', ') || '(空·需设 LIGHTVELA_BUNDLE_ID)');
 
-  // 开通后轮询等 pass 生效
+  // 开通后轮询等 pass 生效（放宽到 ~25s，覆盖异步开通延迟，避免“刚下单就误判失败”）
   const waitPass = async (bundleId, tries) => {
     for (let i = 0; i < tries; i++) {
-      await sleep(i === 0 ? 800 : 1500);
+      await sleep(i === 0 ? 1500 : 2000);
       try {
         const live = await fetchLivePasses();
         if (live.length) {
@@ -890,34 +948,49 @@ async function restSubscribe() {
     return false;
   };
 
-  // 2) 逐个候选尝试：新版"点石下单即付"优先，老接口兜底
+  // 2) 外层重试（治本：瞬时网络抖动/代理断连不再直接判“抢套餐失败”；token 中途失效也会重验）
+  const OUTER = Number(process.env.LIGHTVELA_SUB_RETRY || 3);
   let lastErr = '';
-  for (const bundleId of candidates) {
-    // 2a) 新版（网站真实在用的那条）
-    try {
-      const r = await httpsReq('POST', '/v1/passes/dianshi/order-and-pay', { body: { bundle_id: bundleId, period: 1, time_unit: 'm' } });
-      const { code, msg } = brief(r);
-      console.log('[订阅] dianshi/order-and-pay', bundleId, '→', r.status, 'code=' + (code || '-'), 'msg=' + msg);
-      if (isOk(r, code)) {
-        if (await waitPass(bundleId, 8)) return true;
-        lastErr = '订单已建但未生效(' + bundleId + ')';
-      } else { lastErr = msg || ('HTTP ' + r.status); }
-    } catch (e) { console.log('[订阅] dianshi 请求异常:', e.message); lastErr = e.message; }
+  for (let outer = 0; outer < OUTER; outer++) {
+    if (outer > 0) {
+      console.log('[订阅] 第 ' + (outer + 1) + '/' + OUTER + ' 次重试（间隔 5s，重验 Bearer）…');
+      await sleep(5000);
+      try { await ensureBearer(); } catch (e) { console.log('[订阅] 重验 Bearer 失败:', e.message); }
+    }
+    let orderedOk = false;
+    for (const bundleId of candidates) {
+      // 2a) 新版（网站真实在用的那条）
+      try {
+        const r = await httpsReq('POST', '/v1/passes/dianshi/order-and-pay', { body: { bundle_id: bundleId, period: 1, time_unit: 'm' } });
+        const { code, msg } = brief(r);
+        console.log('[订阅] dianshi/order-and-pay', bundleId, '→', r.status, 'code=' + (code || '-'), 'msg=' + msg);
+        if (isOk(r, code)) {
+          if (await waitPass(bundleId, 12)) return true;
+          // 订单已建但 pass 仍未生效：多为异步开通延迟，记软成功并跳出内层，外层重试前再复核
+          lastErr = '订单已建但 pass 未生效(' + bundleId + ')';
+          orderedOk = true;
+          try { const lv = await fetchLivePasses(); if (lv.length) { console.log('SUBSCRIBE=OK|activated|' + (lv[0].bundle_id || bundleId) + '|' + (lv[0].pass_id || '')); return true; } } catch (_) {}
+        } else { lastErr = msg || ('HTTP ' + r.status); }
+      } catch (e) { console.log('[订阅] dianshi 请求异常:', e.message); lastErr = e.message; }
+      if (orderedOk) break;
 
-    // 2b) 老接口（对遗留免费包仍可能有效）
-    try {
-      const r2 = await httpsReq('POST', '/v1/passes', { body: { bundle_id: bundleId } });
-      const { code, msg } = brief(r2);
-      console.log('[订阅] POST /v1/passes', bundleId, '→', r2.status, 'code=' + (code || '-'), 'msg=' + msg);
-      if (isOk(r2, code)) {
-        if (await waitPass(bundleId, 8)) return true;
-      }
-      if (/conflict|already|exist|duplicate|已订阅|已存在|重复/i.test(code + ' ' + msg)) {
-        console.log('SUBSCRIBE=OK|already|' + bundleId + '|');
-        return true;
-      }
-      lastErr = msg || ('HTTP ' + r2.status);
-    } catch (e) { console.log('[订阅] 老接口请求异常:', e.message); lastErr = e.message; }
+      // 2b) 老接口（对遗留免费包仍可能有效）
+      try {
+        const r2 = await httpsReq('POST', '/v1/passes', { body: { bundle_id: bundleId } });
+        const { code, msg } = brief(r2);
+        console.log('[订阅] POST /v1/passes', bundleId, '→', r2.status, 'code=' + (code || '-'), 'msg=' + msg);
+        if (isOk(r2, code)) {
+          if (await waitPass(bundleId, 12)) return true;
+        }
+        if (/conflict|already|exist|duplicate|已订阅|已存在|重复/i.test(code + ' ' + msg)) {
+          console.log('SUBSCRIBE=OK|already|' + bundleId + '|');
+          return true;
+        }
+        lastErr = msg || ('HTTP ' + r2.status);
+      } catch (e) { console.log('[订阅] 老接口请求异常:', e.message); lastErr = e.message; }
+    }
+    // 外层重试前，再查一次现有订阅（覆盖异步开通）
+    try { const lv = await fetchLivePasses(); if (lv.length) { console.log('SUBSCRIBE=OK|activated|' + (lv[0].bundle_id || '') + '|' + (lv[0].pass_id || '')); return true; } } catch (_) {}
   }
 
   console.log('SUBSCRIBE=RETRY|' + (lastErr || '所有候选套餐均未开通'));
@@ -1733,6 +1806,9 @@ async function main() {
 
   const results = [];
   for (const { acc, idx } of runPairs) {
+    // ★ 换账号时强制换新隧道 → 该账号的出口 IP 与上一个账号不同（单进程批量模式必需；
+    //   子进程模式本循环只跑一次、且 agent 是全新的，reset 为空操作，无副作用）
+    if (EGRESS_AGENTS.length) EGRESS_AGENTS.forEach(resetHttpsAgent);
     // ★ 实名补救跨进程协调：本身份若已被别的账号补救占用（consumed），本子进程直接跳过，不再注册本身份
     const selfStatus = await markSelfRunning(idx);
     if (selfStatus === 'skipped') {
@@ -1767,7 +1843,7 @@ async function main() {
       if (!reused) saveDomesticToken(cred);   // 复用且有凭证不重复追加；登录/补全都存盘
       console.log('DOMESTIC_CRED_JSON=' + JSON.stringify(cred));
       if (loginOnly) { results.push({ uid, phone, loginOk: true }); continue; }   // 模式①：只拿凭证
-      // 2) 抢套餐（0 元包；实抓确认用 bundle_launch_ai_01）
+      // 2) 抢套餐（0 元包；2026-10-22 起实际可用 bundle_free_trial_01）
       const subOk = await restSubscribe();
       if (!subOk) throw new Error('抢套餐失败');
       // 3) 建机器人（有就复用，没有就建 + 轮询到 active/running）
