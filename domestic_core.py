@@ -42,10 +42,18 @@ CRED_RE = re.compile(r"DOMESTIC_CRED_JSON=(\{.*\})")
 # ===================== 国内版配置（接码平台账号/密码 + 代理 + 部署指令）=====================
 DEFAULT_DOMESTIC_CONFIG = {
     "sms": {
+        "provider": "haozhuma",   # 接码平台选择器：haozhuma（默认）| feihu；选哪套哪套生效，两套并存
         "apiBase": "https://api.haozhuma.com",
         "apiUser": "f632fc95683bd65352623febb154ffcae6550a33178a18c65921060810d0571c",
         "apiPass": "284d033beb03583ba15948792383e03683e36a6c90cf0c63a1ca767a2d70c2f6",
         "projectId": 21986,
+        # 飞狐接码（与豪猪并存；provider=feihu 时生效）
+        "feihu": {
+            "apiBase": "http://api.feihu2026.com/api/sms",
+            "apiKey": "",
+            "apiSecret": "",
+            "projectId": "",
+        },
     },
     "proxy": {
         "type": "socks5",
@@ -106,13 +114,47 @@ def get_config():
 
 
 def set_sms_config(apiBase, apiUser, apiPass, projectId):
+    """保存豪猪接码账密（不覆盖 provider / feihu 等并存字段）。"""
     cfg = _read_config()
-    cfg["sms"] = {
-        "apiBase": (apiBase or DEFAULT_DOMESTIC_CONFIG["sms"]["apiBase"]).strip(),
-        "apiUser": (apiUser or "").strip(),
-        "apiPass": (apiPass or "").strip(),
-        "projectId": int(projectId) if str(projectId).strip() else DEFAULT_DOMESTIC_CONFIG["sms"]["projectId"],
-    }
+    sms = cfg.get("sms") or {}
+    sms["apiBase"] = (apiBase or DEFAULT_DOMESTIC_CONFIG["sms"]["apiBase"]).strip()
+    sms["apiUser"] = (apiUser or "").strip()
+    sms["apiPass"] = (apiPass or "").strip()
+    sms["projectId"] = int(projectId) if str(projectId).strip() else DEFAULT_DOMESTIC_CONFIG["sms"]["projectId"]
+    # 保留 provider / feihu 字段，避免覆盖另一套平台配置
+    if "provider" not in sms:
+        sms["provider"] = "haozhuma"
+    if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
+        sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
+    cfg["sms"] = sms
+    _write_config(cfg)
+    return {"ok": True}
+
+
+def set_sms_provider(provider):
+    """切换接码平台：haozhuma | feihu（选哪套哪套生效）。"""
+    cfg = _read_config()
+    sms = cfg.get("sms") or {}
+    sms["provider"] = "feihu" if str(provider).strip().lower() == "feihu" else "haozhuma"
+    if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
+        sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
+    cfg["sms"] = sms
+    _write_config(cfg)
+    return {"ok": True, "provider": sms["provider"]}
+
+
+def set_feihu_config(apiBase, apiKey, apiSecret, projectId):
+    """保存飞狐接码配置（apiKey=平台账号，apiSecret=API密钥，projectId=pid）。"""
+    cfg = _read_config()
+    sms = cfg.get("sms") or {}
+    fh = sms.get("feihu") or {}
+    if apiBase and apiBase.strip():
+        fh["apiBase"] = apiBase.strip()
+    fh["apiKey"] = (apiKey or "").strip()
+    fh["apiSecret"] = (apiSecret or "").strip()
+    fh["projectId"] = (projectId or "").strip()
+    sms["feihu"] = fh
+    cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True}
 
@@ -152,8 +194,12 @@ def set_deploy_config(verify, retry, smsTimeoutSec, smsMaxRent):
 
 
 def test_sms():
-    """用配置里的账密登录豪猪、查余额，返回 {ok, balance, error}。"""
+    """用配置里的账密登录当前所选平台（豪猪/飞狐）、查余额，返回 {ok, balance, error}。"""
     cfg = _read_config()["sms"]
+    provider = (cfg.get("provider") or "haozhuma").lower()
+    if provider == "feihu":
+        return test_feihu()
+    # —— 豪猪 ——
     if not cfg.get("apiUser") or not cfg.get("apiPass"):
         return {"ok": False, "error": "未填写接码平台账号/密码"}
     try:
@@ -173,6 +219,34 @@ def test_sms():
         with urllib.request.urlopen(req2, timeout=10) as r:
             j2 = json.loads(r.read().decode("utf-8", errors="replace"))
         return {"ok": True, "balance": j2.get("money"), "summary": j2}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def test_feihu():
+    """用配置里的飞狐 apiKey/apiSecret 登录、查余额，返回 {ok, balance, error}。"""
+    cfg = (_read_config().get("sms") or {}).get("feihu") or {}
+    api_base = (cfg.get("apiBase") or DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]["apiBase"]).split(",")[0].strip()
+    api_key, api_secret = cfg.get("apiKey"), cfg.get("apiSecret")
+    if not api_key or not api_secret:
+        return {"ok": False, "error": "飞狐未填写 apiKey / API密钥"}
+    try:
+        import urllib.request, urllib.parse
+        base = api_base.rstrip("/")
+        url = base + "/login?user=" + urllib.parse.quote(api_key) + "&pass=" + urllib.parse.quote(api_secret)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read().decode("utf-8", errors="replace"))
+        if str(j.get("code")) != "200":
+            return {"ok": False, "error": "飞狐登录失败: " + json.dumps(j, ensure_ascii=False)}
+        token = (j.get("data") or {}).get("token")
+        if not token:
+            return {"ok": False, "error": "飞狐登录返回无 token: " + json.dumps(j, ensure_ascii=False)}
+        url2 = base + "/userInfo?token=" + urllib.parse.quote(token)
+        req2 = urllib.request.Request(url2, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req2, timeout=10) as r:
+            j2 = json.loads(r.read().decode("utf-8", errors="replace"))
+        return {"ok": True, "balance": (j2.get("data") or {}).get("money"), "summary": j2}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -293,6 +367,9 @@ def _env_from_config(cfg):
     """把国内版配置转成子进程环境变量（SMS+proxy）。"""
     env = {}
     sms = (cfg or {}).get("sms") or {}
+    provider = (sms.get("provider") or "haozhuma").lower()
+    # ★ 平台选择器：选哪套哪套生效（两套凭证都透传，bot.js 按此 env 决定用哪套）
+    env["LIGHTVELA_SMS_PROVIDER"] = provider
     if sms.get("apiBase"):
         env["LIGHTVELA_SMS_API_BASE"] = sms["apiBase"]
     if sms.get("apiUser"):
@@ -301,6 +378,16 @@ def _env_from_config(cfg):
         env["LIGHTVELA_SMS_PASS"] = sms["apiPass"]
     if sms.get("projectId"):
         env["LIGHTVELA_SMS_PROJECT_ID"] = str(sms["projectId"])
+    # 飞狐凭证（无论当前是否选中都透传，切换即可生效）
+    fh = sms.get("feihu") or {}
+    if fh.get("apiBase"):
+        env["LIGHTVELA_FEIHU_API_BASE"] = fh["apiBase"]
+    if fh.get("apiKey"):
+        env["LIGHTVELA_FEIHU_API_KEY"] = fh["apiKey"]
+    if fh.get("apiSecret"):
+        env["LIGHTVELA_FEIHU_API_SECRET"] = fh["apiSecret"]
+    if fh.get("projectId"):
+        env["LIGHTVELA_FEIHU_PROJECT_ID"] = str(fh["projectId"])
     px = (cfg or {}).get("proxy")
     if px:
         env["LIGHTVELA_EGRESS_PROXY"] = _normalize_proxy_cfg(px)
@@ -438,7 +525,9 @@ def _panel_line(s):
     if s.startswith("[订阅]"):
         if any(p in s for p in _SUBSCRIBE_DROP):
             return None
-        if "已有有效订阅" in s or "复核通过" in s:
+        if "已有有效订阅" in s:
+            return "[订阅] ✅ 复用已有订阅（跳过重复激活）"
+        if "复核通过" in s:
             return "[订阅] ✅ 复核通过"
         return None  # 其它 [订阅] 行不显示
     # 模型 / 部署结果
@@ -668,22 +757,28 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
             # 续跑时 prelude 是「[跳过] 某某：原因」明细，放在日志最前面
             _state["log"] = list(prelude or [])
             _state["procs"] = []
-        for i in range(0, total, CONCURRENCY):
-            # ★ 全局停止：每批开始前检查，停止后不再启动排队账号
+        # ★ 滑动窗口并发：始终保持最多 CONCURRENCY 个账号在跑，
+        #   任意一个跑完立刻补下一个，不再等整批齐了才走。
+        sem = threading.Semaphore(CONCURRENCY)
+        threads = []
+
+        def _worker(i, acc):
+            try:
+                if not _state["running"]:
+                    return
+                _run_one(i, acc, mode, tmp, use_saved)
+            finally:
+                sem.release()
+
+        for i, acc in enumerate(accounts):
             if not _state["running"]:
                 break
-            batch = []
-            for k in range(CONCURRENCY):
-                if i + k >= total:
-                    break
-                # ★ 本批内若中途被停止，也不补起剩余线程
-                if not _state["running"]:
-                    break
-                t = threading.Thread(target=_run_one, args=(i + k, accounts[i + k], mode, tmp, use_saved), daemon=True)
-                batch.append(t)
-                t.start()
-            for t in batch:
-                t.join()
+            sem.acquire()
+            t = threading.Thread(target=_worker, args=(i, acc), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
     finally:
         try:
             os.remove(tmp)

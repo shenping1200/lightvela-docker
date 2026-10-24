@@ -263,6 +263,9 @@ HANDLERS = {
     "domestic_config_get":       lambda a: dcore.get_config(),
     "domestic_sms_set":          lambda a: dcore.set_sms_config(a[0] if a else "", a[1] if len(a) > 1 else "",
                                                                 a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""),
+    "domestic_sms_provider_set": lambda a: dcore.set_sms_provider(a[0] if a else "haozhuma"),
+    "domestic_feihu_set":        lambda a: dcore.set_feihu_config(a[0] if a else "", a[1] if len(a) > 1 else "",
+                                                                a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""),
     "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                                   a[4] if len(a) > 4 else ""),
@@ -271,6 +274,7 @@ HANDLERS = {
                                                             a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                             a[4] if len(a) > 4 else ""),
     "domestic_sms_balance":      lambda a: dcore.sms_balance(),
+    "domestic_test_feihu":       lambda a: dcore.test_feihu(),
     "domestic_deploy_set":       lambda a: dcore.set_deploy_config(
         a[0] if len(a) > 0 else True,
         a[1] if len(a) > 1 else 2,

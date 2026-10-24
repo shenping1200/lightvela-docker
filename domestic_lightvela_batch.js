@@ -93,20 +93,24 @@ async function runBatch() {
   console.log(`[批量] 开始时间 ${new Date(startedAt).toLocaleString()}`);
 
   const all = [];
-  for (let i = 0; i < total; i += CONCURRENCY) {
-    const batchNo = Math.floor(i / CONCURRENCY) + 1;
-    const slice = [];
-    for (let k = 0; k < CONCURRENCY && i + k < total; k++) {
-      slice.push(runOne(i + k, ACCOUNTS[i + k]));
-    }
-    console.log(`[批量] >>> 第 ${batchNo} 批启动：账号 ${i + 1}~${i + slice.length}`);
-    const batchResults = await Promise.all(slice);
-    all.push(...batchResults);
-
-    const ok = batchResults.filter((r) => r.code === 'OK').length;
-    const fail = batchResults.length - ok;
-    console.log(`[批量] <<< 第 ${batchNo} 批完成：本批 成功 ${ok} / 失败 ${fail} | 累计成功 ${all.filter((r) => r.code === 'OK').length}/${all.length}`);
+  let next = 0;
+  let done = 0;
+  // ★ 滑动窗口：始终保持最多 CONCURRENCY 个账号在跑，跑完一个立刻补下一个
+  const workers = [];
+  for (let w = 0; w < CONCURRENCY; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = next++;
+        if (i >= total) break;
+        const r = await runOne(i, ACCOUNTS[i]);
+        all.push(r);
+        done++;
+        const ok = r.code === 'OK' ? 1 : 0;
+        console.log(`[批量] #${i + 1} 完成（累计 ${done}/${total} | 本个 成功 ${ok}）`);
+      }
+    })());
   }
+  await Promise.all(workers);
 
   const okCount = all.filter((r) => r.code === 'OK').length;
   const failCount = all.length - okCount;

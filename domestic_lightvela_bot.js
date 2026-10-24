@@ -385,7 +385,7 @@ function wsParseServerFrames(buf) {
 //   LIGHTVELA_SMS_USER         API 账号（h5.haozhuma.com「API-配置」里复制）
 //   LIGHTVELA_SMS_PASS         API 密码
 //   LIGHTVELA_SMS_PROJECT_ID   项目编号（默认 21986 = 腾讯云 / 腾讯云短信）
-const SMS = {
+const SMS_HAOZHUMA = {
   apiBase:   process.env.LIGHTVELA_SMS_API_BASE || 'https://api.haozhuma.com',
   apiUser:   process.env.LIGHTVELA_SMS_USER     || 'f632fc95683bd65352623febb154ffcae6550a33178a18c65921060810d0571c',
   apiPass:   process.env.LIGHTVELA_SMS_PASS     || '284d033beb03583ba15948792383e03683e36a6c90cf0c63a1ca767a2d70c2f6',
@@ -425,6 +425,112 @@ const SMS = {
   async blacklist(phone) { const t = await this.login(); await fetch(`${this.apiBase}/sms/?api=addBlacklist&token=${t}&sid=${this.projectId}&phone=${phone}`); },
   async balance() { const t = await this.login(); const j = await (await fetch(`${this.apiBase}/sms/?api=getSummary&token=${t}`)).json(); return j.money; },
 };
+
+// ===================== 国内版：飞狐接码（与豪猪并存，按 LIGHTVELA_SMS_PROVIDER 切换）=====================
+// 飞狐 API 文档：https://my.feihu2026.com/document
+//   基础地址：http://api.feihu2026.com/api/sms（备用 se/by/vx/dx/lt/yd/hk 等子域，连不上自动换下一个）
+//   认证：/login?user=<api_key>&pass=<API密钥> -> data.token（长期有效，缓存即可）
+//   取号：/getPhone?token=&pid=<项目ID>&... -> phone + order_id
+//   轮询：/getMessage?token=&order_id= -> data.status: 1等待 / 3已收到(data.code) / 4失败 / 5已释放 / 6超时；间隔>=10s
+//   释放：/cancelRecv?token=&order_id=      加黑：/addBlackList?token=&order_id=
+//   余额：/userInfo?token= -> data.money
+//   通用返回：{code:200, msg:"OK", data:{...}}
+const SMS_FEIHU = {
+  // 备用域名数组：主域连不上自动换下一个（只换一次，避免对"已发出未超时"的请求重复取号）
+  apiBases: (process.env.LIGHTVELA_FEIHU_API_BASE || 'http://api.feihu2026.com/api/sms')
+              .split(',').map(s => s.trim()).filter(Boolean),
+  apiKey:    process.env.LIGHTVELA_FEIHU_API_KEY     || '',
+  apiSecret: process.env.LIGHTVELA_FEIHU_API_SECRET  || '',
+  projectId: process.env.LIGHTVELA_FEIHU_PROJECT_ID  || '',
+  _token: null,
+  _orderByPhone: {},   // phone -> order_id：飞狐按订单释放/拉黑，不是按手机号
+  _baseIdx: 0,
+  _base() { return this.apiBases[this._baseIdx % this.apiBases.length]; },
+  async _get(path) {
+    const tryOnce = async (base) => {
+      const url = base + path;
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 LightVela' } });
+      const t = await r.text();
+      try { return JSON.parse(t); } catch (e) { return {}; }
+    };
+    try {
+      return await tryOnce(this._base());
+    } catch (e) {
+      // 网络层失败（ENOTFOUND/ETIMEDOUT/ECONNREFUSED）：换下一个备用域名重试一次
+      this._baseIdx++;
+      console.log('  [飞狐] 域名 ' + this._base() + ' 连接失败，切换备用域名重试…');
+      try { return await tryOnce(this._base()); }
+      catch (e2) { throw new Error('飞狐请求失败: ' + e2.message); }
+    }
+  },
+  async login() {
+    if (this._token) return this._token;
+    if (!this.apiKey || !this.apiSecret) throw new Error('飞狐未配置（缺少 apiKey / API密钥）');
+    const j = await this._get('/login?user=' + encodeURIComponent(this.apiKey) + '&pass=' + encodeURIComponent(this.apiSecret));
+    if (Number(j.code) !== 200) throw new Error('飞狐登录失败: ' + JSON.stringify(j));
+    this._token = j.data && j.data.token;
+    if (!this._token) throw new Error('飞狐登录返回无 token: ' + JSON.stringify(j));
+    return this._token;
+  },
+  async rentNumber() {
+    const token = await this.login();
+    if (!this.projectId) throw new Error('飞狐未配置项目 ID（pid）');
+    const j = await this._get('/getPhone?token=' + encodeURIComponent(token) + '&pid=' + encodeURIComponent(this.projectId));
+    if (Number(j.code) !== 200) throw new Error('飞狐取号失败: ' + JSON.stringify(j));
+    const phone = j.data && j.data.phone;
+    const order = j.data && j.data.order_id;
+    if (!phone) throw new Error('飞狐取号返回无手机号: ' + JSON.stringify(j));
+    this._orderByPhone[phone] = order;   // 记下订单号，释放/拉黑要用
+    return phone;
+  },
+  async getCode(phone, { timeoutMs = 180000, intervalMs = 15000 } = {}) {
+    const token = await this.login();
+    const order = this._orderByPhone[phone];
+    if (!order) throw new Error('飞狐取码缺少 order_id（该号非本次取号所得）: ' + phone);
+    if (intervalMs < 10000) intervalMs = 10000;   // 飞狐硬性要求轮询间隔 >=10s
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const j = await this._get('/getMessage?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+      if (Number(j.code) !== 200) throw new Error('飞狐取码接口错误: ' + JSON.stringify(j));
+      const st = Number(j.data && j.data.status);
+      if (st === 3) {
+        // 已收到：优先取 data.code，取不到再从短信正文里抠 4~8 位数字
+        const code = (j.data && (j.data.code != null ? String(j.data.code) : '')) ||
+                     (j.data && j.data.message ? (j.data.message.match(/(\d{4,8})/) || [])[1] : '') || '';
+        if (/^\d{4,8}$/.test(code)) return code;
+      } else if (st === 4 || st === 6) {
+        throw new Error('飞狐短信获取失败(状态' + st + '): ' + JSON.stringify(j.data || j));
+      } else if (st === 5) {
+        throw new Error('飞狐号码已被释放(状态5): ' + JSON.stringify(j.data || j));
+      }
+      await sleep(intervalMs);   // 状态 1（等待中）继续轮询
+    }
+    throw new Error('飞狐取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
+  },
+  async release(phone) {
+    const token = await this.login();
+    const order = this._orderByPhone[phone];
+    if (!order) return;
+    await this._get('/cancelRecv?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+  },
+  async blacklist(phone) {
+    const token = await this.login();
+    const order = this._orderByPhone[phone];
+    if (!order) return;
+    await this._get('/addBlackList?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+  },
+  async balance() {
+    const token = await this.login();
+    const j = await this._get('/userInfo?token=' + encodeURIComponent(token));
+    if (Number(j.code) !== 200) throw new Error('飞狐查余额失败: ' + JSON.stringify(j));
+    const m = j.data && j.data.money;
+    return (m != null ? m : '未知');
+  },
+};
+
+// ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu，选哪套哪套生效；两套实现并存、互不干扰
+const SMS_PROVIDER = (process.env.LIGHTVELA_SMS_PROVIDER || 'haozhuma').toLowerCase();
+const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU : SMS_HAOZHUMA;
 
 // 账号清单从独立文件加载（单一数据源，批量调度器也 require 它）
 // 支持环境变量 LIGHTVELA_ACCOUNTS_FILE 覆盖（UI 传入临时账号列表时用，避免改默认 accounts.js 干扰后台批量）
@@ -659,9 +765,17 @@ async function recoverRealname(selfIdx) {
   throw new Error('实名补救失败：已尝试 ' + MAX_RECOVERY + ' 个排队身份仍无法完成实名，终止本次注册');
 }
 
+// ★ 2026-10-23：接码平台（实测飞狐）偶尔混入香港/澳门号码（852/853 本地号，非 11 位，
+//   如 8 位的 44244437）。大陆号判定规则（老大定）：1 开头、共 11 位即放行，不挑号段
+//   （165/170/162 等虚拟运营商号段照常用，香港 852/澳门 853 的短号自然被挡）。
+function isMainlandPhone(phone) {
+  return /^1\d{10}$/.test(String(phone == null ? '' : phone).trim());
+}
+
 async function domesticLogin(acc, idx) {
   console.log(`\n===== 账号: ${acc.name} (${acc.idCard}) =====`);
   const MAX_RENT = Number(process.env.LIGHTVELA_SMS_MAX_RENT || 3);          // 最多换几个号
+  const MAX_REGION_RETRY = Number(process.env.LIGHTVELA_SMS_MAX_REGION_RETRY || 5); // 连续取到非大陆号的重取上限（平台号源异常时放弃本账号）
   const CODE_TIMEOUT_MS = Number(process.env.LIGHTVELA_SMS_CODE_TIMEOUT_MS || 180000); // 官方：超三分钟未收到验证码即拉黑重取
   const RESEND_WAIT_MS = Number(process.env.LIGHTVELA_SMS_RESEND_WAIT_MS || 60000);  // 发码限频后等 60s 同号重发
   const RESEND_MAX = Number(process.env.LIGHTVELA_SMS_RESEND_MAX || 5);             // 同号重发上限
@@ -673,8 +787,18 @@ async function domesticLogin(acc, idx) {
   for (let attempt = 1; attempt <= MAX_RENT; attempt++) {
     let phone = null;
     try {
-      phone = await SMS.rentNumber();
-      console.log(`  手机号(取号#${attempt}):`, phone);
+      // ★ 2026-10-23：取到非大陆号（香港/澳门）→ 拉黑并重取，直到拿到 11 位大陆号为止。
+      //   独立计数（MAX_REGION_RETRY）不占用 MAX_RENT 换号配额——取错地区是平台缺陷，不是号源质量问题。
+      //   飞狐拉黑按订单走（addBlackList 同时释放进行中的订单），豪猪按手机号走，SMS.blacklist 已各自封装。
+      for (let rr = 0; rr < MAX_REGION_RETRY; rr++) {
+        phone = await SMS.rentNumber();
+        console.log(`  手机号(取号#${attempt}${rr > 0 ? '-重取' + rr : ''}):`, phone);
+        if (isMainlandPhone(phone)) break;
+        try { await SMS.blacklist(phone); } catch (_) {}
+        console.log(`  ⛔ 已拉黑非大陆号码（${String(phone).length} 位）：${phone}，重新取号…`);
+        phone = null;
+      }
+      if (!phone) throw new Error('连续 ' + MAX_REGION_RETRY + ' 次取到非大陆号码（平台号源异常），放弃本账号');
       // —— 发码错峰门控 + 限频同号重发 ——
       // 门控：并发账号之间发短信请求至少间隔 SEND_GAP_MS（默认30s），避免被官方限频
       // 限频：若返回“发送过于频繁”，等 RESEND_WAIT_MS（默认60s）后用同一号码重发，最多 RESEND_MAX 次
@@ -1005,15 +1129,25 @@ async function restSubscribe() {
 async function restCreateBot(name) {
   await ensureBearer();
 
-  // 0) 已有可用实例 → 复用
+  // 0) 已有可用实例 → 复用（★ 必须校验「未过期」：平台对过期实例仍标 status=Running，
+  //    直接复用会踩僵尸实例 → 部署时 TAT/debug-exec 挂死 → 看门狗静默杀掉，造成"假成功/程序暂停"。
+  //    故只认 status active/running 且 timeout_at 未过期的实例；过期一律当没有、强制新建。）
   try {
     const ri = await httpsReq('GET', '/v1/instances');
     const items = pickArray(unwrapData(ri.json), ['items', 'instances']) || [];
-    const act = items.find((x) => /active|running/i.test(String(x.status || '')));
+    const act = items.find((x) => {
+      if (!/active|running/i.test(String(x.status || ''))) return false;
+      const exp = x.timeout_at || x.expired_at || x.expire_at || x.expires_at;
+      let expired = false;
+      if (exp) { try { if (new Date(exp).getTime() < Date.now()) expired = true; } catch (_) {} }
+      else if (x.created_at) { try { if (new Date(x.created_at).getTime() + 3600 * 1000 < Date.now()) expired = true; } catch (_) {} }
+      if (expired) { console.log('[建Bot] 发现过期实例(已跳过复用):', x.instance_id || x.id, '过期时间=' + (exp || (x.created_at ? 'created_at+1h' : '未知'))); return false; }
+      return true;
+    });
     if (act) {
       const iid = act.instance_id || act.id;
       CFG.instanceId = iid;
-      console.log('[建Bot] 复用已有实例:', iid, '状态=' + (act.status || ''));
+      console.log('[建Bot] 复用已有实例:', iid, '状态=' + (act.status || '') + (act.timeout_at ? ' 过期时间=' + act.timeout_at : ''));
       console.log('BOT=' + iid + '|status=' + (act.status || 'active') + '|reused=1');
       return true;
     }
@@ -1797,7 +1931,7 @@ async function main() {
     }
   }
 
-  try { console.log('[豪猪] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
+  try { console.log('[' + (SMS_PROVIDER === 'feihu' ? '飞狐' : '豪猪') + '] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
   catch (e) { console.warn('[豪猪] 查余额失败:', e.message); }
 
   if (!ACCOUNTS.length) throw new Error('ACCOUNTS 为空：把每账号的 name+idCard 填进去');
@@ -1847,7 +1981,7 @@ async function main() {
       const subOk = await restSubscribe();
       if (!subOk) throw new Error('抢套餐失败');
       // 3) 建机器人（有就复用，没有就建 + 轮询到 active/running）
-      const botOk = await restCreateBot(INSTANCE_NAME);
+      const botOk = await restCreateBot(INSTANCE_NAME + (uid ? '-' + uid : ''));
       if (!botOk) throw new Error('建机器人失败');
       // 4) 把部署消息发给机器人 + 抓回复（runChat 内部会自动设主模型，否则机器人不回话；
       //    判失败会自动 F 主动验证 + D 免费重试，最多 LIGHTVELA_DEPLOY_RETRY 次）

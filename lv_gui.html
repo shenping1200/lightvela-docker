@@ -299,30 +299,61 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         </div>
       </div>
 
-      <!-- ★ 接码平台 API 配置（账密 / 项目 ID） -->
+      <!-- ★ 接码平台 API 配置（平台切换 / 豪猪 / 飞狐 并存） -->
       <div class="card">
         <h2>接码平台 API <span class="sub" id="domSmsStat">默认账密</span></h2>
         <div class="row">
-          <label>API 地址</label>
-          <input type="text" id="domSmsBase" spellcheck="false" placeholder="https://api.haozhuma.com">
+          <label>平台</label>
+          <select id="domSmsProvider" style="width:150px">
+            <option value="haozhuma" selected>豪猪（默认）</option>
+            <option value="feihu">飞狐</option>
+          </select>
+          <span class="sub" style="color:var(--tx3)">两套并存，选哪套哪套生效</span>
         </div>
-        <div class="pgrid">
-          <label>账号</label>
-          <input type="text" id="domSmsUser" spellcheck="false" placeholder="h5.haozhuma.com API-配置里复制">
-          <label>密码</label>
-          <input type="text" id="domSmsPass" spellcheck="false" placeholder="同上">
+
+        <!-- 豪猪面板 -->
+        <div id="domHzPanel">
+          <div class="row">
+            <label>API 地址</label>
+            <input type="text" id="domSmsBase" spellcheck="false" placeholder="https://api.haozhuma.com">
+          </div>
+          <div class="pgrid">
+            <label>账号</label>
+            <input type="text" id="domSmsUser" spellcheck="false" placeholder="h5.haozhuma.com API-配置里复制">
+            <label>密码</label>
+            <input type="text" id="domSmsPass" spellcheck="false" placeholder="同上">
+          </div>
+          <div class="row">
+            <label>项目 ID</label>
+            <input type="number" id="domSmsSid" value="21986" min="1" step="1">
+            <span class="sub" style="color:var(--tx3)">腾讯云短信=21986</span>
+          </div>
         </div>
-        <div class="row">
-          <label>项目 ID</label>
-          <input type="number" id="domSmsSid" value="21986" min="1" step="1">
-          <span class="sub" style="color:var(--tx3)">腾讯云短信=21986</span>
+
+        <!-- 飞狐面板 -->
+        <div id="domFhPanel" style="display:none">
+          <div class="row">
+            <label>API 地址</label>
+            <input type="text" id="domFhBase" spellcheck="false" placeholder="http://api.feihu2026.com/api/sms">
+          </div>
+          <div class="pgrid">
+            <label>apiKey</label>
+            <input type="text" id="domFhKey" spellcheck="false" placeholder="飞狐平台账号">
+            <label>API密钥</label>
+            <input type="text" id="domFhSecret" spellcheck="false" placeholder="飞狐 API 密钥">
+          </div>
+          <div class="row">
+            <label>项目 ID</label>
+            <input type="text" id="domFhSid" spellcheck="false" placeholder="飞狐项目 pid">
+          </div>
         </div>
+
         <div class="bar" style="margin-top:4px">
           <button class="btn primary sm" id="domBtnSmsSave">保存配置</button>
           <button class="btn sm" id="domBtnSmsTest">测试连接 + 查余额</button>
           <span id="domSmsHint" class="stat"></span>
         </div>
-        <div class="hint">改完点「保存配置」对新账号生效；「测试连接」会调一次豪猪登录 + 查余额确认账密。</div>
+        <div class="hint">「保存配置」会把两套凭证都存下来并切换当前生效平台；「测试连接」测的是当前所选平台。</div>
       </div>
 
       <!-- ★ 代理（与国内版 bot 子进程一起透传） -->
@@ -876,6 +907,7 @@ function boot() {
   $('domBtnTkDel').onclick = domTkDel;
   $('domBtnSmsSave').onclick = domSmsSave;
   $('domBtnSmsTest').onclick = domSmsTest;
+  $('domSmsProvider').onchange = toggleSmsProvider;
   $('domBtnProxySave').onclick = domProxySave;
   $('domBtnProxyTest').onclick = domProxyTest;
   $('domBtnStratSave').onclick = domStrategySave;
@@ -1059,15 +1091,30 @@ async function domTkDel() {
 }
 
 /* ---------- 国内版配置（接码平台 / 代理 / 部署指令）---------- */
+function toggleSmsProvider() {
+  const p = $('domSmsProvider').value;
+  $('domHzPanel').style.display = (p === 'feihu') ? 'none' : '';
+  $('domFhPanel').style.display = (p === 'feihu') ? '' : 'none';
+}
+
 async function loadDomConfig() {
   const r = await API.domestic_config_get();
   if (!r || !r.ok || !r.config) return;
   const s = r.config.sms || {};
+  $('domSmsProvider').value = (s.provider || 'haozhuma');
+  // 豪猪
   $('domSmsBase').value = s.apiBase || 'https://api.haozhuma.com';
   $('domSmsUser').value = s.apiUser || '';
   $('domSmsPass').value = s.apiPass || '';
   $('domSmsSid').value  = s.projectId || 21986;
-  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密');
+  // 飞狐
+  const fh = s.feihu || {};
+  $('domFhBase').value = fh.apiBase || 'http://api.feihu2026.com/api/sms';
+  $('domFhKey').value = fh.apiKey || '';
+  $('domFhSecret').value = fh.apiSecret || '';
+  $('domFhSid').value = fh.projectId || '';
+  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 当前：' + ($('domSmsProvider').value === 'feihu' ? '飞狐' : '豪猪');
+  toggleSmsProvider();
   const p = r.config.proxy || {};
   $('domPType').value = p.type || 'socks5';
   $('domPHost').value = p.host || '';
@@ -1078,27 +1125,39 @@ async function loadDomConfig() {
 }
 
 async function domSmsSave() {
-  const r = await API.domestic_sms_set(
+  const provider = $('domSmsProvider').value;
+  const r1 = await API.domestic_sms_provider_set(provider);
+  const r2 = await API.domestic_sms_set(
     $('domSmsBase').value.trim(),
     $('domSmsUser').value.trim(),
     $('domSmsPass').value.trim(),
     parseInt($('domSmsSid').value, 10) || 21986
   );
-  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败：' + esc(r && r.error) + '</span>'; return; }
-  $('domSmsStat').textContent = '已保存';
+  const r3 = await API.domestic_feihu_set(
+    $('domFhBase').value.trim(),
+    $('domFhKey').value.trim(),
+    $('domFhSecret').value.trim(),
+    $('domFhSid').value.trim()
+  );
+  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok))) {
+    $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败</span>'; return;
+  }
+  $('domSmsStat').textContent = '已保存 · 当前：' + (provider === 'feihu' ? '飞狐' : '豪猪');
   $('domSmsHint').innerHTML = '✓ 已保存（对新任务生效）';
   setTimeout(() => { $('domSmsHint').textContent = ''; }, 2500);
 }
 
 async function domSmsTest() {
   const btn = $('domBtnSmsTest');
+  const provider = $('domSmsProvider').value;
   btn.disabled = true; btn.textContent = '查询中…';
   $('domSmsHint').textContent = '';
   await domSmsSave();  // 先存最新值再测
   const r = await API.domestic_sms_balance();
   btn.disabled = false; btn.textContent = '测试连接 + 查余额';
-  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(r && r.error) + '</span>'; return; }
-  $('domSmsHint').innerHTML = '✓ 登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
+  const label = (provider === 'feihu') ? '飞狐' : '豪猪';
+  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(label) + '：' + esc(r && r.error) + '</span>'; return; }
+  $('domSmsHint').innerHTML = '✓ ' + esc(label) + '登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
 }
 
 async function domProxySave() {
