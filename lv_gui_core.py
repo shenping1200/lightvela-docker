@@ -109,7 +109,7 @@ TOKEN_FILE = "lv-tokens.json"
 
 # ---------------- 账号解析 ----------------
 def parse_accounts(text):
-    """每行：邮箱----密码----用户名----2FA----创建时间（GitHub，后两项可缺）。
+    """每行：GitHub 两种格式均可 —— 用户名----密码----2FA[----创建时间]（无邮箱，推荐），或 邮箱----密码----用户名----2FA[----创建时间]（兼容旧格式）。
     谷歌账号：在任意段标 google/g 即为谷歌账号，格式
         邮箱----密码----辅助邮箱[----创建时间]----google
     缺省 provider=github。
@@ -145,16 +145,27 @@ def parse_accounts(text):
                 r["created"] = tail if tail and tail.lower() not in ("google", "g", "github", "gh") else ""
                 r["ok"] = True
         else:
-            if len(parts) < 4:
-                r["err"] = "字段不足（需 邮箱----密码----用户名----2FA）"
-            elif not parts[0] or not parts[1] or not parts[3]:
-                r["err"] = "邮箱/密码/2FA 不能为空"
+            # GitHub 两种格式都支持：
+            #   第一段含 @ → 原格式：邮箱----密码----用户名----2FA[----创建时间]
+            #   第一段不含 @ → 新格式：用户名----密码----2FA[----创建时间]（无邮箱）
+            if len(parts) < 3:
+                r["err"] = "字段不足（GitHub 需 用户名----密码----2FA，或 邮箱----密码----用户名----2FA）"
+            elif "@" in (parts[0] or ""):
+                if not parts[1] or not parts[2] or not parts[3]:
+                    r["err"] = "邮箱/密码/用户名/2FA 不能为空"
+                else:
+                    r["email"], r["password"] = parts[0], parts[1]
+                    r["login"], r["tfa"] = parts[2], parts[3]
+                    r["created"] = parts[4] if len(parts) > 4 else ""
+                    r["ok"] = True
             else:
-                r["email"], r["password"] = parts[0], parts[1]
-                r["login"] = parts[2] or parts[0]
-                r["tfa"] = parts[3]
-                r["created"] = parts[4] if len(parts) > 4 else ""
-                r["ok"] = True
+                if not parts[1] or not parts[2]:
+                    r["err"] = "用户名/密码/2FA 不能为空"
+                else:
+                    r["login"], r["password"], r["tfa"] = parts[0], parts[1], parts[2]
+                    r["email"] = ""
+                    r["created"] = parts[3] if len(parts) > 3 else ""
+                    r["ok"] = True
         rows.append(r)
     return rows
 
