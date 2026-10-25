@@ -926,6 +926,8 @@ class Job(object):
         SHADOW_CODE = "PASS_BILLING_ACCOUNT_OPEN_FAILED"
         SHADOW_BACKOFF = 4.0     # 这类 409 的退避秒数（不再 1 秒猛发，省请求也躲风控）
         SHADOW_BUDGET = 600.0    # 这类 409 的专用总预算秒数
+        SHADOW_BINDING_MAX = 5        # 影子账户绑定 403 最多退避重试次数（绑定按会话首次自动开通，几秒即成）
+        SHADOW_BINDING_BACKOFF = 15.0  # 每次重试前退避秒数（给平台自动开通留时间）
         if has_pass:
             return True
         # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
@@ -944,6 +946,7 @@ class Job(object):
         shadow_deadline = time.time() + max(self.duration, SHADOW_BUDGET)
         only_shadow = True
         n = 0
+        self._shadow_bind_retry = 0   # 影子账户绑定 403 重试计数（每次抢单重置）
         while True:
             if self._stopped():
                 break
@@ -977,24 +980,37 @@ class Job(object):
                     self.row(idx, stage="抢单中", detail="影子账户开通中｜已发 %d 次" % n)
                     time.sleep(back)
                     continue
-                # ★ 非临时错误：pass 已存在 / 需绑影子账户，重试无解 → 立即判失败（不再白烧预算）
-                if code == "PASS_ALREADY_EXISTS" or "SHADOW_BINDING" in str(code or ""):
-                    if code == "PASS_ALREADY_EXISTS":
-                        # 歧义态：可能上一轮已抢到 → 复查一次 live_passes
-                        live = live_passes(s)
-                        if live:
-                            pid = live[0].get("pass_id", "")
-                            bid = live[0].get("bundle_id", "")
-                            self.log(tag + " 🎉 复查发现已抢到（409 已存在）| %s | pass=%s" % (bid, pid))
-                            self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="already")
-                            return True
-                        self.log(tag + " ❌ pass 已存在但查不到（状态冲突），停止重试")
-                        self.row(idx, stage="失败", detail="pass已存在但查不到", ok=False, result="pass_exists_conflict")
-                        return False
-                    # 403 PASS_SHADOW_BINDING_REQUIRED：需平台后台手动绑影子账户
-                    self.log(tag + " ❌ 需先绑定影子计费账户（%s）——去 LightVela 后台绑定后单独重跑" % (code or msg))
-                    self.row(idx, stage="失败", detail="需绑影子账户", ok=False, result="shadow_binding_required")
+                # ★ 非临时错误：pass 已存在 → 复查一次即判（不再白烧预算）。
+                #   影子账户绑定(403) 不在此列：经验证绑定按【登录会话首次自动开通】（仅数秒），
+                #   复用同一令牌再发一单即过，故改为退避重试，不立即判死。
+                if code == "PASS_ALREADY_EXISTS":
+                    # 歧义态：可能上一轮已抢到 → 复查一次 live_passes
+                    live = live_passes(s)
+                    if live:
+                        pid = live[0].get("pass_id", "")
+                        bid = live[0].get("bundle_id", "")
+                        self.log(tag + " 🎉 复查发现已抢到（409 已存在）| %s | pass=%s" % (bid, pid))
+                        self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="already")
+                        return True
+                    self.log(tag + " ❌ pass 已存在但查不到（状态冲突），停止重试")
+                    self.row(idx, stage="失败", detail="pass已存在但查不到", ok=False, result="pass_exists_conflict")
                     return False
+                if "SHADOW_BINDING" in str(code or ""):
+                    # 403 PASS_SHADOW_BINDING_REQUIRED：
+                    # 经验证，绑定是按【登录会话首次自动开通】（开通仅需数秒），
+                    # 复用同一令牌再跑一次即过 —— 故不立即判死，退避重试等平台自动开通。
+                    if getattr(self, "_shadow_bind_retry", 0) >= SHADOW_BINDING_MAX:
+                        self.log(tag + " ❌ 影子账户已重试 %d 次仍提示需绑定（%s）——可能真未开通"
+                                 % (self._shadow_bind_retry, code or msg))
+                        self.row(idx, stage="失败", detail="影子账户重试超限", ok=False, result="shadow_binding_required")
+                        return False
+                    self._shadow_bind_retry = getattr(self, "_shadow_bind_retry", 0) + 1
+                    back = SHADOW_BINDING_BACKOFF + random.uniform(0, 5.0)
+                    self.log(tag + " ⚠️ 首次下单触发影子账户绑定（%s），平台自动开通中，第 %d/%d 次，%.1fs 后重试"
+                             % (code or msg, self._shadow_bind_retry, SHADOW_BINDING_MAX, back))
+                    self.row(idx, stage="抢单中", detail="影子账户自动开通中(%d/%d)" % (self._shadow_bind_retry, SHADOW_BINDING_MAX))
+                    time.sleep(back)
+                    continue
                 only_shadow = False   # 其它错误 → 退回原预算
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
