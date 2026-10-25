@@ -40,22 +40,35 @@
 //   任何一步失败都回退原生 console.log，绝不伤业务。
 const _fs = require('fs');
 const _util = require('util');
+// ★ 日志双写 + EPIPE 防护（修复「webapp 重启后 bot 在取码前崩、run_domestic_*.log 0 字节、面板没反应」）
+//   根因：国内版 bot 由 webapp(Python) 用管道拉起；Windows 上父进程(webapp)被重启会导致 stdout 管道(fd=1)断裂，
+//   旧代码用 fs.writeSync(1,…) 同步写管道，管道一断就同步抛 EPIPE 直接崩进程——飞狐取号/发码已完成、取码前崩。
+//   修复：① setBlocking 解除 Windows 块缓冲（日志实时）；② 若设了 LIGHTVELA_LOG_FILE，额外同步写日志文件
+//        （不依赖管道，父进程死了也不丢、bot 还能继续跑完）；③ 所有写 fd=1 的操作吞掉 EPIPE/其它错误，管道断了不崩。
 const _outFd = (process.stdout && typeof process.stdout.fd === 'number') ? process.stdout.fd : 1;
-if (process.stdout._handle && typeof process.stdout._handle.setBlocking === 'function') {
-  process.stdout._handle.setBlocking(true);
-}
-{
-  const _origLog = console.log.bind(console);
-  console.log = function (...a) {
-    try { _fs.writeSync(_outFd, _util.format(...a) + '\n'); }
-    catch (e) { try { _origLog(...a); } catch (_) {} }
-  };
-  const _origWarn = console.warn ? console.warn.bind(console) : _origLog;
-  console.warn = function (...a) {
-    try { _fs.writeSync(_outFd, _util.format(...a) + '\n'); }
-    catch (e) { try { _origWarn(...a); } catch (_) {} }
-  };
-}
+try { if (process.stdout._handle && typeof process.stdout._handle.setBlocking === 'function') process.stdout._handle.setBlocking(true); } catch (e) {}
+(() => {
+  let _fileFd = null;
+  const _logPath = process.env.LIGHTVELA_LOG_FILE;
+  if (_logPath) { try { _fileFd = _fs.openSync(_logPath, 'a'); } catch (e) { _fileFd = null; } }
+  // 写管道：吞掉 EPIPE（管道断裂时静默丢弃，绝不崩进程）
+  const _writeOut = (s) => { try { _fs.writeSync(_outFd, s); } catch (e) { /* 管道断裂(EPIPE)等：吞掉 */ } };
+  // 写文件：父进程死了也不丢，bot 还能继续跑完
+  const _writeFile = (s) => { if (_fileFd != null) { try { _fs.writeSync(_fileFd, s); } catch (e) {} } };
+  const _emit = (...a) => { const s = _util.format(...a) + '\n'; _writeOut(s); _writeFile(s); };
+  // ★ 无换行的直写出口（流式回复增量等）：同样"管道+文件"双写——
+  //   之前这些地方直接 process.stdout.write()，只进管道不进文件，部署回复在 run_domestic_*.log 里看不到，排障抓瞎；
+  //   而且绕过 EPIPE 防护。统一走这里。
+  global.__safeOut = (s) => { const t = String(s); _writeOut(t); _writeFile(t); };
+  console.log = _emit;
+  console.warn = _emit;
+  console.error = _emit;
+  // 兜底：即便别处直接 process.stdout/stderr.write，也别因 EPIPE 崩
+  try { process.stdout.on('error', () => {}); process.stderr.on('error', () => {}); } catch (e) {}
+  // ★ 未捕获异常/拒绝也写文件（父进程(webapp)已死时 stderr 无处去，0 字节日志会让人以为“没反应”）写完即退出，由看门狗兜底
+  process.on('uncaughtException', (e) => { _writeFile('[致命] 未捕获异常: ' + (e && e.stack ? e.stack : e) + '\n'); process.exit(1); });
+  process.on('unhandledRejection', (e) => { _writeFile('[致命] 未处理 Promise 拒绝: ' + (e && e.stack ? e.stack : e) + '\n'); process.exit(1); });
+})();
 const tls = require('tls');
 const net = require('net');
 const https = require('https');
@@ -528,9 +541,86 @@ const SMS_FEIHU = {
   },
 };
 
-// ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu，选哪套哪套生效；两套实现并存、互不干扰
+// ===================== 国内版：鲁班接码（与豪猪/飞狐并存，按 LIGHTVELA_SMS_PROVIDER 切换）=====================
+// 鲁班 API 文档：https://lubansms.com/api_docs/
+//   基础地址：https://lubansms.com/v2/api（所有请求 GET + apikey 参数，免登录）
+//   取号：/getNumber?apikey=&service_id=<服务编号> -> number + request_id（service_id 指定国家+应用，+86 中国编号在面板填）
+//   轮询：/getSms?apikey=&request_id= -> {code:0,msg:"wait"} 等待 / {code:0,msg:"success",sms_code:"..."} 收到 / {code:400} 超时或 apikey 错
+//   释放：/setStatus?apikey=&request_id=&status=reject（鲁班无独立拉黑，释放即弃号）
+//   余额：/getBalance?apikey= -> {code:0,balance:"96.72"}
+const SMS_LUBAN = {
+  apiBase: process.env.LIGHTVELA_LUBAN_API_BASE || 'https://lubansms.com/v2/api',
+  apiKey:  process.env.LIGHTVELA_LUBAN_API_KEY     || '',
+  serviceId: process.env.LIGHTVELA_LUBAN_SERVICE_ID  || '',
+  _reqIdByPhone: {},   // phone -> request_id：鲁班按 request_id 取码/释放，不是按手机号
+  async login() {
+    if (!this.apiKey) throw new Error('鲁班未配置（缺少 apiKey）');
+    return null;   // 鲁班免登录，每个请求直接带 apikey，无需 token
+  },
+  async _get(path) {
+    if (!this.apiKey) throw new Error('鲁班未配置（缺少 apiKey）');
+    const sep = path.includes('?') ? '&' : '?';
+    const url = this.apiBase.replace(/\/+$/, '') + path + sep + 'apikey=' + encodeURIComponent(this.apiKey);
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 LightVela' } });
+    const t = await r.text();
+    try { return JSON.parse(t); } catch (e) { return {}; }
+  },
+  async rentNumber() {
+    await this.login();
+    if (!this.serviceId) throw new Error('鲁班未配置服务 ID（service_id，+86 中国编号在面板填）');
+    const j = await this._get('/getNumber?service_id=' + encodeURIComponent(this.serviceId));
+    if (Number(j.code) !== 0) throw new Error('鲁班取号失败: ' + JSON.stringify(j));
+    const rawPhone = j.number;
+    const rid = j.request_id;
+    if (!rawPhone) throw new Error('鲁班取号返回无手机号: ' + JSON.stringify(j));
+    // ★ 鲁班把 +86 国家前缀一并返回（如 +8617155647680），剥掉前缀只留 11 位裸大陆号，
+    //   与豪猪/飞狐（返回裸号）保持一致——既不会被「非大陆号码」过滤器误杀，发码/验证也用裸号。
+    const phone = normalizeMainlandPhone(rawPhone);
+    this._reqIdByPhone[phone] = rid;   // 记下 request_id（按裸号存），取码/释放要用
+    return phone;
+  },
+  async getCode(phone, { timeoutMs = 180000, intervalMs = 15000 } = {}) {
+    await this.login();
+    const rid = this._reqIdByPhone[phone];
+    if (!rid) throw new Error('鲁班取码缺少 request_id（该号非本次取号所得）: ' + phone);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const j = await this._get('/getSms?request_id=' + encodeURIComponent(rid));
+      if (Number(j.code) !== 0) throw new Error('鲁班取码接口错误: ' + JSON.stringify(j));
+      const msg = j.msg;
+      if (msg === 'success') {
+        const code = (j.sms_code != null ? String(j.sms_code) : '') || '';
+        if (/^\d{4,8}$/.test(code)) return code;
+      } else if (msg === 'wait') {
+        // 等待中，继续轮询
+      } else {
+        throw new Error('鲁班短信获取失败: ' + JSON.stringify(j));
+      }
+      await sleep(intervalMs);
+    }
+    throw new Error('鲁班取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
+  },
+  async release(phone) {
+    const rid = this._reqIdByPhone[phone];
+    if (!rid) return;
+    await this._get('/setStatus?request_id=' + encodeURIComponent(rid) + '&status=reject');
+  },
+  async blacklist(phone) {
+    // 鲁班无独立拉黑接口，释放即弃号（setStatus?status=reject）
+    await this.release(phone);
+  },
+  async balance() {
+    const j = await this._get('/getBalance');
+    if (Number(j.code) !== 0) throw new Error('鲁班查余额失败: ' + JSON.stringify(j));
+    return (j.balance != null ? j.balance : '未知');
+  },
+};
+
+// ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu | lubansms，选哪套哪套生效；三套实现并存、互不干扰
 const SMS_PROVIDER = (process.env.LIGHTVELA_SMS_PROVIDER || 'haozhuma').toLowerCase();
-const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU : SMS_HAOZHUMA;
+const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU
+          : SMS_PROVIDER === 'lubansms' ? SMS_LUBAN
+          : SMS_HAOZHUMA;
 
 // 账号清单从独立文件加载（单一数据源，批量调度器也 require 它）
 // 支持环境变量 LIGHTVELA_ACCOUNTS_FILE 覆盖（UI 传入临时账号列表时用，避免改默认 accounts.js 干扰后台批量）
@@ -765,11 +855,20 @@ async function recoverRealname(selfIdx) {
   throw new Error('实名补救失败：已尝试 ' + MAX_RECOVERY + ' 个排队身份仍无法完成实名，终止本次注册');
 }
 
-// ★ 2026-10-23：接码平台（实测飞狐）偶尔混入香港/澳门号码（852/853 本地号，非 11 位，
-//   如 8 位的 44244437）。大陆号判定规则（老大定）：1 开头、共 11 位即放行，不挑号段
-//   （165/170/162 等虚拟运营商号段照常用，香港 852/澳门 853 的短号自然被挡）。
+// ★ 接码平台（实测飞狐）偶尔混入香港/澳门号码（852/853 本地号，非 11 位，如 8 位的 44244437）。
+//   大陆号判定规则（老大定）：1 开头、共 11 位即放行，不挑号段（165/170/162 等虚拟运营商号段照常用，
+//   香港 852/澳门 853 的短号自然被挡）。同时兼容带 +86 国家前缀的写法（鲁班等平台会把前缀一并返回）。
 function isMainlandPhone(phone) {
-  return /^1\d{10}$/.test(String(phone == null ? '' : phone).trim());
+  return /^(\+?86)?1\d{10}$/.test(String(phone == null ? '' : phone).trim());
+}
+
+// ★ 把带国家前缀的号码规整成 11 位裸大陆号：剥掉前导 + 与 +86 前缀（鲁班返回的 +86171… 之类）。
+//   香港 +852 / 澳门 +853 等其它国家码不会被误剥（只认「86 前缀 + 后面恰为 11 位大陆号」）。
+function normalizeMainlandPhone(phone) {
+  let p = String(phone == null ? '' : phone).trim();
+  if (p.startsWith('+')) p = p.slice(1);
+  if (p.startsWith('86') && /^86\d{11}$/.test(p)) p = p.slice(2);
+  return p;
 }
 
 async function domesticLogin(acc, idx) {
@@ -903,6 +1002,10 @@ async function domesticLogin(acc, idx) {
 
 // ===================== REST 引导 =====================
 function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body = null, headers = {}, timeoutMs = 20000, retries = 2, retryBaseMs = 800 } = {}) {
+  // ★ 2026-10-23 修复：req.setTimeout 是【socket 空闲超时】，对"挂起但 socket 仍有零星活动"
+  //   （代理 keepalive / 对端 dribble）的请求会被无限重置 → 永远不触发 → 进程无限卡死
+  //   （实测：出口代理抽风时 /bots 挂起 6 分钟无任何超时日志）。
+  //   改成【绝对超时】：到点无条件 req.destroy()，与 socket 有没有活动无关。
   const attempt = () => new Promise((resolve, reject) => {
     const u = new URL(CFG.apiBase + path);
     const data = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
@@ -923,8 +1026,14 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
       });
     });
     let settled = false;
-    req.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
-    req.setTimeout(timeoutMs, () => { if (!settled) { settled = true; req.destroy(new Error('REST 超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); } });
+    const done = (fn, arg) => { if (settled) return; settled = true; try { fn(arg); } catch (e) {} };
+    req.on('error', (err) => done(reject, err));
+    req.setTimeout(timeoutMs, () => { req.destroy(new Error('REST 空闲超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path)); });
+    const hardTimer = setTimeout(() => {
+      req.destroy(new Error('REST 绝对超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path));
+      done(reject, new Error('REST 绝对超时(' + Math.round(timeoutMs / 1000) + 's): ' + method + ' ' + path));
+    }, timeoutMs + 2000);
+    req.on('close', () => clearTimeout(hardTimer));
     if (data) req.write(data);
     req.end();
   });
@@ -1129,29 +1238,55 @@ async function restSubscribe() {
 async function restCreateBot(name) {
   await ensureBearer();
 
-  // 0) 已有可用实例 → 复用（★ 必须校验「未过期」：平台对过期实例仍标 status=Running，
-  //    直接复用会踩僵尸实例 → 部署时 TAT/debug-exec 挂死 → 看门狗静默杀掉，造成"假成功/程序暂停"。
-  //    故只认 status active/running 且 timeout_at 未过期的实例；过期一律当没有、强制新建。）
+  // 0) 已有可用实例 → 复用（★ 2026-10-23 修复：复用前必须看剩余寿命）
+  //    根因：实例只有 1 小时寿命（timeout_at）。曾复用一个只剩 ~10 分钟就到期的实例发部署命令，
+  //    后端一条回复不吐（后端随实例半死不活），干等 10 分钟被父进程看门狗杀掉 → 面板一直「等待中」。
+  //    规则：挑剩余时间最长的 Running 实例；剩余 < LIGHTVELA_REUSE_MIN_LEFT_SEC（默认 1200s=20 分钟）
+  //    就不复用、新建实例（新建失败才兜底复用旧实例，好歹比没有强）。
+  const reuseMinLeftMs = parseInt(process.env.LIGHTVELA_REUSE_MIN_LEFT_SEC || '1200', 10) * 1000;
+  const _isoZ = (t) => (!t ? '' : (/Z$|[+-]\d\d:?\d\d$/.test(String(t)) ? String(t) : String(t) + 'Z'));
+  const instLeftMs = (x) => {
+    try {
+      const t = _isoZ(x.timeout_at || x.expires_at);
+      if (t) { const ms = Date.parse(t); if (!isNaN(ms)) return ms - Date.now(); }
+      const c = _isoZ(x.created_at);
+      if (c) { const ms = Date.parse(c); if (!isNaN(ms)) return ms + 3600 * 1000 - Date.now(); } // 创建时 timeout:3600s
+    } catch (e) {}
+    return null;   // 拿不到寿命信息 → 未知，按旧行为直接复用
+  };
+  let oldInst = null, oldLeft = null;
   try {
     const ri = await httpsReq('GET', '/v1/instances');
     const items = pickArray(unwrapData(ri.json), ['items', 'instances']) || [];
-    const act = items.find((x) => {
-      if (!/active|running/i.test(String(x.status || ''))) return false;
-      const exp = x.timeout_at || x.expired_at || x.expire_at || x.expires_at;
-      let expired = false;
-      if (exp) { try { if (new Date(exp).getTime() < Date.now()) expired = true; } catch (_) {} }
-      else if (x.created_at) { try { if (new Date(x.created_at).getTime() + 3600 * 1000 < Date.now()) expired = true; } catch (_) {} }
-      if (expired) { console.log('[建Bot] 发现过期实例(已跳过复用):', x.instance_id || x.id, '过期时间=' + (exp || (x.created_at ? 'created_at+1h' : '未知'))); return false; }
-      return true;
-    });
-    if (act) {
-      const iid = act.instance_id || act.id;
-      CFG.instanceId = iid;
-      console.log('[建Bot] 复用已有实例:', iid, '状态=' + (act.status || '') + (act.timeout_at ? ' 过期时间=' + act.timeout_at : ''));
-      console.log('BOT=' + iid + '|status=' + (act.status || 'active') + '|reused=1');
-      return true;
+    for (const x of items) {
+      if (!/active|running/i.test(String(x.status || ''))) continue;
+      const left = instLeftMs(x);
+      const score = (left === null) ? Infinity : left;
+      const bestScore = (oldLeft === null) ? Infinity : oldLeft;
+      if (!oldInst || score > bestScore) { oldInst = x; oldLeft = left; }
     }
   } catch (e) { console.log('[建Bot] 查询现有实例失败(忽略):', e.message); }
+  // 新建失败时的兜底：拿寿命不足的旧实例顶上
+  const fallbackReuse = () => {
+    if (!oldInst) return false;
+    const iid = oldInst.instance_id || oldInst.id;
+    CFG.instanceId = iid;
+    console.log('[建Bot] 新建失败，兜底复用旧实例:', iid, '状态=' + (oldInst.status || ''));
+    console.log('BOT=' + iid + '|status=' + (oldInst.status || 'active') + '|reused=1');
+    return true;
+  };
+  if (oldInst) {
+    const leftTxt = (oldLeft === null) ? '寿命未知' : ('剩余约 ' + Math.max(0, Math.round(oldLeft / 60000)) + ' 分钟');
+    if (oldLeft !== null && oldLeft < reuseMinLeftMs) {
+      console.log('[建Bot] 现有实例 ' + (oldInst.instance_id || oldInst.id) + ' ' + leftTxt + '（< ' + Math.round(reuseMinLeftMs / 60000) + ' 分钟），不复用、新建实例');
+    } else {
+      const iid = oldInst.instance_id || oldInst.id;
+      CFG.instanceId = iid;
+      console.log('[建Bot] 复用已有实例:', iid, '状态=' + (oldInst.status || '') + '（' + leftTxt + '）');
+      console.log('BOT=' + iid + '|status=' + (oldInst.status || 'active') + '|reused=1');
+      return true;
+    }
+  }
 
   // 1) 直接创建实例（注：后端【没有】 /v1/instances/create-prerequisites 这个接口，
   //    实测返回 NOT_FOUND，纯属多打一次请求 + 日志噪音，已于 2026-10-10 去掉）
@@ -1160,7 +1295,11 @@ async function restCreateBot(name) {
   const nm = String(name || '').trim() || ('agent-' + crypto.randomBytes(3).toString('hex'));
   let rc;
   try { rc = await httpsReq('POST', '/v1/instances', { body: { timeout: 3600, name: nm } }); }
-  catch (e) { console.log('BOT=FAIL|请求异常:' + String(e.message).slice(0, 100)); return false; }
+  catch (e) {
+    console.log('BOT=FAIL|请求异常:' + String(e.message).slice(0, 100));
+    if (fallbackReuse()) return true;
+    return false;
+  }
   const d = unwrapData(rc.json) || {};
   console.log('[建Bot] POST /v1/instances →', rc.status, JSON.stringify(rc.json || {}).slice(0, 240));
   let iid = d.instance_id || d.id || '';
@@ -1168,6 +1307,7 @@ async function restCreateBot(name) {
   if (!iid) {
     const msg = String((rc.json && (rc.json.message || rc.json.msg || rc.json.code)) || rc.text || '').replace(/\s+/g, ' ').slice(0, 140);
     console.log('BOT=FAIL|' + (msg || ('HTTP ' + rc.status)));
+    if (fallbackReuse()) return true;
     return false;
   }
 
@@ -1931,7 +2071,7 @@ async function main() {
     }
   }
 
-  try { console.log('[' + (SMS_PROVIDER === 'feihu' ? '飞狐' : '豪猪') + '] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
+  try { console.log('[' + (SMS_PROVIDER === 'feihu' ? '飞狐' : SMS_PROVIDER === 'lubansms' ? '鲁班' : '豪猪') + '] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
   catch (e) { console.warn('[豪猪] 查余额失败:', e.message); }
 
   if (!ACCOUNTS.length) throw new Error('ACCOUNTS 为空：把每账号的 name+idCard 填进去');
@@ -1981,7 +2121,7 @@ async function main() {
       const subOk = await restSubscribe();
       if (!subOk) throw new Error('抢套餐失败');
       // 3) 建机器人（有就复用，没有就建 + 轮询到 active/running）
-      const botOk = await restCreateBot(INSTANCE_NAME + (uid ? '-' + uid : ''));
+      const botOk = await restCreateBot(INSTANCE_NAME);
       if (!botOk) throw new Error('建机器人失败');
       // 4) 把部署消息发给机器人 + 抓回复（runChat 内部会自动设主模型，否则机器人不回话；
       //    判失败会自动 F 主动验证 + D 免费重试，最多 LIGHTVELA_DEPLOY_RETRY 次）

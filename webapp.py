@@ -266,6 +266,8 @@ HANDLERS = {
     "domestic_sms_provider_set": lambda a: dcore.set_sms_provider(a[0] if a else "haozhuma"),
     "domestic_feihu_set":        lambda a: dcore.set_feihu_config(a[0] if a else "", a[1] if len(a) > 1 else "",
                                                                 a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""),
+    "domestic_luban_set":        lambda a: dcore.set_luban_config(a[0] if a else "", a[1] if len(a) > 1 else "",
+                                                                a[2] if len(a) > 2 else ""),
     "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                                   a[4] if len(a) > 4 else ""),

@@ -971,6 +971,7 @@ function boot() {
   loadDomDeployMsg();
   switchTab('intl');
   if (!pollTimer) pollTimer = setInterval(pollDispatch, 700);
+  domResume();   // 页面加载时：后端若已有国内版任务在跑，自动续接显示
   initSplitter();
 }
 /* 登录按钮必须在"未登录"时也绑上（不能放进 boot，否则登录页点不动） */
@@ -991,7 +992,7 @@ function switchTab(tab) {
 /* 统一轮询分发：按当前 Tab 决定刷国际版还是国内版，避免两套日志互相覆盖 */
 function pollDispatch() {
   if (currentTab === 'intl') { poll(); }
-  else if (currentTab === 'domestic') { domPoll(); }
+  else if (currentTab === 'domestic') { if (!domRunning) domResume(); domPoll(); }
 }
 
 function appendDomLog(lines) {
@@ -1035,6 +1036,21 @@ async function domStart() {
   domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
   switchTab('domestic');
   appendDomLog(['[已启动] 模式=' + modeLabel + ' · 并发=' + conc + ' · 复用=' + (useSaved ? '是' : '否') + ' · 共 ' + r.total + ' 个']);
+  domPoll();   // 启动成功立刻拉一次结果，不等轮询器第一跳
+}
+
+/* 页面刷新/切到国内版时：后端若已有任务在跑，自动续接显示（只恢复显示，不动任务） */
+async function domResume() {
+  if (domRunning) return;
+  const s = await API.domestic_status();
+  // 只要有任务（运行中 或 已完成但有记录）就续接显示，避免刷新后空白
+  if (s && s.ok && (s.running || (s.total && s.total > 0))) {
+    domRunning = true;
+    $('domBtnStart').disabled = !s.running; $('domBtnStop').disabled = s.running;
+    $('domBtnExportFailed').disabled = s.running; $('domBtnImportFailed').disabled = s.running;
+    appendDomLog([(s.running ? '[续接显示] 检测到后端任务运行中' : '[续接显示] 检测到已完成任务') + '：共 ' + (s.total || 0) + ' · 完成 ' + (s.done || 0)]);
+    domPoll();
+  }
 }
 
 async function domStop() { await API.domestic_stop(); }

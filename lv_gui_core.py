@@ -60,6 +60,10 @@ MODE_LABEL = {"check": "体检（只登录+查订阅，不下单）",
 
 # ---- 全流程：复用已跑通的 Node 引擎（不重写底层 WS/BSON 隧道，稳） ----
 PURECODE_JS = "lightvela-purecode.js"
+
+# ★ 建 Bot 的名字：统一用「网站系统默认名」（老大 2026-10-26 定），不再自拼"前缀-序号"、也不再随机。
+#   所有机器完全一致，省去逐台配置；需要临时改名时用环境变量 LIGHTVELA_BOT_NAME 覆盖。
+DEFAULT_BOT_NAME = os.environ.get("LIGHTVELA_BOT_NAME") or "我的 AI 伙伴"
 DEPLOY_MSG_FILE = "_deploy_msg.txt"
 NODE_CANDIDATES = [
     r"C:\Users\Administrator\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe",
@@ -1077,7 +1081,7 @@ class Job(object):
         # ① 建 Bot（Node 侧有现成实例会自动复用）
         self.row(idx, stage="建Bot中", detail="")
         self.log(tag + " 开始创建机器人 ...")
-        name = "%s-%s" % (self.bot_prefix, idx)
+        name = DEFAULT_BOT_NAME   # ★ 统一用网站系统默认名（不再用 前缀-序号，也不随机）
         bot = ""
         for attempt in range(1, self.bot_retry + 1):
             if self._stopped():

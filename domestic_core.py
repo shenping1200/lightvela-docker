@@ -34,6 +34,7 @@ _state = {
     "log": [],             # 实时日志（带账号前缀）
     "thread": None,
     "procs": [],
+    "finishing": 0,       # ★ 收尾中的账号数：bot 退出后 wait/join/写结果还要几秒，这期间不算"假运行"
 }
 
 CRED_RE = re.compile(r"DOMESTIC_CRED_JSON=(\{.*\})")
@@ -53,6 +54,13 @@ DEFAULT_DOMESTIC_CONFIG = {
             "apiKey": "",
             "apiSecret": "",
             "projectId": "",
+        },
+        # 鲁班接码（与豪猪/飞狐并存；provider=lubansms 时生效）
+        #   鲁班免登录，所有请求直接带 apikey；取号必带 service_id（指定国家+应用，如 +86 中国服务编号）
+        "luban": {
+            "apiBase": "https://lubansms.com/v2/api",
+            "apiKey": "",
+            "serviceId": "",
         },
     },
     "proxy": {
@@ -132,12 +140,15 @@ def set_sms_config(apiBase, apiUser, apiPass, projectId):
 
 
 def set_sms_provider(provider):
-    """切换接码平台：haozhuma | feihu（选哪套哪套生效）。"""
+    """切换接码平台：haozhuma | feihu | lubansms（选哪套哪套生效）。"""
     cfg = _read_config()
     sms = cfg.get("sms") or {}
-    sms["provider"] = "feihu" if str(provider).strip().lower() == "feihu" else "haozhuma"
+    p = str(provider).strip().lower()
+    sms["provider"] = p if p in ("feihu", "lubansms") else "haozhuma"
     if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
         sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
+    if "luban" not in sms or not isinstance(sms.get("luban"), dict):
+        sms["luban"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["luban"]))
     cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True, "provider": sms["provider"]}
@@ -154,6 +165,26 @@ def set_feihu_config(apiBase, apiKey, apiSecret, projectId):
     fh["apiSecret"] = (apiSecret or "").strip()
     fh["projectId"] = (projectId or "").strip()
     sms["feihu"] = fh
+    cfg["sms"] = sms
+    _write_config(cfg)
+    return {"ok": True}
+
+
+def set_luban_config(apiBase, apiKey, serviceId):
+    """保存鲁班接码配置（apiKey=平台密钥，serviceId=+86 中国服务编号）。"""
+    cfg = _read_config()
+    sms = cfg.get("sms") or {}
+    lb = sms.get("luban") or {}
+    if apiBase and apiBase.strip():
+        lb["apiBase"] = apiBase.strip()
+    lb["apiKey"] = (apiKey or "").strip()
+    lb["serviceId"] = (serviceId or "").strip()
+    sms["luban"] = lb
+    # 保留 provider / feihu / haozhuma 字段，避免覆盖另外两套平台配置
+    if "provider" not in sms:
+        sms["provider"] = "haozhuma"
+    if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
+        sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
     cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True}
@@ -194,11 +225,13 @@ def set_deploy_config(verify, retry, smsTimeoutSec, smsMaxRent):
 
 
 def test_sms():
-    """用配置里的账密登录当前所选平台（豪猪/飞狐）、查余额，返回 {ok, balance, error}。"""
+    """用配置里的账密登录当前所选平台（豪猪/飞狐/鲁班）、查余额，返回 {ok, balance, error}。"""
     cfg = _read_config()["sms"]
     provider = (cfg.get("provider") or "haozhuma").lower()
     if provider == "feihu":
         return test_feihu()
+    if provider == "lubansms":
+        return test_luban()
     # —— 豪猪 ——
     if not cfg.get("apiUser") or not cfg.get("apiPass"):
         return {"ok": False, "error": "未填写接码平台账号/密码"}
@@ -247,6 +280,26 @@ def test_feihu():
         with urllib.request.urlopen(req2, timeout=10) as r:
             j2 = json.loads(r.read().decode("utf-8", errors="replace"))
         return {"ok": True, "balance": (j2.get("data") or {}).get("money"), "summary": j2}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def test_luban():
+    """用配置里的鲁班 apiKey 查余额，返回 {ok, balance, error}（鲁班免登录，所有请求直接带 apikey）。"""
+    cfg = (_read_config().get("sms") or {}).get("luban") or {}
+    api_base = (cfg.get("apiBase") or DEFAULT_DOMESTIC_CONFIG["sms"]["luban"]["apiBase"]).rstrip("/")
+    api_key = cfg.get("apiKey")
+    if not api_key:
+        return {"ok": False, "error": "鲁班未填写 apiKey"}
+    try:
+        import urllib.request, urllib.parse
+        url = api_base + "/getBalance?apikey=" + urllib.parse.quote(api_key)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read().decode("utf-8", errors="replace"))
+        if str(j.get("code")) != "0":
+            return {"ok": False, "error": "鲁班查询失败: " + json.dumps(j, ensure_ascii=False)}
+        return {"ok": True, "balance": j.get("balance"), "summary": j}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -388,6 +441,14 @@ def _env_from_config(cfg):
         env["LIGHTVELA_FEIHU_API_SECRET"] = fh["apiSecret"]
     if fh.get("projectId"):
         env["LIGHTVELA_FEIHU_PROJECT_ID"] = str(fh["projectId"])
+    # 鲁班凭证（无论当前是否选中都透传，切换即可生效）
+    lb = sms.get("luban") or {}
+    if lb.get("apiBase"):
+        env["LIGHTVELA_LUBAN_API_BASE"] = lb["apiBase"]
+    if lb.get("apiKey"):
+        env["LIGHTVELA_LUBAN_API_KEY"] = lb["apiKey"]
+    if lb.get("serviceId"):
+        env["LIGHTVELA_LUBAN_SERVICE_ID"] = str(lb["serviceId"])
     px = (cfg or {}).get("proxy")
     if px:
         env["LIGHTVELA_EGRESS_PROXY"] = _normalize_proxy_cfg(px)
@@ -564,6 +625,27 @@ def _append_log(line, prefix=""):
             _state["log"] = _state["log"][-3500:]
 
 
+def _hard_kill(proc):
+    """杀 bot 子进程，并确认真死了。
+    ★ 2026-10-23 实测：TerminateProcess(proc.kill) 在个别场景不生效（bot 线程卡在内核调用里时
+      进程会挂起 5 个多小时才自己消失），所以 kill 后等 5 秒，还活着就 taskkill /F /T 补刀。
+    """
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
 def _run_one(idx, acc, mode, accounts_file, use_saved=False):
     """单账号子进程：spawn node bot.js --account-idx idx [--login-only]，实时读日志。"""
     # ★ 全局停止闸门①：线程被调度到时若已停止，连子进程都不起，占位（姓名+身份证）原样保留
@@ -586,12 +668,20 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False):
     # ★ 把并发数传给 bot.js：仅当并发>1 时才启用发码错峰门控（单账号无需错峰）
     env["LIGHTVELA_DOMESTIC_CONCURRENCY"] = str(CONCURRENCY)
     log_file = os.path.join(BASE, "run_domestic_%02d_%s.log" % (idx, acc["name"]))
+    # ★ 仅清空上一轮日志；本轮日志改由 bot 经 LIGHTVELA_LOG_FILE 自写（父进程 webapp 被重启也不丢、bot 还能跑完）
     try:
-        fd = open(log_file, "w", encoding="utf-8")
+        with open(log_file, "w", encoding="utf-8"):
+            pass
     except Exception:
-        fd = None
+        pass
+    env["LIGHTVELA_LOG_FILE"] = log_file
+    # ★ 2026-10-23 修复（重大根因）：text=True 不传 encoding 时按系统 locale 解码，
+    #   中文 Windows（计划任务环境，无 UTF-8 mode）= GBK/cp936；bot 输出的是 UTF-8 中文，
+    #   _reader 读到第一行中文就抛 UnicodeDecodeError → 被 except 吞掉 → reader 线程静默死亡
+    #   → 面板日志只剩 [已启动]；管道没人读被填满后 bot 同步写管道永久阻塞（JS 线程卡死），
+    #   最终被看门狗误杀。必须显式 UTF-8 + errors=replace（Node 输出恒为 UTF-8）。
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            env=env, cwd=BASE, text=True, bufsize=1)
+                            env=env, cwd=BASE, text=True, encoding="utf-8", errors="replace", bufsize=1)
     # ★ 全局停止闸门②：Popen 之后到入列之前的窗口里被停止，立即杀掉，不让它跑
     with _lock:
         if not _state["running"]:
@@ -599,8 +689,6 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False):
                 proc.kill()
             except Exception:
                 pass
-            if fd:
-                fd.close()
             return None
         _state["procs"].append(proc)
     cred = {}
@@ -634,22 +722,31 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False):
                         in_deploy = True  # 进入部署阶段，后续过程行压掉
                 if cleaned is not None:
                     _append_log(cleaned, "[%02d %s] " % (idx, acc["name"]))
-                if fd:
-                    fd.write(line)
                 m = CRED_RE.search(line)
                 if m:
                     try:
                         cred.update(json.loads(m.group(1)))
                     except Exception:
                         pass
-        except Exception:
-            pass
-        finally:
-            if fd:
+        except Exception as e:
+            # ★ 2026-10-23：reader 死掉绝不能静默——以前这里 except: pass 吞掉一切，
+            #   面板看不出任何异常；且 reader 死后没人读管道，bot 同步写满 64KB 管道缓冲区后
+            #   会永久阻塞（JS 线程卡死）→ 被看门狗误杀。现在：① 面板可见真实原因；
+            #   ② 自动起保底排水线程继续抽干管道，bot 绝不因管道满而卡死。
+            _append_log("[系统] 日志读取线程异常（已切换保底排水，bot 不会卡死）: %r" % (e,), "")
+            def _drain():
                 try:
-                    fd.close()
+                    while True:
+                        chunk = proc.stdout.read(4096)
+                        if not chunk:
+                            break
                 except Exception:
                     pass
+            try:
+                threading.Thread(target=_drain, daemon=True).start()
+            except Exception:
+                pass
+        finally:
             log_done.set()
 
     rt = threading.Thread(target=_reader, daemon=True)
@@ -675,58 +772,61 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False):
             killed = "STOPPED"
             break
         time.sleep(1)
-    if killed:
+    # ★ 2026-10-23：进入收尾窗口。bot 进程已退出（或将被杀），但 wait/join/写结果还要几秒，
+    #   这期间 procs 已空——status() 的"假运行纠正"若此时抢跑，前端会立刻打出
+    #   「[全部结束] 完成 0 / 1」（结果还没写上），几秒后才悄悄变成 1/1。用 finishing 计数挡住。
+    with _lock:
+        _state["finishing"] += 1
+    try:
+        if killed:
+            _hard_kill(proc)
+            exit_code = killed
+        else:
+            try:
+                proc.wait(timeout=10)
+                exit_code = proc.returncode
+            except Exception:
+                _hard_kill(proc)
+                exit_code = "TIMEOUT"
         try:
-            proc.kill()
+            rt.join(timeout=5)
         except Exception:
             pass
-        exit_code = killed
-    else:
-        try:
-            proc.wait(timeout=10)
-            exit_code = proc.returncode
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            exit_code = "TIMEOUT"
-    try:
-        rt.join(timeout=5)
-    except Exception:
-        pass
-    ok = (exit_code == 0)
-    if ok:
-        err_msg = None
-    elif fail_reason[0]:
-        err_msg = fail_reason[0]
-    elif exit_code == "TIMEOUT":
-        err_msg = "执行超时（超过 %d 分钟）" % (PER_ACCT_TIMEOUT // 60)
-    elif exit_code == "TIMEOUT_SILENCE":
-        err_msg = "子进程长时间无响应，已被看门狗终止"
-    elif exit_code == "STOPPED":
-        err_msg = "用户手动停止"
-    else:
-        err_msg = "执行失败（详见日志）"
-    res = {
-        "idx": idx,
-        "name": acc["name"],
-        "idCard": acc["idCard"],
-        "ok": ok,
-        "phone": cred.get("phone"),
-        "uid": cred.get("uid"),
-        "bearer": cred.get("bearer"),
-        "instanceId": None,
-        "deployOk": (ok if mode == "full" else None),
-        "error": err_msg,
-        "log": os.path.basename(log_file),
-    }
-    with _lock:
-        while len(_state["results"]) <= idx:
-            _state["results"].append(None)
-        _state["results"][idx] = res
-        _state["done"] += 1
-    return res
+        ok = (exit_code == 0)
+        if ok:
+            err_msg = None
+        elif fail_reason[0]:
+            err_msg = fail_reason[0]
+        elif exit_code == "TIMEOUT":
+            err_msg = "执行超时（超过 %d 分钟）" % (PER_ACCT_TIMEOUT // 60)
+        elif exit_code == "TIMEOUT_SILENCE":
+            err_msg = "子进程长时间无响应，已被看门狗终止"
+        elif exit_code == "STOPPED":
+            err_msg = "用户手动停止"
+        else:
+            err_msg = "执行失败（详见日志）"
+        res = {
+            "idx": idx,
+            "name": acc["name"],
+            "idCard": acc["idCard"],
+            "ok": ok,
+            "phone": cred.get("phone"),
+            "uid": cred.get("uid"),
+            "bearer": cred.get("bearer"),
+            "instanceId": None,
+            "deployOk": (ok if mode == "full" else None),
+            "error": err_msg,
+            "log": os.path.basename(log_file),
+        }
+        with _lock:
+            while len(_state["results"]) <= idx:
+                _state["results"].append(None)
+            _state["results"][idx] = res
+            _state["done"] += 1
+        return res
+    finally:
+        with _lock:
+            _state["finishing"] -= 1
 
 
 def _run_thread(accounts, mode, prelude=None, use_saved=False):
@@ -757,6 +857,8 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
             # 续跑时 prelude 是「[跳过] 某某：原因」明细，放在日志最前面
             _state["log"] = list(prelude or [])
             _state["procs"] = []
+        # ★ 启动新运行前，清掉上一轮 webapp 重启留下的孤儿 bot 进程（命令行含 domestic_lightvela_bot.js）
+        kill_orphan_bots()
         # ★ 滑动窗口并发：始终保持最多 CONCURRENCY 个账号在跑，
         #   任意一个跑完立刻补下一个，不再等整批齐了才走。
         sem = threading.Semaphore(CONCURRENCY)
@@ -771,6 +873,7 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
                 sem.release()
 
         for i, acc in enumerate(accounts):
+            # ★ 全局停止：每个账号启动前检查，停止后不再启动排队账号
             if not _state["running"]:
                 break
             sem.acquire()
@@ -785,6 +888,9 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
         except Exception:
             pass
         with _lock:
+            # ★ 2026-10-24：整轮跑完也兜一次底——中途被停止闸门跳过的账号（提前 return None）
+            #   如果日志里其实已经跑出结果了，把格子补上，别留在「等待中」
+            _backfill_pending_results()
             _state["running"] = False
 
 
@@ -842,6 +948,32 @@ def start(mode, text, concurrency=None, use_saved=False):
     return {"ok": True, "total": len(accs), "mode": mode}
 
 
+def kill_orphan_bots():
+    """启动新运行前，清掉上一轮 webapp 重启留下的孤儿 bot 进程（命令行含 domestic_lightvela_bot.js）。
+    返回清理掉的进程数；出错时记日志并返回 0。"""
+    try:
+        out = subprocess.run(
+            ["wmic", "process", "where",
+             "name='node.exe' and commandline like '%domestic_lightvela_bot.js%'",
+             "get", "processid"],
+            capture_output=True, text=True,
+        ).stdout
+        pids = [ln.strip() for ln in out.splitlines() if ln.strip().isdigit()]
+        killed = 0
+        for pid in pids:
+            try:
+                subprocess.run(["taskkill", "/PID", pid, "/F", "/T"], capture_output=True, text=True)
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            _append_log("[清理] 已结束 %d 个上一轮遗留的孤儿 bot 进程" % killed)
+        return killed
+    except Exception as e:
+        _append_log("[清理] 孤儿进程清理失败: " + str(e))
+        return 0
+
+
 def stop():
     """全局停止：杀掉所有正在跑的子进程，并置 running=False。
     配合 _run_thread 批循环与 _run_one 的 running 闸门，排队中的账号也不会再被启动。"""
@@ -857,8 +989,88 @@ def stop():
     return {"ok": True, "stopped": len(procs)}
 
 
+def _backfill_pending_results():
+    """★ 2026-10-24 新增：把「日志里明明成功、格子里却显示等待中」的账号回填进结果表。
+
+    成因：某些账号的收尾回执还没写回结果表，运行状态就被判结束了（假运行纠正触发 /
+    停止闸门提前 return None），那个格子就一直停在只有「姓名+身份证」的占位状态
+    → 面板显示「等待中」，完成计数也少一个（老大 2026-10-24 反馈何利丹这一例）。
+
+    依据：**只认本轮机器人自己写的运行日志** run_domestic_序号_姓名.log，且修改时间必须
+    晚于本轮开始时间。绝不拿凭证文件去判成败——凭证是跨轮累积的，拿它回填会把上一轮的
+    成功错记到这一轮头上（张华这类"上一轮成、这一轮败"的会被误判成成功）。
+      - 日志里有 RESULT=OK                                        → 部署成功
+      - 日志里有 RESULT=FAIL / RESULT=ERROR / [RUNFAIL] / ❌ 账号失败 → 部署失败
+      - 只登录模式：日志里有「登录成功」                            → 登录成功
+      - 以上都没有 → 说明真没跑完，不瞎猜，保持「等待中」
+    凭证文件只用来补手机号 / 实例号这些展示字段。
+    调用方必须已经持有 _lock。返回回填的格子数。
+    """
+    started = int(_state.get("started_at") or 0)
+    mode = _state.get("mode")
+    try:
+        saved = _read_tokens() or {}
+    except Exception:
+        saved = {}
+    filled = 0
+    for r in _state["results"]:
+        if not r or r.get("ok") is not None:      # 已落定的不碰
+            continue
+        lp = os.path.join(BASE, "run_domestic_%02d_%s.log" % (int(r.get("idx") or 0), r.get("name") or ""))
+        if not os.path.isfile(lp):
+            continue
+        try:
+            if started and int(os.path.getmtime(lp)) < started - 5:
+                continue                          # 不是本轮写的日志，不认
+            txt = open(lp, encoding="utf-8", errors="replace").read()
+        except Exception:
+            continue
+        if mode == "login":
+            if "登录成功" not in txt:
+                continue                          # 登录都没成，不瞎写
+            ok, err = True, None
+        elif "RESULT=OK" in txt:
+            ok, err = True, None
+        elif ("RESULT=FAIL" in txt or "RESULT=ERROR" in txt
+              or "[RUNFAIL]" in txt or "❌ 账号失败" in txt):
+            ok, err = False, "部署失败（从本轮运行日志回填）"
+        else:
+            continue                              # 看不出结果，不瞎写
+        rec = saved.get(r.get("idCard")) or {}
+        r["ok"] = ok
+        r["error"] = err
+        r["phone"] = rec.get("phone")
+        r["uid"] = rec.get("uid")
+        r["bearer"] = rec.get("bearer")
+        r["instanceId"] = rec.get("instanceId") if mode != "login" else None
+        r["deployOk"] = (True if ok else False) if mode != "login" else None
+        r["log"] = os.path.basename(lp)
+        _state["done"] += 1
+        filled += 1
+    if filled:
+        _state["log"].append("[系统] 已从本轮运行日志回填 %d 个卡在「等待中」的格子" % filled)
+    return filled
+
+
 def status():
     with _lock:
+        # ★ 防御：标记在跑但已无存活子进程（如 webapp 重启后子进程变孤儿），纠正为假运行，避免面板一直显示"进行中"
+        #   ★ 2026-10-23：必须排除"收尾窗口"——bot 退出后 _run_one 还要花几秒 wait/join/写结果，
+        #      这期间 procs 已空但结果没落定，若此时纠正 running，前端会立刻打出错误的
+        #      「[全部结束] 完成 0 / 1」。finishing>0 = 有账号正在收尾，一律不纠正。
+        if _state["running"]:
+            alive = [p for p in _state["procs"] if p.poll() is None] if _state["procs"] else []
+            # ★ 2026-10-24：批次空档闸——批循环总管线程（_state["thread"]）还活着，
+            #   说明整轮还在正常跑；此刻 procs 为空只是"上一批刚 join 完、下一批还没 spawn"
+            #   的瞬间空档，一律不许判结束。只有总管线程也死了（真卡死 / webapp 重启），
+            #   才允许纠正。这一道闸同时堵住"批次空档"和"收尾空档"两类误判结束。
+            _master_alive = bool(_state.get("thread") and _state["thread"].is_alive())
+            if not _master_alive and not alive and _state.get("finishing", 0) == 0 and (int(time.time()) - (_state["started_at"] or 0)) > 10:
+                _state["running"] = False
+                _state["log"].append("[系统] 检测到子进程已全部退出（可能 webapp 重启导致），已自动纠正运行状态")
+                # ★ 2026-10-24：宣布结束前，先把「日志里已成功、格子里还是等待中」的账号补上，
+                #   免得真成功的账号被当成没跑，老大还得翻日志才知道真假
+                _backfill_pending_results()
         return {
             "ok": True,
             "running": _state["running"],
