@@ -22,6 +22,7 @@ from urllib.parse import urlparse, unquote, quote
 import requests
 
 # ---------------- 常量 ----------------
+DIR = os.path.dirname(os.path.abspath(__file__))   # 脚本所在目录（lv_google_login.js 同目录）
 CLIENT_ID = "Ov23ctPQOrmnxkn8SRqM"
 REDIRECT = "https://api.lightvela.ai/auth/oauth/github/callback"
 SCOPE = "read:user,user:email"
@@ -108,8 +109,11 @@ TOKEN_FILE = "lv-tokens.json"
 
 # ---------------- 账号解析 ----------------
 def parse_accounts(text):
-    """每行：邮箱----密码----用户名----2FA----创建时间（后两项可缺）。
-    返回 [{'idx','raw_parts','email','password','login','tfa','created','ok','err'}]"""
+    """每行：邮箱----密码----用户名----2FA----创建时间（GitHub，后两项可缺）。
+    谷歌账号：在任意段标 google/g 即为谷歌账号，格式
+        邮箱----密码----辅助邮箱[----创建时间]----google
+    缺省 provider=github。
+    返回 [{'idx','raw_parts','email','password','login','tfa','created','provider','recovery','ok','err'}]"""
     rows = []
     for raw in (text or "").splitlines():
         s = raw.strip()
@@ -117,17 +121,40 @@ def parse_accounts(text):
             continue
         parts = [p.strip() for p in re.split(r"-{2,}", s)]
         r = {"idx": len(rows) + 1, "raw_parts": parts, "ok": False, "err": "",
-             "email": "", "password": "", "login": "", "tfa": "", "created": ""}
-        if len(parts) < 4:
-            r["err"] = "字段不足（需 邮箱----密码----用户名----2FA）"
-        elif not parts[0] or not parts[1] or not parts[3]:
-            r["err"] = "邮箱/密码/2FA 不能为空"
+             "email": "", "password": "", "login": "", "tfa": "", "created": "",
+             "provider": "github", "recovery": ""}
+        # provider 判定：任意段精确等于 google/g -> 谷歌；github/gh -> GitHub；否则默认 GitHub
+        provider = "github"
+        for p in parts:
+            pl = p.lower()
+            if pl in ("google", "g"):
+                provider = "google"; break
+            if pl in ("github", "gh"):
+                provider = "github"; break
+        r["provider"] = provider
+        if provider == "google":
+            # 邮箱----密码----辅助邮箱[----创建时间]----google
+            if not parts[0] or not parts[1]:
+                r["err"] = "谷歌账号需 邮箱----密码[----辅助邮箱][----创建时间]----google"
+            else:
+                r["email"], r["password"] = parts[0], parts[1]
+                r["recovery"] = parts[2] or ""
+                r["login"] = parts[0]            # 仅用于命名/凭据 key，登录不依赖
+                r["tfa"] = ""
+                tail = parts[3] if len(parts) > 3 else ""
+                r["created"] = tail if tail and tail.lower() not in ("google", "g", "github", "gh") else ""
+                r["ok"] = True
         else:
-            r["email"], r["password"] = parts[0], parts[1]
-            r["login"] = parts[2] or parts[0]
-            r["tfa"] = parts[3]
-            r["created"] = parts[4] if len(parts) > 4 else ""
-            r["ok"] = True
+            if len(parts) < 4:
+                r["err"] = "字段不足（需 邮箱----密码----用户名----2FA）"
+            elif not parts[0] or not parts[1] or not parts[3]:
+                r["err"] = "邮箱/密码/2FA 不能为空"
+            else:
+                r["email"], r["password"] = parts[0], parts[1]
+                r["login"] = parts[2] or parts[0]
+                r["tfa"] = parts[3]
+                r["created"] = parts[4] if len(parts) > 4 else ""
+                r["ok"] = True
         rows.append(r)
     return rows
 
@@ -451,6 +478,99 @@ def gh_login_retry(login, password, tfa, proxy, log=None, max_attempts=5, retry_
     raise last_exc
 
 
+# ---------------- 谷歌授权登录（node + Playwright，真实浏览器引擎）----------------
+# 走 /auth/oauth/google/start -> Google 登录（邮箱+密码，必要时辅助邮箱确认）
+# -> LightVela 授权确认 -> 回调拿到 session_token（= Bearer，与 GitHub 同构）。
+# 为什么不用纯 requests：实测证明 Google 登录页是 JS 渲染的 SPA（无传统 <form>），
+# 且强制要求浏览器 JS 实时计算的机器人防护值（bgresponse）——纯 requests 既拿不到表单、
+# 也算不出该值（保留 js_disabled 被拒登、删除则 500）。故必须用真实浏览器引擎，
+# 由 node + Playwright（Chromium）完成登录，本文件作为 Python 侧桥（subprocess 调 lv_google_login.js）。
+# 部署约束：VPS 容器需内置 node + playwright + chromium（见 Dockerfile / 部署说明）。
+NODE_BIN = os.environ.get("LIGHTVELA_NODE_BIN") or "node"
+GOOGLE_LOGIN_JS = os.path.join(DIR, "lv_google_login.js")
+
+
+def _find_node_modules():
+    """找一个装有 playwright 的 node_modules 目录，返回其路径或 None。"""
+    cands = []
+    if os.environ.get("LIGHTVELA_NODE_MODULES"):
+        cands.append(os.environ["LIGHTVELA_NODE_MODULES"])
+    # 本机 managed node 工作区（已确认装了 playwright）
+    cands.append(r"C:\Users\Administrator\.workbuddy\binaries\node\workspace\node_modules")
+    # 脚本同目录下的 node_modules（部署时若把 playwright 放旁边）
+    cands.append(os.path.join(DIR, "node_modules"))
+    # Docker 容器内：Dockerfile 用 `npm install playwright` 装到 /app/node_modules
+    cands.append("/app/node_modules")
+    for c in cands:
+        if c and os.path.isdir(os.path.join(c, "playwright")):
+            return c
+    return None
+
+
+def google_login(email, password, recovery, px=None, log=None):
+    """谷歌授权登录（node + Playwright）-> 返回 LightVela Bearer。失败抛异常。
+    px（代理）保留以与 GitHub 路径对齐；node 脚本默认走自身网络（容器内直连/系统代理）。"""
+    def L(m):
+        if log:
+            log(m)
+    if not email or not password:
+        raise RuntimeError("谷歌账号需 邮箱 + 密码")
+    if not os.path.exists(GOOGLE_LOGIN_JS):
+        raise RuntimeError("缺少谷歌登录脚本: " + GOOGLE_LOGIN_JS)
+    env = dict(os.environ)
+    nm = _find_node_modules()
+    if nm:
+        env["NODE_PATH"] = nm
+        env["PLAYWRIGHT_PKG"] = os.path.join(nm, "playwright")
+    else:
+        L("  ⚠️ 未找到 playwright 模块目录（可在 LIGHTVELA_NODE_MODULES 指定；容器需内置）")
+    args = [NODE_BIN, GOOGLE_LOGIN_JS, "--email=" + email, "--password=" + password]
+    if recovery:
+        args.append("--recovery=" + recovery)
+    L("  启动谷歌无头浏览器登录 ...")
+    try:
+        # 超时放宽到 360s：小内存机器(如 952MB 的 80 VPS)上实测谷歌登录要 150~300s，
+        # 原 180s 会误杀近一半账号（观测到最慢 298.5s）。
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=360)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("谷歌登录超时（浏览器流程 >360s）")
+    except FileNotFoundError:
+        raise RuntimeError("找不到 node 可执行文件（请设置 LIGHTVELA_NODE_BIN，并确保容器内置 node）")
+    out = (r.stdout or "").strip()
+    try:
+        data = json.loads(out)
+    except Exception:
+        raise RuntimeError("谷歌登录脚本输出无法解析: " + out[-200:] +
+                           " | stderr=" + (r.stderr or "")[-200:])
+    if not data.get("ok") or not data.get("token"):
+        raise RuntimeError("谷歌登录失败: " + str(data.get("error") or "未知") +
+                           ((" | " + (r.stderr or "")[-160:]) if r.stderr else ""))
+    return data["token"]
+
+
+def google_login_retry(email, password, recovery, px=None, log=None, max_attempts=3, retry_delay=5.0):
+    """谷歌登录 + 环境层失败重试（超时 / node 缺失 / 输出解析失败）。
+    账号密码错、辅助邮箱验证不通过等「真失败」不重试，直接抛出。"""
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return google_login(email, password, recovery, px, log=log)
+        except RuntimeError as e:
+            msg = str(e)
+            if "超时" in msg or "node" in msg or "脚本输出无法解析" in msg or "缺少谷歌登录脚本" in msg:
+                last_exc = e
+                if attempt < max_attempts:
+                    if log:
+                        log("  ⚠️ 谷歌登录环境异常（%s），%ds后重试（第%d/%d次）"
+                            % (msg[:80], retry_delay, attempt, max_attempts))
+                    time.sleep(retry_delay)
+                else:
+                    raise
+            else:
+                raise   # 真失败不重试
+    raise last_exc
+
+
 def live_passes(s):
     r = s.get(API + "/v1/passes", timeout=40)
     try:
@@ -668,8 +788,12 @@ class Job(object):
         self.row(idx, stage="登录中", detail="")
         self.log(tag + " 开始登录 ...")
         t0 = time.time()
-        token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
-                               log=lambda m: self.log(tag + m))
+        if acc.get("provider") == "google":
+            token = google_login_retry(acc["email"], acc["password"], acc.get("recovery", ""), px,
+                                       log=lambda m: self.log(tag + m))
+        else:
+            token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
+                                   log=lambda m: self.log(tag + m))
         self.tokens[name] = token
         self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
         self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
@@ -750,7 +874,13 @@ class Job(object):
                 self._deploy_flow(idx, tag, token, px)
         except Exception as e:
             self.log(tag + " ❌ 失败：%s" % e)
-            self.row(idx, stage="失败", detail=str(e)[:160], ok=False, result="error")
+            detail = str(e)[:160]
+            result = "error"
+            if "registration_email_risk_re" in detail:
+                # 谷歌对这批邮箱标记了风险，纯风控，需换号源 / 换更干净邮箱域 / 换环境
+                result = "google_risk"
+                self.log(tag + " 🚫 谷歌风控标记（registration_email_risk_re）——非程序问题，需换号源或换更干净邮箱域")
+            self.row(idx, stage="失败", detail=detail, ok=False, result=result)
 
     # --- 订阅策略辅助：主套餐 + 降级套餐 ---
     def _primary_unavailable(self):
@@ -847,6 +977,24 @@ class Job(object):
                     self.row(idx, stage="抢单中", detail="影子账户开通中｜已发 %d 次" % n)
                     time.sleep(back)
                     continue
+                # ★ 非临时错误：pass 已存在 / 需绑影子账户，重试无解 → 立即判失败（不再白烧预算）
+                if code == "PASS_ALREADY_EXISTS" or "SHADOW_BINDING" in str(code or ""):
+                    if code == "PASS_ALREADY_EXISTS":
+                        # 歧义态：可能上一轮已抢到 → 复查一次 live_passes
+                        live = live_passes(s)
+                        if live:
+                            pid = live[0].get("pass_id", "")
+                            bid = live[0].get("bundle_id", "")
+                            self.log(tag + " 🎉 复查发现已抢到（409 已存在）| %s | pass=%s" % (bid, pid))
+                            self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="already")
+                            return True
+                        self.log(tag + " ❌ pass 已存在但查不到（状态冲突），停止重试")
+                        self.row(idx, stage="失败", detail="pass已存在但查不到", ok=False, result="pass_exists_conflict")
+                        return False
+                    # 403 PASS_SHADOW_BINDING_REQUIRED：需平台后台手动绑影子账户
+                    self.log(tag + " ❌ 需先绑定影子计费账户（%s）——去 LightVela 后台绑定后单独重跑" % (code or msg))
+                    self.row(idx, stage="失败", detail="需绑影子账户", ok=False, result="shadow_binding_required")
+                    return False
                 only_shadow = False   # 其它错误 → 退回原预算
                 if n == 1 or n % 10 == 0:
                     self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
@@ -1113,12 +1261,16 @@ class Monitor(object):
         if not acc["ok"]:
             self.log(tag + " ❌ 第一个账号格式错误：" + acc.get("err", ""))
             return False
-        self.log(tag + " 启动检测：开始 GitHub 授权登录 ...")
+        self.log(tag + " 启动检测：开始授权登录 ...")
         px = proxy_of(acc, self.proxy)
         t0 = time.time()
         try:
-            token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
-                                   log=lambda m: self.log(tag + m))
+            if acc.get("provider") == "google":
+                token = google_login_retry(acc["email"], acc["password"], acc.get("recovery", ""),
+                                           px, log=lambda m: self.log(tag + m))
+            else:
+                token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
+                                       log=lambda m: self.log(tag + m))
         except Exception as e:
             self.log(tag + " ❌ 登录异常：%s" % e)
             return False

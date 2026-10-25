@@ -129,9 +129,16 @@
 <main id="tab-intl">
   <div class="col left" id="colLeft">
     <div class="card" style="flex:1;min-height:212px">
-      <h2>账号 <span class="sub">邮箱----密码----用户名----2FA----创建时间</span></h2>
+      <h2>账号
+        <span class="tabs" style="margin-left:8px">
+          <button class="tabbtn active" id="tabGhBtn" onclick="switchAccTab('gh')">GitHub</button>
+          <button class="tabbtn" id="tabGgBtn" onclick="switchAccTab('gg')">Google</button>
+        </span>
+        <span class="sub" id="accSub">邮箱----密码----用户名----2FA----创建时间</span>
+      </h2>
       <textarea id="acc" spellcheck="false" placeholder="每行一个账号：
 puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYNTE----2026-09-29 21:42:19"></textarea>
+      <textarea id="accG" spellcheck="false" style="display:none" placeholder="每行一个账号（Google）：&#10;you@gmail.com----你的密码----辅助邮箱（可选）"></textarea>
       <div class="bar" style="margin-top:8px">
         <button class="btn sm" id="btnImport">导入 txt</button>
         <button class="btn sm" id="btnClear">清空</button>
@@ -307,8 +314,9 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <select id="domSmsProvider" style="width:150px">
             <option value="haozhuma" selected>豪猪（默认）</option>
             <option value="feihu">飞狐</option>
+            <option value="lubansms">鲁班</option>
           </select>
-          <span class="sub" style="color:var(--tx3)">两套并存，选哪套哪套生效</span>
+          <span class="sub" style="color:var(--tx3)">三套并存，选哪套哪套生效</span>
         </div>
 
         <!-- 豪猪面板 -->
@@ -342,11 +350,26 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
             <label>API密钥</label>
             <input type="text" id="domFhSecret" spellcheck="false" placeholder="飞狐 API 密钥">
           </div>
-          <div class="row">
-            <label>项目 ID</label>
-            <input type="text" id="domFhSid" spellcheck="false" placeholder="飞狐项目 pid">
-          </div>
+        <div class="row">
+          <label>项目 ID</label>
+          <input type="text" id="domFhSid" spellcheck="false" placeholder="飞狐项目 pid">
         </div>
+      </div>
+
+      <!-- 鲁班面板（三平台共存，+86 国内号；service_id 留空填 +86 中国编号） -->
+      <div id="domLbPanel" style="display:none">
+        <div class="row">
+          <label>API 地址</label>
+          <input type="text" id="domLbBase" spellcheck="false" placeholder="https://lubansms.com/v2/api（可不填，默认此值）">
+        </div>
+        <div class="pgrid">
+          <label>apiKey</label>
+          <input type="text" id="domLbKey" spellcheck="false" placeholder="鲁班平台 API 密钥">
+          <label>服务 ID</label>
+          <input type="text" id="domLbSid" spellcheck="false" placeholder="+86 中国编号（鲁班后台填）">
+        </div>
+        <div class="hint" style="margin-top:6px">鲁班免登录，所有请求带 apiKey；取号必须填「服务 ID」（决定国家+应用，类似飞狐 pid），+86 大陆号在鲁班后台查对应编号填入。</div>
+      </div>
 
         <div class="bar" style="margin-top:4px">
           <button class="btn primary sm" id="domBtnSmsSave">保存配置</button>
@@ -617,9 +640,37 @@ function stamp() {
   return d.getFullYear() + p(d.getMonth()+1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
 }
 
+function currentAccEl() {
+  // 当前激活的账号文本框（GitHub / Google 标签切换）
+  return $('accG').style.display === 'none' ? $('acc') : $('accG');
+}
+function currentAccValue() { return currentAccEl().value; }
+function switchAccTab(which) {
+  if (which === 'gh') {
+    $('acc').style.display = ''; $('accG').style.display = 'none';
+    $('tabGhBtn').classList.add('active'); $('tabGgBtn').classList.remove('active');
+    $('accSub').textContent = '邮箱----密码----用户名----2FA----创建时间';
+  } else {
+    $('acc').style.display = 'none'; $('accG').style.display = '';
+    $('tabGgBtn').classList.add('active'); $('tabGhBtn').classList.remove('active');
+    $('accSub').textContent = '邮箱----密码----辅助邮箱（每行一个）';
+  }
+  doParse();   // 切换后立即刷新解析统计
+}
+function accPayload() {
+  // 提交用：GitHub 原样 + Google 每行自动补 ----google（后端据此判谷歌账号）
+  const gh = $('acc').value.trim();
+  const ggRaw = $('accG').value.trim();
+  const gg = ggRaw.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    const low = l.toLowerCase();
+    return (low.endsWith('----google') || low.endsWith('----g')) ? l : (l + '----google');
+  }).join('\n');
+  return [gh, gg].filter(Boolean).join('\n');
+}
+
 /* ---------- 各功能 ---------- */
 async function doParse() {
-  const r = await API.parse($('acc').value);
+  const r = await API.parse(currentAccValue());
   if (!r || !r.ok) { $('parseStat').textContent = '解析失败'; return; }
   const bad = r.invalid;
   $('parseStat').innerHTML = '共 <b>' + r.total + '</b> 个 · 有效 <b>' + r.valid + '</b>' +
@@ -628,7 +679,7 @@ async function doParse() {
 async function doImport() {
   const text = await pickFile($('fileTxt'));
   if (text == null) return;
-  $('acc').value = text;
+  currentAccEl().value = text;
   appendLog(['[已导入] ' + text.split('\n').filter(Boolean).length + ' 行']);
   doParse();
 }
@@ -645,7 +696,7 @@ async function doTestProxy() {
 async function doStart() {
   await doParse();
   const proxy = await proxyArg();
-  const r = await API.start($('acc').value, proxy, $('mode').value,
+  const r = await API.start(accPayload(), proxy, $('mode').value,
                             parseFloat($('interval').value) || 1,
                             parseFloat($('duration').value) || 300,
                             $('useSaved').checked,
@@ -674,7 +725,7 @@ async function proxyArg() {
 async function doMonStart() {
   await doParse();
   const proxy = await proxyArg();
-  const r = await API.monitor_start($('acc').value, proxy,
+  const r = await API.monitor_start(accPayload(), proxy,
                                     parseInt($('monInterval').value, 10) || 5,
                                     parseInt($('monParallel').value, 10) || parseInt($('parallel').value, 10) || 1,
                                     $('bundleStrategy').value);
@@ -739,9 +790,9 @@ async function doImportFailed() {
   if (!r || !r.ok) { appendLog(['[导入失败] ✗ ' + (r && r.error)]); return; }
   const text = (r.text || '').trim();
   if (!text) { appendLog(['[导入失败] 没有失败账号 ✓']); return; }
-  $('acc').value = '';                                // 先清空账号区
-  $('acc').value = text;                              // 填入失败账号
-  $('acc').dispatchEvent(new Event('input'));         // 触发解析刷新账号数
+  currentAccEl().value = '';                          // 先清空当前标签账号区
+  currentAccEl().value = text;                        // 填入失败账号
+  currentAccEl().dispatchEvent(new Event('input'));   // 触发解析刷新账号数
   appendLog(['[导入失败] 已清空账号区并填入 ' + (r.count || 0) + ' 个失败账号（可直接点开始重跑）']);
 }
 async function doTkInfo() {
@@ -869,7 +920,7 @@ function boot() {
   if (booted) { doParse(); doTkInfo(); return; }
   booted = true;
   $('btnImport').onclick = doImport;
-  $('btnClear').onclick = () => { $('acc').value = ''; doParse(); };
+  $('btnClear').onclick = () => { currentAccEl().value = ''; doParse(); };
   $('btnTest').onclick = doTestProxy;
   $('btnStart').onclick = () => { doStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnStop').onclick = doStop;
@@ -1093,8 +1144,9 @@ async function domTkDel() {
 /* ---------- 国内版配置（接码平台 / 代理 / 部署指令）---------- */
 function toggleSmsProvider() {
   const p = $('domSmsProvider').value;
-  $('domHzPanel').style.display = (p === 'feihu') ? 'none' : '';
+  $('domHzPanel').style.display = (p === 'haozhuma') ? '' : 'none';
   $('domFhPanel').style.display = (p === 'feihu') ? '' : 'none';
+  $('domLbPanel').style.display = (p === 'lubansms') ? '' : 'none';
 }
 
 async function loadDomConfig() {
@@ -1113,7 +1165,13 @@ async function loadDomConfig() {
   $('domFhKey').value = fh.apiKey || '';
   $('domFhSecret').value = fh.apiSecret || '';
   $('domFhSid').value = fh.projectId || '';
-  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 当前：' + ($('domSmsProvider').value === 'feihu' ? '飞狐' : '豪猪');
+  // 鲁班
+  const lb = s.luban || {};
+  $('domLbBase').value = lb.apiBase || 'https://lubansms.com/v2/api';
+  $('domLbKey').value = lb.apiKey || '';
+  $('domLbSid').value = lb.serviceId || '';
+  const pName = ($('domSmsProvider').value === 'feihu') ? '飞狐' : ($('domSmsProvider').value === 'lubansms') ? '鲁班' : '豪猪';
+  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 当前：' + pName;
   toggleSmsProvider();
   const p = r.config.proxy || {};
   $('domPType').value = p.type || 'socks5';
@@ -1139,10 +1197,16 @@ async function domSmsSave() {
     $('domFhSecret').value.trim(),
     $('domFhSid').value.trim()
   );
-  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok))) {
+  const r4 = await API.domestic_luban_set(
+    $('domLbBase').value.trim(),
+    $('domLbKey').value.trim(),
+    $('domLbSid').value.trim()
+  );
+  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok))) {
     $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败</span>'; return;
   }
-  $('domSmsStat').textContent = '已保存 · 当前：' + (provider === 'feihu' ? '飞狐' : '豪猪');
+  const pName = (provider === 'feihu') ? '飞狐' : (provider === 'lubansms') ? '鲁班' : '豪猪';
+  $('domSmsStat').textContent = '已保存 · 当前：' + pName;
   $('domSmsHint').innerHTML = '✓ 已保存（对新任务生效）';
   setTimeout(() => { $('domSmsHint').textContent = ''; }, 2500);
 }
@@ -1155,7 +1219,7 @@ async function domSmsTest() {
   await domSmsSave();  // 先存最新值再测
   const r = await API.domestic_sms_balance();
   btn.disabled = false; btn.textContent = '测试连接 + 查余额';
-  const label = (provider === 'feihu') ? '飞狐' : '豪猪';
+  const label = (provider === 'feihu') ? '飞狐' : (provider === 'lubansms') ? '鲁班' : '豪猪';
   if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(label) + '：' + esc(r && r.error) + '</span>'; return; }
   $('domSmsHint').innerHTML = '✓ ' + esc(label) + '登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
 }
@@ -1248,6 +1312,12 @@ async function domDepReset() {
 
 window.addEventListener('load', async () => {
   wireLogin();
+  // 账号双标签：分别载入已存内容 + 绑定输入持久化（GitHub/Google 分开记）
+  $('acc').value = localStorage.getItem('lv_acc_gh') || '';
+  $('accG').value = localStorage.getItem('lv_acc_gg') || '';
+  $('accG').addEventListener('input', doParse);
+  $('acc').addEventListener('input', () => { try { localStorage.setItem('lv_acc_gh', $('acc').value); } catch (e) {} });
+  $('accG').addEventListener('input', () => { try { localStorage.setItem('lv_acc_gg', $('accG').value); } catch (e) {} });
   try {
     const r = await fetch('/api/session').then(x => x.json());
     if (r && r.logged_in) { hideLogin(); setStatus('已就绪', true); boot(); }
