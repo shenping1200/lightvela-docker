@@ -951,8 +951,13 @@ async function domesticLogin(acc, idx) {
           if (rlType) {
             lastRateJson = sr.json;
             if (rlType === 'verification_provider_rate_limited') {
-              // 脏IP限流：代理池每次请求自动换出口IP，下一轮重发即换新IP；但仍须等满手机号冷却，否则网站照样限
-              console.log(`  ⚠️ 限流类型=IP脏(${rlType})：出口IP被官方限频 → 重发时代理池自动换IP，但仍须等满 ${RESEND_WAIT_MS / 1000}s 手机号冷却`);
+              // ★ 2026-10-26 老大定：出口IP被官方限频（脏IP）→ 直接判定本账号失败，不重试、不换号。
+              //   实测代理 a.rr2.kdns.fr 是“每次新建连接换一个出口IP”，但本进程全程复用同一条隧道
+              //   （lv-proxy.js: keepAlive + maxSockets:1 + 缓存 TLS socket），重发多少次都是同一个脏IP，
+              //   硬重试只会白等 60s×N、白烧号码。下次重跑 = 新进程 = 新连接 = 新出口IP，自然就好了。
+              console.log(`  ⛔ 限流类型=IP脏(${rlType})：出口IP被官方限频，直接判定失败（不重试/不换号），稍后重跑会自动换新出口IP`);
+              if (phone) { try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（IP脏放弃，号源一次性）:', phone); } catch (_) {} }
+              throw new Error('IP脏限频：出口IP被官方限频，已放弃本次尝试（不重试/不换号）。稍后重跑会自动换新出口IP');
             } else {
               // 其他限流：非IP问题，保持原等待后重发即可
               console.log(`  ⚠️ 限流类型=其他(${rlType})：非IP类限流，保持 ${RESEND_WAIT_MS / 1000}s 等待后重发`);
