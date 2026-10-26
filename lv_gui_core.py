@@ -63,7 +63,7 @@ PURECODE_JS = "lightvela-purecode.js"
 
 # ★ 建 Bot 的名字：统一用「网站系统默认名」（老大 2026-10-26 定），不再自拼"前缀-序号"、也不再随机。
 #   所有机器完全一致，省去逐台配置；需要临时改名时用环境变量 LIGHTVELA_BOT_NAME 覆盖。
-DEFAULT_BOT_NAME = os.environ.get("LIGHTVELA_BOT_NAME") or "我的 AI 伙伴"
+DEFAULT_BOT_NAME = os.environ.get("LIGHTVELA_BOT_NAME") or "My AI Companion"
 DEPLOY_MSG_FILE = "_deploy_msg.txt"
 NODE_CANDIDATES = [
     r"C:\Users\Administrator\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe",
