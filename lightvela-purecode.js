@@ -570,8 +570,14 @@ async function restCreateBot(name) {
       } catch (e) { /* 忽略单次查询失败 */ }
     }
     console.log('[建Bot] 重建实例=' + iid2 + ' 最终状态=' + status2 + ' 名称=' + nm);
+    // ★ 2026-10-26 二次修复（关键）：重建后若仍是 Failed，绝不能先打印 'BOT=<iid2>|status=Failed'
+    //   否则 Python 正则 BOT=<id>|status=<x> 会误判成功，拿死实例去部署 → DEBUG_NOT_SUPPORTED。
+    //   必须"先判 Failed → 打 BOT=FAIL"，只有真 Running 才打 BOT=<iid2>|status=... 放行。
+    if (/failed/i.test(status2)) {
+      console.log('BOT=FAIL|重建实例仍为 Failed（绑定可能未生效，下一轮重跑会再建）');
+      return false;
+    }
     console.log('BOT=' + iid2 + '|status=' + (status2 || 'unknown') + '|name=' + nm + '|rebuilt=1');
-    if (/failed/i.test(status2)) { console.log('BOT=FAIL|重建实例仍为 Failed（绑定可能未生效，下一轮重跑会再建）'); return false; }
     return /active|running|creating|pending/i.test(status2) || !!iid2;
   }
 
