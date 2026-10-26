@@ -517,7 +517,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 let pollTimer = null, logLen = 0, running = false, booted = false;
-let currentTab = 'intl', domRunning = false, domLogLen = 0, lastDomStatus = null;
+let currentTab = 'intl', domRunning = false, domLogLen = 0, lastDomStatus = null, domResumedOnce = false;
 
 /* ---------- 后端桥：把 window.pywebview.api 换成 fetch ---------- */
 const API = new Proxy({}, {
@@ -1041,10 +1041,11 @@ async function domStart() {
 
 /* 页面刷新/切到国内版时：后端若已有任务在跑，自动续接显示（只恢复显示，不动任务） */
 async function domResume() {
-  if (domRunning) return;
+  if (domRunning || domResumedOnce) return;   // ★ 只续接一次：否则 700ms 心跳会「续接→立刻结束」死循环，日志刷屏 + 按钮闪动
   const s = await API.domestic_status();
   // 只要有任务（运行中 或 已完成但有记录）就续接显示，避免刷新后空白
   if (s && s.ok && (s.running || (s.total && s.total > 0))) {
+    domResumedOnce = true;   // ★ 标记已续接，之后心跳不再重复拉
     domRunning = true;
     $('domBtnStart').disabled = !s.running; $('domBtnStop').disabled = s.running;
     $('domBtnExportFailed').disabled = s.running; $('domBtnImportFailed').disabled = s.running;

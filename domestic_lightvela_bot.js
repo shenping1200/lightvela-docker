@@ -548,6 +548,37 @@ const SMS_FEIHU = {
 //   轮询：/getSms?apikey=&request_id= -> {code:0,msg:"wait"} 等待 / {code:0,msg:"success",sms_code:"..."} 收到 / {code:400} 超时或 apikey 错
 //   释放：/setStatus?apikey=&request_id=&status=reject（鲁班无独立拉黑，释放即弃号）
 //   余额：/getBalance?apikey= -> {code:0,balance:"96.72"}
+// ★ 从短信内容里抠验证码（2026-10-26 新增）
+//   兼容两种返回：① 纯码（官方文档格式）"380682"
+//                 ② 整条短信原文（cn7 通道实际返回）"【腾讯云】871226 腾讯云注册短信验证码，5分钟内有效！"
+function pickLubanSmsCode(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  if (/^\d{4,8}$/.test(s)) return s;                        // ① 本身就是纯码
+  // 候选：所有 4~8 位数字，先排除「5分钟 / 60秒」这类时效数字
+  const cands = (s.match(/\d{4,8}/g) || []).filter((d) =>
+    !new RegExp(d + '\\s*(?:分钟|分|秒|小时|min|sec|hour)', 'i').test(s));
+  if (!cands.length) return '';
+  if (cands.length === 1) return cands[0];
+  // 多个候选：先看「验证码」字样后面紧跟的数字，再看它前面最近的数字
+  const KW = /(?:验证码|校验码|动态码|确认码|verification\s*code|code)/gi;
+  let m;
+  while ((m = KW.exec(s)) !== null) {                      // ① 关键词后面的（「验证码 654321」「验证码是 123456」）
+    const tail = s.slice(m.index + m[0].length, m.index + m[0].length + 20);
+    const nums = tail.match(/\d{4,8}/g);
+    if (nums && cands.indexOf(nums[0]) >= 0) return nums[0];
+  }
+  KW.lastIndex = 0;
+  while ((m = KW.exec(s)) !== null) {                      // ② 关键词前面的（「871226 腾讯云注册短信验证码」）
+    const head = s.slice(Math.max(0, m.index - 24), m.index);
+    const nums = head.match(/\d{4,8}/g);
+    if (nums && cands.indexOf(nums[nums.length - 1]) >= 0) return nums[nums.length - 1];
+  }
+  // 再退一步：国内验证码基本都是 6 位
+  const six = cands.filter((d) => d.length === 6)[0];
+  return six || cands[0];
+}
+
 const SMS_LUBAN = {
   apiBase: process.env.LIGHTVELA_LUBAN_API_BASE || 'https://lubansms.com/v2/api',
   apiKey:  process.env.LIGHTVELA_LUBAN_API_KEY     || '',
@@ -589,8 +620,12 @@ const SMS_LUBAN = {
       if (Number(j.code) !== 0) throw new Error('鲁班取码接口错误: ' + JSON.stringify(j));
       const msg = j.msg;
       if (msg === 'success') {
-        const code = (j.sms_code != null ? String(j.sms_code) : '') || '';
-        if (/^\d{4,8}$/.test(code)) return code;
+        // ★ 2026-10-26 修复：鲁班 cn7 通道把「整条短信原文」塞进 sms_code
+        //   （如「【腾讯云】871226 腾讯云注册短信验证码，5分钟内有效！」），不是纯数字。
+        //   旧代码只认 /^\d{4,8}$/ 纯数字 → 码早到了却一直当「没收到」，空转 180s 后误判超时。
+        const code = pickLubanSmsCode(j.sms_code);
+        if (code) return code;
+        throw new Error('鲁班已收到短信但抠不出验证码: ' + JSON.stringify(j));
       } else if (msg === 'wait') {
         // 等待中，继续轮询
       } else {
