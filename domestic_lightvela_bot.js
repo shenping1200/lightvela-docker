@@ -1474,6 +1474,57 @@ async function restCreateBot(name) {
   CFG.instanceId = iid;   // 记下来：后面设主模型 / 发消息都用它
   console.log('[建Bot] 实例=' + iid + ' 最终状态=' + status + ' 名称=' + nm);
   console.log('BOT=' + iid + '|status=' + (status || 'unknown') + '|name=' + nm);
+
+  // ★ 2026-10-24 修复：实例建完是 Failed 不能当成功
+  // 现象：首登触发 PASS_SHADOW_BINDING_REQUIRED 的号，实例创建即 Failed；
+  // 原 return 只要有 id 就 true，导致下游 debug/exec 连吃 3 次 DEBUG_NOT_SUPPORTED 白重试。
+  // 处理：Failed → 先删掉这个废实例（释放每 uid 仅 1 个的实例配额）→ 原地再建一个 → 轮询；
+  // 重建后仍 Failed / 删除或重建失败 → 直接 return false（外层按「建Bot失败」，不再带死实例去部署）。
+  if (/failed/i.test(status)) {
+    console.log('[建Bot] 实例=' + iid + ' 状态=Failed，尝试删掉废实例后原地重建一次');
+    // 先删废实例（释放配额）；删除接口在本平台偶发慢/超时，故带 15s 超时 + 最多 2 次重试
+    let deleted = false;
+    for (let attempt = 1; attempt <= 2 && !deleted; attempt++) {
+      try {
+        const dr = await httpsReq('DELETE', '/v1/instances/' + iid, { timeoutMs: 15000, retries: 0 });
+        const ok = (dr.status < 300) || /deleted|not.*found|404|no.*such/i.test(JSON.stringify(dr.json || ''));
+        console.log('[建Bot] DELETE 尝试' + attempt + ' /v1/instances/' + iid + ' →', dr.status, JSON.stringify(dr.json || {}).slice(0, 160));
+        if (ok) { deleted = true; break; }
+      } catch (e) {
+        console.log('[建Bot] DELETE 尝试' + attempt + ' 异常:', e.message);
+      }
+    }
+    if (!deleted) console.log('[建Bot] 删除废实例未确认成功，仍尝试重建（若平台报配额满则本轮放弃，下一轮再试）');
+    // 原地再建一个
+    let rc2, d2, iid2 = '', status2 = 'Failed';
+    try {
+      rc2 = await httpsReq('POST', '/v1/instances', { body: { timeout: 3600, name: nm } });
+      d2 = unwrapData(rc2.json) || {};
+      iid2 = d2.instance_id || d2.id || '';
+      status2 = String(d2.status || '');
+      console.log('[建Bot] 重建 POST /v1/instances →', rc2.status, JSON.stringify(rc2.json || {}).slice(0, 200));
+    } catch (e) {
+      console.log('[建Bot] 重建请求异常:', e.message);
+      return false;
+    }
+    if (!iid2) { console.log('BOT=FAIL|重建未拿到实例id（可能配额满）'); return false; }
+    // 轮询重建实例
+    for (let j = 0; j < 20 && !/active|running/i.test(status2); j++) {
+      await sleep(3000);
+      try {
+        const r3 = await httpsReq('GET', '/v1/instances');
+        const its3 = pickArray(unwrapData(r3.json), ['items', 'instances']) || [];
+        const hit3 = its3.find((x) => (x.instance_id || x.id) === iid2);
+        if (hit3 && hit3.status) status2 = String(hit3.status);
+      } catch (e) { /* 忽略单次查询失败 */ }
+    }
+    CFG.instanceId = iid2;
+    console.log('[建Bot] 重建实例=' + iid2 + ' 最终状态=' + status2 + ' 名称=' + nm);
+    console.log('BOT=' + iid2 + '|status=' + (status2 || 'unknown') + '|name=' + nm + '|rebuilt=1');
+    if (/failed/i.test(status2)) { console.log('BOT=FAIL|重建实例仍为 Failed（绑定可能未生效，下一轮重跑会再建）'); return false; }
+    return /active|running|creating|pending/i.test(status2) || !!iid2;
+  }
+
   return /active|running|creating|pending/i.test(status) || !!iid;
 }
 
