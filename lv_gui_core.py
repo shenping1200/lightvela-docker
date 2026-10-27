@@ -645,6 +645,59 @@ def load_tokens():
         return {}
 
 
+# ---------------- 数据中心（凭证中心）对接 2026-10-27 ----------------
+# 规则（老大定）：先问中心（查全量，不分机器，可跨机复用）→ 连不上/查不到再查本地 → 都没有按新号走
+CENTER_BASE = os.environ.get("LIGHTVELA_CENTER", "http://43.167.192.48:18090")
+CENTER_TOKEN = os.environ.get("LIGHTVELA_CENTER_TOKEN", "lvc-9f3a7d2e6b1c4a85")
+CENTER_TIMEOUT = float(os.environ.get("LIGHTVELA_CENTER_TIMEOUT", "6"))
+
+
+def center_machine_id():
+    """本机标识：环境变量 → 数据目录下 machine-id → 空字符串"""
+    v = (os.environ.get("LIGHTVELA_MACHINE_ID") or "").strip()
+    if v:
+        return v
+    try:
+        p = os.path.join(os.path.dirname(token_path()), "machine-id")
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def center_get_token(username):
+    """按用户名问数据中心要令牌。连不上/查不到都返回 None，调用方自行回退本地/登录。"""
+    if not username:
+        return None
+    try:
+        r = requests.get(CENTER_BASE + "/creds/lookup",
+                         params={"platform": "intl", "username": username},
+                         headers={"X-Auth-Token": CENTER_TOKEN}, timeout=CENTER_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        d = r.json() or {}
+        for c in (d.get("creds") or []):
+            if c.get("token"):
+                return c["token"]
+        return None
+    except Exception:
+        return None
+
+
+def center_push_token(username, token):
+    """把令牌推到数据中心（失败只返回 False，本地已存，不影响任务）"""
+    if not (username and token):
+        return False
+    try:
+        r = requests.post(CENTER_BASE + "/creds",
+                          json={"platform": "intl", "account_key": username, "token": token,
+                                "owner": center_machine_id() or None},
+                          headers={"X-Auth-Token": CENTER_TOKEN}, timeout=CENTER_TIMEOUT)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def merge_tokens(local, incoming):
     """合并两份凭证。同一账号【时间新的赢】（老大选的"甲"规则）。
     返回 (merged, added, updated)。"""
@@ -707,11 +760,130 @@ def fetch_bundles(proxy_url, token=None):
 
 
 def bundle_state(proxy_url, bundle_id=DEFAULT_BUNDLE, token=None):
-    """返回目标包的 bundle_sales_state（'AVAILABLE'/'SOLD_OUT'/...），取不到返回 None。"""
+    """返回目标包的 bundle_sales_state（'AVAILABLE'/'SOLD_OUT'/...），取不到返回 None。
+
+    ★ 必须带令牌！不带令牌平台直接回 401，返回空列表 → 状态恒为 None。
+      2026-10-27 前的老代码所有调用点都没传令牌，导致「售罄降级」和「放货监控」
+      两条逻辑的判断条件永远不成立（等于从未生效）。
+    """
     for b in fetch_bundles(proxy_url, token):
         if b.get("bundle_id") == bundle_id:
             return b.get("bundle_sales_state")
     return None
+
+
+# ---------------- Telegram 推送 2026-10-27 ----------------
+TG_CONFIG_FILE = "lv-tg.json"
+
+
+def tg_config_path():
+    """机器人配置文件位置：优先数据目录（Docker 挂载盘 /data），否则程序目录。"""
+    d = os.environ.get("LV_DATA_DIR") or app_dir()
+    return os.path.join(d, TG_CONFIG_FILE)
+
+
+def load_tg_config():
+    """读机器人配置：{token, chat_id, enabled}。文件不存在/损坏一律返回空配置，不抛异常。"""
+    cfg = {"token": "", "chat_id": "", "enabled": True}
+    p = tg_config_path()
+    if not os.path.isfile(p):
+        return cfg
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+        if isinstance(d, dict):
+            for k in ("token", "chat_id"):
+                if d.get(k):
+                    cfg[k] = str(d[k]).strip()
+            if "enabled" in d:
+                cfg["enabled"] = bool(d["enabled"])
+    except Exception:
+        pass
+    return cfg
+
+
+def save_tg_config(token, chat_id, enabled=True):
+    """保存机器人配置。返回 (ok, 路径 或 错误说明)。"""
+    p = tg_config_path()
+    try:
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"token": (token or "").strip(),
+                       "chat_id": (chat_id or "").strip(),
+                       "enabled": bool(enabled)}, f, ensure_ascii=False, indent=2)
+        return True, p
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def tg_send(text, token=None, chat_id=None, proxy_url=None):
+    """给 Telegram 机器人发一条消息，返回 (ok, 说明)。
+
+    ★ 三重保险，绝不影响抢单/监控主流程：
+      1) 没配令牌或会话ID → 直接返回失败，不发请求；
+      2) 先直连；直连不通且给了代理 → 再用代理试一次（海外机器直连 api.telegram.org 一般通，
+         国内机器多半不通，所以留了代理兜底）；
+      3) 任何异常全部吞掉，只把原因返回给调用方写日志。
+    """
+    cfg = load_tg_config()
+    if not cfg.get("enabled", True):
+        return False, "推送开关已关闭"
+    token = (token or cfg.get("token") or "").strip()
+    chat_id = (chat_id or cfg.get("chat_id") or "").strip()
+    if not token or not chat_id:
+        return False, "未配置机器人令牌或会话ID"
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    body = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": "true"}
+    last = ""
+    tries = [(False, None)]
+    if proxy_url:
+        tries.append((True, proxy_url))
+    for use_proxy, px in tries:
+        s = requests.Session()
+        s.trust_env = False
+        if use_proxy:
+            s.proxies = {"http": px, "https": px}
+        try:
+            r = s.post(url, data=body, timeout=15)
+        except Exception as e:
+            last = ("经代理" if use_proxy else "直连") + "异常：" + str(e)[:120]
+            continue
+        if r.status_code == 200:
+            return True, "已发送" + ("（经代理）" if use_proxy else "（直连）")
+        last = ("经代理" if use_proxy else "直连") + "HTTP %s %s" % (r.status_code, (r.text or "")[:120])
+    return False, last or "发送失败"
+
+
+def build_available_text(bundle, bundle_fallback, st_p, st_f,
+                         accounts_n=0, auto_rush=False, seq=None, test=False):
+    """生成「放货了」的推送文案。
+
+    ★ 真实放货推送 与 面板上的测试推送 共用这一个函数，保证两条消息长得一模一样
+      （老大要求：点测试就能看到真放货时的样子）。
+    """
+    lines = ["<b>🎯 LightVela 放货了</b>" + (("（第 %d 条）" % seq) if seq else "")]
+    if st_p == "AVAILABLE":
+        lines.append("✅ 主套餐 <b>%s</b>（4500 积分）现在可买" % bundle)
+    if bundle_fallback and st_f == "AVAILABLE":
+        lines.append("✅ 降级套餐 <b>%s</b>（100 积分）现在可买" % bundle_fallback)
+    if st_p and st_p != "AVAILABLE":
+        lines.append("· 主套餐 %s：%s" % (bundle, st_p))
+    if bundle_fallback and st_f and st_f != "AVAILABLE":
+        lines.append("· 降级套餐 %s：%s" % (bundle_fallback, st_f))
+    lines.append("")
+    lines.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    mid = center_machine_id()
+    if mid:
+        lines.append("机器：%s" % mid)
+    if accounts_n:
+        lines.append("待跑账号：%d 个" % accounts_n)
+    lines.append("自动开抢：%s" % ("已开启" if auto_rush else "未开启（请自己点开始）"))
+    if test:
+        lines.append("")
+        lines.append("<i>—— 以上是测试推送，真实放货时发的就是这条 ——</i>")
+    return "\n".join(lines)
 
 
 # ---------------- 任务 ----------------
@@ -719,7 +891,7 @@ class Job(object):
     def __init__(self, accounts, proxy, mode, interval=1.0, duration=300.0,
                  use_saved=False, bundle=DEFAULT_BUNDLE, bundle_fallback=None, parallel=1,
                  flow_rush=True, bot_prefix="agent", bot_retry=3, deploy_retry=3,
-                 skip_verify=False):
+                 skip_verify=False, rush_limit=20):
         self.accounts = accounts
         self.proxy = proxy
         self.mode = mode if mode in MODES else "check"
@@ -729,6 +901,9 @@ class Job(object):
         self.bundle = bundle or DEFAULT_BUNDLE
         self.bundle_fallback = bundle_fallback    # 降级套餐（主套餐售罄时改订）
         self.parallel = max(1, int(parallel or 1))
+        # ★ 2026-10-27 新增：每档套餐最多发多少单。主套餐发满就切降级套餐，
+        #   降级套餐再发满就判失败（老大定的规则：4500 抢 20 次不成 → 切 100 → 再 20 次不成 → 失败）
+        self.rush_limit = max(1, int(rush_limit or 20))
         # 监控批次专用开关
         self.abort_if_soldout = False   # 一旦售罄立即终止后续账号
         self.saved_fallback = True      # use_saved 但缺令牌时退回登录并保存令牌（而非失败）
@@ -759,11 +934,37 @@ class Job(object):
         self.summary = ""
 
     # --- 上报 ---
+    def _log_file(self):
+        """日志文件句柄（懒加载，只尝试一次）。
+        ★ 2026-10-27 新增：原来日志只存内存 self.logs，容器一重启全丢、出问题没法复盘。
+        现在同时按天写 /data/lv-run-YYYYMMDD.log；任何异常都不影响主流程。"""
+        if getattr(self, "_log_tried", False):
+            return getattr(self, "_log_fh", None)
+        self._log_tried = True
+        self._log_fh = None
+        try:
+            d = os.environ.get("LV_DATA_DIR") or app_dir()
+            p = os.path.join(d, "lv-run-%s.log" % time.strftime("%Y%m%d"))
+            self._log_fh = open(p, "a", encoding="utf-8")
+            self._log_path = p
+        except Exception:
+            self._log_fh = None
+            self._log_path = ""
+        return self._log_fh
+
     def log(self, msg):
+        line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
         with self.lock:
-            self.logs.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+            self.logs.append(line)
             if len(self.logs) > 4000:
                 del self.logs[:1500]
+            fp = self._log_file()
+            if fp is not None:
+                try:
+                    fp.write(line + "\n")
+                    fp.flush()
+                except Exception:
+                    pass
 
     def row(self, idx, **kw):
         with self.lock:
@@ -810,6 +1011,11 @@ class Job(object):
             token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
                                    log=lambda m: self.log(tag + m))
         self.tokens[name] = token
+        # ★ 同步到数据中心（跨机复用；失败不影响本次）
+        if center_push_token(name, token):
+            self.log(tag + " ☁ 令牌已同步到数据中心")
+        else:
+            self.log(tag + " ⚠ 数据中心同步失败（本地已存，不影响本次）")
         self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
         self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
         return token
@@ -835,14 +1041,20 @@ class Job(object):
                 token = self.tokens.get(name) or self.tokens.get(acc.get("email", "")) or ""
                 if token:
                     self.log(tag + " 复用已存令牌，跳过登录")
-                elif self.saved_fallback:
-                    # 复用模式但本账号没令牌 → 退回正常登录并保存，下次直接复用
-                    self.log(tag + " 复用模式缺令牌，退回登录并保存 ...")
-                    token = self._do_login(idx, tag, acc, px, name)
                 else:
-                    self.row(idx, stage="失败", detail="无已存令牌", ok=False)
-                    self.log(tag + " ❌ 没有已存令牌（请先跑一次预登录）")
-                    return
+                    # ★ 本地没有 → 问数据中心（查全量，不分机器，可跨机复用）
+                    token = center_get_token(name) or ""
+                    if token:
+                        self.tokens[name] = token
+                        self.log(tag + " ☁ 从数据中心取到令牌，跳过登录")
+                    elif self.saved_fallback:
+                        # 复用模式但本地和数据中心都没有 → 退回正常登录并保存（当新号走）
+                        self.log(tag + " 本地/数据中心都没有令牌，退回登录并保存 ...")
+                        token = self._do_login(idx, tag, acc, px, name)
+                    else:
+                        self.row(idx, stage="失败", detail="无已存令牌", ok=False)
+                        self.log(tag + " ❌ 本地和数据中心都没有令牌（请先跑一次预登录）")
+                        return
             else:
                 token = self._do_login(idx, tag, acc, px, name)
 
@@ -877,7 +1089,7 @@ class Job(object):
 
             # ---- 抢单（rush 模式；或全流程里勾了「先抢订阅」）----
             if self.mode == "rush" or (self.mode == "fullflow" and self.flow_rush):
-                if not self._rush(idx, tag, s, has_pass):
+                if not self._rush(idx, tag, s, has_pass, token):
                     return
             elif self.mode == "fullflow" and not has_pass:
                 self.row(idx, stage="失败", detail="没有订阅且未开启抢单", ok=False, result="no_pass")
@@ -898,39 +1110,47 @@ class Job(object):
             self.row(idx, stage="失败", detail=detail, ok=False, result=result)
 
     # --- 订阅策略辅助：主套餐 + 降级套餐 ---
-    def _primary_unavailable(self):
-        """主套餐是否真的不可买：主套餐售罄，且无降级套餐可用（或降级也售罄）。
-        有降级套餐且降级可买时返回 False（应继续走降级，不应整批跳过）。"""
-        if bundle_state(self.proxy, self.bundle) != "SOLD_OUT":
-            return False
-        if not self.bundle_fallback:
-            return True
-        return bundle_state(self.proxy, self.bundle_fallback) == "SOLD_OUT"
-
-    def _choose_bundle(self):
-        """按策略选本次下单的套餐：主套餐售罄且降级确实可买 → 走降级；否则走主套餐。"""
-        if self.bundle_fallback \
-           and bundle_state(self.proxy, self.bundle) == "SOLD_OUT" \
-           and bundle_state(self.proxy, self.bundle_fallback) != "SOLD_OUT":
+    def _stage_bundle(self, stage):
+        """按档位取套餐 ID：0=主套餐，1=降级套餐（没配降级套餐时恒为主套餐）。"""
+        if stage == 1 and self.bundle_fallback:
             return self.bundle_fallback
         return self.bundle
 
-    def _attempt_order(self, s, tag):
-        """下单（带降级）。返回 (st, code, msg, used_bundle)。"""
-        used = self._choose_bundle()
-        if used != self.bundle:
-            self.log(tag + " 主套餐 %s 售罄，降级下单 %s ..." % (self.bundle, used))
+    def _has_next_stage(self, stage):
+        """当前档位还有没有下一档可切。"""
+        return bool(self.bundle_fallback) and stage == 0
+
+    def _primary_unavailable(self, token=None):
+        """主套餐是否真的不可买：主套餐售罄，且无降级套餐可用（或降级也售罄）。
+        有降级套餐且降级可买时返回 False（应继续走降级，不应整批跳过）。
+
+        ★ 2026-10-27 修复：查询必须带令牌，否则平台回 401、状态恒为空、本函数恒为 False。"""
+        if bundle_state(self.proxy, self.bundle, token) != "SOLD_OUT":
+            return False
+        if not self.bundle_fallback:
+            return True
+        return bundle_state(self.proxy, self.bundle_fallback, token) == "SOLD_OUT"
+
+    def _attempt_order(self, s, tag, stage=0):
+        """按档位下单（降级不再靠查状态判断，纯按"发满多少单"切换，更可靠）。
+        返回 (st, code, msg, used_bundle)。"""
+        used = self._stage_bundle(stage)
         st, code, msg = order(s, used)
         return st, code, msg, used
 
-    def _rush(self, idx, tag, s, has_pass):
+    def _rush(self, idx, tag, s, has_pass, token=None):
         """抢 0 元订阅。已有订阅直接算成功。返回 True = 有订阅可用。
 
-        ★ 仿浏览器真实行为：下单只发一次 → 然后耐心轮询等生效；确认没抢到才发下一单。
-          老版把"下单"和"等生效"揉进一个急循环（每次下单只等 0.8s 就查，未生效立刻重发），
-          而 pass 正常要数秒才 provision 到 /v1/passes，于是几乎必然误判"未生效"、
-          每 ~1.8s 重复下单：要么顶掉/重置 pending 订单，要么触发服务端频控，
-          导致本来一单能成的事要抢很多发才中一次。拆成两阶段后：
+        ★ 2026-10-27 改造（老大定的规则）：
+          主套餐连发 20 次抢不到 → 自动切降级套餐 → 降级套餐再发 20 次抢不到 → 判失败。
+          · 次数口径：只有「真正没抢到」才计次 —— 下单被拒（售罄/无货）、或下单成功但
+            等不到订阅生效，都算一次。
+          · 「平台影子计费账户还没开通」(409) 和「影子账户绑定待开通」(403) 这两类
+            **临时性错误不计次**：抓包实测首次下单到成功要约 178 秒、连点 16 次才成，
+            若计次会在账户还没开好时就误切降级套餐，反而更慢。
+          · 时间预算保留作安全网：每档各自一套 300 秒 / 影子账户 600 秒预算，切档时重置。
+
+        ★ 下单策略仍是两阶段（沿用老逻辑，别改回去）：
             A. 发一单（200=已下单/待生效；非200=没抢到，隔 interval 再试；401=凭证死）
             B. 下单成功后只轮询 live_passes 不重发，递增等待(2s→…→8s)最多 PATIENCE 秒，
                生效即成功；超窗口仍未生效才回 A 重发下一单。
@@ -943,34 +1163,65 @@ class Job(object):
         SHADOW_BUDGET = 600.0    # 这类 409 的专用总预算秒数
         SHADOW_BINDING_MAX = 5        # 影子账户绑定 403 最多退避重试次数（绑定按会话首次自动开通，几秒即成）
         SHADOW_BINDING_BACKOFF = 15.0  # 每次重试前退避秒数（给平台自动开通留时间）
+        LIMIT = max(1, int(getattr(self, "rush_limit", 20) or 20))   # 每档最多发多少单
         if has_pass:
             return True
         # 监控批次：开抢前先确认还有货，没货立即终止后续账号（避免空耗请求）
         if self.abort_if_soldout:
-            if self._primary_unavailable():
+            if self._primary_unavailable(token):
                 self.log(tag + " 🛑 放开后又售罄，终止本账号")
                 self._mark_soldout_skip(idx)
                 return False
         self.row(idx, stage="抢单中", detail="")
-        self.log(tag + " 开始抢单（间隔 %ss，最长 %ss；影子账户专用最长 %ss）..."
-                 % (self.interval, self.duration, SHADOW_BUDGET))
+        self.log(tag + " 开始抢单（每档最多 %d 发；间隔 %ss；影子账户专用最长 %ss）..."
+                 % (LIMIT, self.interval, SHADOW_BUDGET))
+        if self.bundle_fallback:
+            self.log(tag + " 订阅策略：优先 %s，发满 %d 发未成自动改抢 %s，再发满 %d 发未成判失败"
+                     % (self.bundle, LIMIT, self.bundle_fallback, LIMIT))
+        stage = 0            # 0=主套餐，1=降级套餐
+        used_n = 0           # 当前档已"真正没抢到"的次数
+        n = 0                # 总发单次数（含临时错误，仅用于日志）
+        self._shadow_bind_retry = 0   # 影子账户绑定 403 重试计数（每次抢单重置）
         deadline = time.time() + self.duration
         # ★ 影子计费账户开通专用预算：只有在全程【只】出现 409 影子账户这一类错误时才生效。
         #   一旦出现售罄/401/网络异常等其它错误，立刻退回原 duration，避免真失败时空转。
-        #   （全流程模式下新账号登录已耗 20~30 秒，300 秒默认预算余量太小，实测撑不过。）
         shadow_deadline = time.time() + max(self.duration, SHADOW_BUDGET)
         only_shadow = True
-        n = 0
-        self._shadow_bind_retry = 0   # 影子账户绑定 403 重试计数（每次抢单重置）
+
+        def _next_stage(reason):
+            """切到降级套餐；没有降级套餐可切时返回 False。"""
+            nonlocal stage, used_n, deadline, shadow_deadline, only_shadow
+            if not self._has_next_stage(stage):
+                return False
+            done = used_n
+            stage = 1
+            used_n = 0
+            only_shadow = True
+            self._shadow_bind_retry = 0   # 换套餐后重新给满绑定重试次数
+            deadline = time.time() + self.duration
+            shadow_deadline = time.time() + max(self.duration, SHADOW_BUDGET)
+            self.log(tag + " 🔄 %s：主套餐 %s 已发 %d 发未成 → 自动改抢降级套餐 %s"
+                     % (reason, self.bundle, done, self._stage_bundle(1)))
+            self.row(idx, stage="抢单中", detail="改抢降级套餐 %s" % self._stage_bundle(1))
+            return True
+
+        def _give_up():
+            self.log(tag + " ❌ 已发 %d 发（含降级套餐）仍未抢到，判定失败" % n)
+            self.row(idx, stage="失败", detail="已发 %d 发未抢到（含降级套餐）" % n,
+                     ok=False, result="rush_failed")
+            return False
+
         while True:
             if self._stopped():
                 break
             if time.time() >= (shadow_deadline if only_shadow else deadline):
+                if _next_stage("本档时间用完"):
+                    continue
                 break
-            # ---- A. 发一单（含降级策略）----
+            # ---- A. 发一单（按当前档位）----
             n += 1
             try:
-                st, code, msg, used = self._attempt_order(s, tag)
+                st, code, msg, used = self._attempt_order(s, tag, stage)
             except Exception as e:
                 only_shadow = False   # 网络异常不算「只是影子账户没开好」，退回原预算
                 if n == 1 or n % 10 == 0:
@@ -981,23 +1232,36 @@ class Job(object):
                 self.log(tag + " ❌ 凭证失效(401)")
                 self.row(idx, stage="失败", detail="凭证失效(401)", ok=False, result="error")
                 return False
-            if not (200 <= st < 300):
-                # 监控批次：下单失败且已回售罄（含降级也不可用）→ 立即终止后续账号
-                if self.abort_if_soldout and self._primary_unavailable():
-                    self.log(tag + " 🛑 下单失败且已售罄，终止本账号")
-                    self._mark_soldout_skip(idx)
+
+            # ---- 临时性错误（不计次）----
+            if not (200 <= st < 300) and code == SHADOW_CODE:
+                # 平台侧影子计费账户还没开好 → 退避久一点再试，别 1 秒猛发
+                back = SHADOW_BACKOFF + random.uniform(0, 1.5)
+                if n == 1 or n % 5 == 0:
+                    self.log(tag + " 第 %d 发影子计费账户未就绪（409），%.1fs 后再试（不计次）" % (n, back))
+                self.row(idx, stage="抢单中", detail="影子账户开通中｜已发 %d 次" % n)
+                time.sleep(back)
+                continue
+            if not (200 <= st < 300) and "SHADOW_BINDING" in str(code or ""):
+                # 403 PASS_SHADOW_BINDING_REQUIRED：绑定按【登录会话首次自动开通】（仅数秒），
+                # 复用同一令牌再跑一次即过 —— 故不立即判死，退避重试等平台自动开通。
+                if self._shadow_bind_retry >= SHADOW_BINDING_MAX:
+                    self.log(tag + " ❌ 影子账户已重试 %d 次仍提示需绑定（%s）——可能真未开通"
+                             % (self._shadow_bind_retry, code or msg))
+                    self.row(idx, stage="失败", detail="影子账户重试超限", ok=False,
+                             result="shadow_binding_required")
                     return False
-                if code == SHADOW_CODE:
-                    # 平台侧影子计费账户还没开好 → 退避久一点再试，别 1 秒猛发
-                    back = SHADOW_BACKOFF + random.uniform(0, 1.5)
-                    if n == 1 or n % 5 == 0:
-                        self.log(tag + " 第 %d 发影子计费账户未就绪（409），%.1fs 后再试" % (n, back))
-                    self.row(idx, stage="抢单中", detail="影子账户开通中｜已发 %d 次" % n)
-                    time.sleep(back)
-                    continue
-                # ★ 非临时错误：pass 已存在 → 复查一次即判（不再白烧预算）。
-                #   影子账户绑定(403) 不在此列：经验证绑定按【登录会话首次自动开通】（仅数秒），
-                #   复用同一令牌再发一单即过，故改为退避重试，不立即判死。
+                self._shadow_bind_retry += 1
+                back = SHADOW_BINDING_BACKOFF + random.uniform(0, 5.0)
+                self.log(tag + " ⚠️ 首次下单触发影子账户绑定（%s），平台自动开通中，第 %d/%d 次，%.1fs 后重试（不计次）"
+                         % (code or msg, self._shadow_bind_retry, SHADOW_BINDING_MAX, back))
+                self.row(idx, stage="抢单中",
+                         detail="影子账户自动开通中(%d/%d)" % (self._shadow_bind_retry, SHADOW_BINDING_MAX))
+                time.sleep(back)
+                continue
+
+            # ---- 真正没抢到：计一次 ----
+            if not (200 <= st < 300):
                 if code == "PASS_ALREADY_EXISTS":
                     # 歧义态：可能上一轮已抢到 → 复查一次 live_passes
                     live = live_passes(s)
@@ -1008,32 +1272,25 @@ class Job(object):
                         self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="already")
                         return True
                     self.log(tag + " ❌ pass 已存在但查不到（状态冲突），停止重试")
-                    self.row(idx, stage="失败", detail="pass已存在但查不到", ok=False, result="pass_exists_conflict")
+                    self.row(idx, stage="失败", detail="pass已存在但查不到", ok=False,
+                             result="pass_exists_conflict")
                     return False
-                if "SHADOW_BINDING" in str(code or ""):
-                    # 403 PASS_SHADOW_BINDING_REQUIRED：
-                    # 经验证，绑定是按【登录会话首次自动开通】（开通仅需数秒），
-                    # 复用同一令牌再跑一次即过 —— 故不立即判死，退避重试等平台自动开通。
-                    if getattr(self, "_shadow_bind_retry", 0) >= SHADOW_BINDING_MAX:
-                        self.log(tag + " ❌ 影子账户已重试 %d 次仍提示需绑定（%s）——可能真未开通"
-                                 % (self._shadow_bind_retry, code or msg))
-                        self.row(idx, stage="失败", detail="影子账户重试超限", ok=False, result="shadow_binding_required")
-                        return False
-                    self._shadow_bind_retry = getattr(self, "_shadow_bind_retry", 0) + 1
-                    back = SHADOW_BINDING_BACKOFF + random.uniform(0, 5.0)
-                    self.log(tag + " ⚠️ 首次下单触发影子账户绑定（%s），平台自动开通中，第 %d/%d 次，%.1fs 后重试"
-                             % (code or msg, self._shadow_bind_retry, SHADOW_BINDING_MAX, back))
-                    self.row(idx, stage="抢单中", detail="影子账户自动开通中(%d/%d)" % (self._shadow_bind_retry, SHADOW_BINDING_MAX))
-                    time.sleep(back)
-                    continue
                 only_shadow = False   # 其它错误 → 退回原预算
-                if n == 1 or n % 10 == 0:
-                    self.log(tag + " 第 %d 发未中：%s %s" % (n, st, code or msg))
-                self.row(idx, stage="抢单中", detail="已发 %d 次｜%s" % (n, code or msg))
+                used_n += 1
+                if used_n == 1 or used_n % 5 == 0 or used_n >= LIMIT:
+                    self.log(tag + " 第 %d 发未中（本档 %d/%d）：%s %s"
+                             % (n, used_n, LIMIT, st, code or msg))
+                self.row(idx, stage="抢单中",
+                         detail="%s 已发 %d/%d｜%s" % (used, used_n, LIMIT, code or msg))
+                if used_n >= LIMIT:
+                    if _next_stage("本档发满 %d 发" % LIMIT):
+                        continue
+                    return _give_up()
                 time.sleep(self.interval)
                 continue
+
             # ---- B. 下单成功 → 耐心等生效（只轮询，不重发订单）----
-            self.log(tag + " 第 %d 发下单成功，等待生效 ..." % n)
+            self.log(tag + " 第 %d 发下单成功（%s），等待生效 ..." % (n, used))
             self.row(idx, stage="抢单中", detail="第 %d 发已下单，等待生效" % n)
             waited = 0.0
             step = 2.0
@@ -1049,10 +1306,20 @@ class Job(object):
                     self.row(idx, stage="已抢到", detail="%s %s" % (bid, pid), ok=True, result="grabbed")
                     return True
                 step = min(step + 1.0, 8.0)
-            if self._stopped() or time.time() >= (shadow_deadline if only_shadow else deadline):
+            if self._stopped():
                 break
-            # 耐心窗口耗尽仍未生效 → 这一单没成，回 A 重发下一单
-            self.log(tag + " 第 %d 发等待 %.0fs 仍未生效，重发下一单 ..." % (n, waited))
+            if time.time() >= (shadow_deadline if only_shadow else deadline):
+                if _next_stage("本档时间用完"):
+                    continue
+                break
+            # 耐心窗口耗尽仍未生效 → 这一单没成，计一次
+            used_n += 1
+            self.log(tag + " 第 %d 发等待 %.0fs 仍未生效（本档 %d/%d），重发下一单 ..."
+                     % (n, waited, used_n, LIMIT))
+            if used_n >= LIMIT:
+                if _next_stage("本档发满 %d 发" % LIMIT):
+                    continue
+                return _give_up()
             time.sleep(self.interval)
         if self._stopped():
             self.row(idx, stage="已停止", detail="用户停止", ok=False, result="stopped")
@@ -1180,6 +1447,8 @@ class Job(object):
         self.started_at = time.time()
         self.log("===== 开始 | 账号 %d 个 | 模式 %s | 代理 %s ====="
                  % (len(self.accounts), MODE_LABEL.get(self.mode, self.mode), self.proxy or "（直连）"))
+        if getattr(self, "_log_path", ""):
+            self.log("本次日志文件: %s" % self._log_path)
         try:
             if self.parallel > 1 and len(self.accounts) > 1:
                 from concurrent.futures import ThreadPoolExecutor
@@ -1198,6 +1467,14 @@ class Job(object):
             self.summary = "完成：%d/%d 成功（耗时 %.0fs）" % (ok, len(self.rows), time.time() - self.started_at)
             self.done = True
             self.log("===== " + self.summary + " =====")
+            # 关掉日志文件句柄（webapp 是常驻进程，不关会累积）
+            try:
+                if getattr(self, "_log_fh", None) is not None:
+                    self._log_fh.close()
+                    self._log_fh = None
+                    self._log_tried = False
+            except Exception:
+                pass
 
     def save_tokens(self):
         try:
@@ -1247,7 +1524,8 @@ class Monitor(object):
     """
 
     def __init__(self, accounts, proxy, interval_sec, parallel, api,
-                 bundle=DEFAULT_BUNDLE, bundle_fallback=None):
+                 bundle=DEFAULT_BUNDLE, bundle_fallback=None,
+                 auto_rush=False, tg_enabled=True, use_saved=False):
         self.accounts = accounts
         self.proxy = proxy
         self.interval = max(1, int(interval_sec or 5))
@@ -1255,6 +1533,22 @@ class Monitor(object):
         self.api = api                      # 引用 Api，便于把批次挂到 api.job 供 UI 显示
         self.bundle = bundle                # 主套餐
         self.bundle_fallback = bundle_fallback    # 降级套餐（主套餐售罄时改订）
+        # ★ 2026-10-27 新增：发现可买时是否自动开抢。老大选「只推 TG，不自动开抢」
+        self.auto_rush = bool(auto_rush)
+        # ★ 2026-10-27 新增：复用已存令牌（老大要求：监控首号检测 + 监控触发的批量都要生效）
+        #   勾了就先去本地令牌库/数据中心找，找到且没失效就直接用，不重复登录。
+        self.use_saved = bool(use_saved)
+        self.local_tokens = {}              # 本次监控里已知可用的令牌（首号拿到后直接喂给批次）
+        self.first_token_name = ""          # 首号在令牌库里的键名
+        self.tg_enabled = bool(tg_enabled)  # 是否发 TG 推送
+        self.tg_state = None                # 最近一次已知状态（AVAILABLE / SOLD_OUT）
+        self.tg_last_result = ""            # 最近一次推送结果（UI 上显示）
+        # ★ 2026-10-27 改：可买就每 5 秒推一次，直到点「停止推送」
+        self.push_interval = 5.0            # 推送间隔（秒）
+        self.push_stopped = False           # 老大点了「停止推送」→ 只停推送，不停监控
+        self.last_push_at = 0.0             # 上次推送时刻
+        self.push_count = 0                 # 本轮已推多少条
+        self.last_avail = None              # (st_p, st_f)：最近一次确认可买的状态；None=当前不可买
         self.lock = threading.Lock()
         self.logs = []
         self.stop_flag = False
@@ -1264,6 +1558,63 @@ class Monitor(object):
         self.last_check = 0.0
         self.summary = ""
         self.first_token = ""
+
+    # --- 推送 ---
+    def _notify(self, text):
+        """发一条 TG 推送。未配置/失败都只写日志，绝不影响监控主流程。"""
+        if not self.tg_enabled:
+            return False
+        ok, info = tg_send(text, proxy_url=self.proxy)
+        self.tg_last_result = ("成功：" if ok else "失败：") + info
+        self.log(("📨 TG 推送" + ("成功" if ok else "失败")) + "：" + info)
+        return ok
+
+    def stop_push(self):
+        """老大点「停止推送」→ 只停推送，监控继续轮询。"""
+        self.push_stopped = True
+        self.log("🔕 已停止推送（监控仍在轮询，只是不再发 TG；已推 %d 条）" % self.push_count)
+
+    def _maybe_push(self):
+        """只要最近一次查到「任一套餐可买」，就按 push_interval（默认 5 秒）持续推送，
+        直到点「停止推送」或状态变回售罄。"""
+        if self.push_stopped or not self.tg_enabled or not self.last_avail:
+            return False
+        now = time.time()
+        if now - self.last_push_at < self.push_interval:
+            return False
+        self.last_push_at = now
+        self.push_count += 1
+        st_p, st_f = self.last_avail
+        ok = self._notify(build_available_text(
+            self.bundle, self.bundle_fallback, st_p, st_f,
+            accounts_n=len(self.accounts), auto_rush=self.auto_rush,
+            seq=self.push_count))
+        # ★ Telegram 限流（429）：退避 60 秒再试，别把「5 秒一条」打成失败死循环
+        if not ok and "429" in (self.tg_last_result or ""):
+            self.last_push_at = time.time() + 60
+            self.log("⏳ TG 限流（429），暂停推送 60 秒后再试")
+        return ok
+
+    def _notify_available(self, st_p, st_f):
+        """立即推一条（真实格式）。"""
+        return self._notify(build_available_text(
+            self.bundle, self.bundle_fallback, st_p, st_f,
+            accounts_n=len(self.accounts), auto_rush=self.auto_rush))
+
+    def _notify_soldout(self, st_p, st_f):
+        """从"可买"退回"售罄" → 推一条，避免你以为还能抢。"""
+        lines = ["<b>⛔ LightVela 又售罄了（已停止推送）</b>"]
+        if st_p:
+            lines.append("· 主套餐 %s：%s" % (self.bundle, st_p))
+        if self.bundle_fallback and st_f:
+            lines.append("· 降级套餐 %s：%s" % (self.bundle_fallback, st_f))
+        lines.append("")
+        lines.append("时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        mid = center_machine_id()
+        if mid:
+            lines.append("机器：%s" % mid)
+        lines.append("本轮共推送 %d 条" % self.push_count)
+        self._notify("\n".join(lines))
 
     # --- 日志（与 Job 同款）---
     def log(self, msg):
@@ -1286,14 +1637,71 @@ class Monitor(object):
         return self.stop_flag
 
     # --- 阶段 1：首号登录检测 ---
+    def _save_one_token(self, name, token):
+        """把一个令牌写进本地令牌库（合并旧内容，不覆盖别人）。失败不影响监控。"""
+        try:
+            p = token_path()
+            old = {}
+            if os.path.isfile(p):
+                try:
+                    raw = json.load(open(p, encoding="utf-8"))
+                    old = raw if isinstance(raw, dict) else {}
+                except Exception:
+                    old = {}
+            old[name] = {"token": token, "ts": int(time.time())}
+            write_tokens(old)
+            return True
+        except Exception as e:
+            self.log("⚠ 存令牌失败：%s" % e)
+            return False
+
+    def _find_saved_token(self, acc, name):
+        """按「本地令牌库 → 数据中心」顺序找一个已存令牌。
+        返回 (token, 来源说明)；都没有返回 ("", "")。"""
+        try:
+            local = load_tokens()
+        except Exception:
+            local = {}
+        t = local.get(name) or local.get(acc.get("email", "")) or ""
+        if t:
+            return t, "本地令牌库"
+        # 本地没有 → 问数据中心（查全量、不分机器，可跨机复用）
+        try:
+            t = center_get_token(name) or ""
+        except Exception:
+            t = ""
+        if t:
+            return t, "数据中心"
+        return "", ""
+
     def _detect_first(self):
         acc = self.accounts[0]
-        tag = "[监控·首号] %s" % (acc.get("login") or acc.get("email") or "#1")
+        name = acc.get("login") or acc.get("email") or "#1"
+        tag = "[监控·首号] %s" % name
         if not acc["ok"]:
             self.log(tag + " ❌ 第一个账号格式错误：" + acc.get("err", ""))
             return False
-        self.log(tag + " 启动检测：开始授权登录 ...")
         px = proxy_of(acc, self.proxy)
+
+        # ★ 2026-10-27 新增：勾了「复用已存令牌」→ 先找令牌，找到且没失效就直接用，不登录
+        if self.use_saved:
+            token, src = self._find_saved_token(acc, name)
+            if token:
+                self.log(tag + " 🔑 复用已存令牌（来自%s），跳过登录" % src)
+                s = api_session(token, px)
+                state, have = probe_token(s)
+                if state != "dead":
+                    self.log(tag + " ✅ 令牌可用（订阅状态=%s），无需重新登录"
+                             % (state or "unknown"))
+                    self.first_token = token
+                    self.first_token_name = name
+                    self.local_tokens[name] = token
+                    return True
+                self.log(tag + " ⚠ 已存令牌已失效（401/403），改走重新登录 ...")
+            else:
+                self.log(tag + " 本地和数据中心都没有令牌，按方案甲退回登录（登录后自动保存）")
+
+        self.log(tag + " 启动检测：开始授权登录 ...")
         t0 = time.time()
         try:
             if acc.get("provider") == "google":
@@ -1317,12 +1725,24 @@ class Monitor(object):
             return False
         self.log(tag + " ✅ 凭证可用（订阅状态=%s）" % (state or "unknown"))
         self.first_token = token
+        self.first_token_name = name
+        # ★ 2026-10-27 新增：复用模式下，刚登录到的令牌要存下来，下次监控就不用再登了
+        if self.use_saved:
+            self.local_tokens[name] = token
+            if self._save_one_token(name, token):
+                self.log(tag + " 💾 令牌已存本地（下次监控可直接复用）")
+            try:
+                if center_push_token(name, token):
+                    self.log(tag + " ☁ 令牌已上报数据中心（其他机器也能复用）")
+            except Exception:
+                pass
         return True
 
     # --- 主循环 ---
     def run(self):
-        self.log("===== 监控启动 | 账号 %d 个 | 间隔 %ds | 并发 %d | 目标 %s ====="
-                 % (len(self.accounts), self.interval, self.parallel, DEFAULT_BUNDLE))
+        self.log("===== 监控启动 | 账号 %d 个 | 间隔 %ds | 并发 %d | 目标 %s | 复用令牌 %s ====="
+                 % (len(self.accounts), self.interval, self.parallel, DEFAULT_BUNDLE,
+                    "开" if self.use_saved else "关"))
         try:
             # 阶段 1：首号检测
             self.phase = "detect"
@@ -1336,30 +1756,63 @@ class Monitor(object):
             # 阶段 2：轮询
             self.phase = "polling"
             triggered = False
+            self.saw_available = False
             while not self._stopped():
                 self.last_check = time.time()
                 # 按订阅策略判断是否有可购买的套餐：主套餐可买，或主售罄但降级可买
-                st_p = bundle_state(self.proxy, self.bundle)
-                st_f = bundle_state(self.proxy, self.bundle_fallback) if self.bundle_fallback else None
-                if st_p == "AVAILABLE":
+                # ★ 2026-10-27 修复：查询必须带首号凭证！不带令牌平台回 401，状态恒为空，
+                #   「可买」判断永远不成立 → 监控永远不会触发（老版就是这个毛病）。
+                st_p = bundle_state(self.proxy, self.bundle, self.first_token)
+                st_f = (bundle_state(self.proxy, self.bundle_fallback, self.first_token)
+                        if self.bundle_fallback else None)
+                avail = (st_p == "AVAILABLE") or bool(self.bundle_fallback and st_f == "AVAILABLE")
+                known = (st_p is not None) or bool(self.bundle_fallback and st_f is not None)
+
+                if avail:
+                    which = []
+                    if st_p == "AVAILABLE":
+                        which.append("主套餐 " + self.bundle)
+                    if self.bundle_fallback and st_f == "AVAILABLE":
+                        which.append("降级套餐 " + self.bundle_fallback)
+                    self.last_state = " + ".join(which) + " 可买"
+                    self.saw_available = True
+                    self.tg_state = "AVAILABLE"
+                    # 记住"现在可买"，让等待期间的秒级检查也能继续推
+                    self.last_avail = (st_p, st_f)
+                    self.log("🎯 轮询：" + self.last_state
+                             + ("（每 %.0f 秒推送一次，点「停止推送」才停）" % self.push_interval
+                                if not self.push_stopped else "（推送已停止）"))
+                    self._maybe_push()
+                    if self.auto_rush:
+                        triggered = True
+                        break
+                else:
+                    if known:
+                        self.last_avail = None
+                        if self.tg_state == "AVAILABLE" and not self.push_stopped:
+                            self.tg_state = "SOLD_OUT"
+                            self.log("⛔ 轮询：又售罄了 → 停止推送并告知")
+                            self._notify_soldout(st_p, st_f)
+                        elif self.tg_state is None:
+                            self.tg_state = "SOLD_OUT"
                     self.last_state = st_p
-                    self.log("🎯 轮询：%s = AVAILABLE → 触发批量抢单！" % self.bundle)
-                    triggered = True
-                    break
-                if self.bundle_fallback and st_f == "AVAILABLE":
-                    self.last_state = "%s售罄→降级%s可买" % (self.bundle, self.bundle_fallback)
-                    self.log("🎯 %s 售罄，但降级套餐 %s 可购买 → 触发批量抢单！" % (self.bundle, self.bundle_fallback))
-                    triggered = True
-                    break
-                self.last_state = st_p
-                self.log("轮询：%s = %s（降级 %s = %s）" % (self.bundle, st_p, self.bundle_fallback or '-', st_f or '-'))
-                # 可被打断地等待 interval 秒
+                    if not known:
+                        self.log("⚠ 轮询：套餐状态查不到（令牌失效或网络抖动），下一轮再试")
+                    else:
+                        self.log("轮询：%s = %s（降级 %s = %s）"
+                                 % (self.bundle, st_p, self.bundle_fallback or '-', st_f or '-'))
+                # 可被打断地等待 interval 秒；等待期间每秒检查一次是否该推
+                # （这样即使轮询间隔设成 30 秒，推送仍能保持 5 秒一条）
                 for _ in range(int(self.interval)):
                     if self._stopped():
                         break
                     time.sleep(1)
+                    self._maybe_push()
             if self._stopped() and not triggered:
-                self.summary = "监控已手动停止（尚未放货）"
+                if getattr(self, "saw_available", False):
+                    self.summary = "监控已手动停止（期间已推送放货通知，未自动开抢）"
+                else:
+                    self.summary = "监控已手动停止（尚未放货）"
                 self.log(self.summary)
                 self.done = True
                 return
@@ -1369,9 +1822,28 @@ class Monitor(object):
             self.log("===== 触发批量：对全部 %d 个导入账号并发 注册→存凭证→买0元 ====="
                      % len(self.accounts))
             job = Job(self.accounts, self.proxy, "rush",
-                      interval=1.0, duration=600.0, use_saved=False,
-                      bundle=self.bundle, bundle_fallback=self.bundle_fallback, parallel=self.parallel,
-                      abort_if_soldout=True)
+                      interval=1.0, duration=600.0, use_saved=self.use_saved,
+                      bundle=self.bundle, bundle_fallback=self.bundle_fallback, parallel=self.parallel)
+            # ★ 2026-10-27 修复旧 BUG：原来把 abort_if_soldout=True 当构造参数传，
+            #   但 Job.__init__ 根本没有这个参数 → 监控一触发自动开抢就抛
+            #   「unexpected keyword argument 'abort_if_soldout'」，批量根本跑不起来。
+            #   改成构造后赋值（Job.__init__ 里本来就初始化了这个字段）。
+            job.abort_if_soldout = True
+            # ★ 2026-10-27 新增：复用模式下把已知令牌全部预载进批次，
+            #   否则监控触发的抢单还是每个号重新登录一次（老版就是写死 use_saved=False）。
+            if self.use_saved:
+                try:
+                    job.tokens = load_tokens()
+                except Exception:
+                    job.tokens = {}
+                # 首号刚刚验过的令牌直接塞进去（连数据中心都不用问）
+                if self.first_token and self.first_token_name:
+                    job.tokens[self.first_token_name] = self.first_token
+                for _k, _v in (self.local_tokens or {}).items():
+                    if _k and _v:
+                        job.tokens[_k] = _v
+                job.log("♻ 复用已存令牌：已预载 %d 个（缺令牌的号按方案甲退回登录并保存）"
+                        % len(job.tokens))
             # 挂到 api.job，UI 的 poll() 会自动渲染表格与日志
             self.api.job = job
             threading.Thread(target=job.run, daemon=True).start()
@@ -1382,6 +1854,10 @@ class Monitor(object):
             ok = sum(1 for r in job.rows if r["ok"])
             self.summary = "放货批量完成：%d/%d 成功（监控结束）" % (ok, len(job.rows))
             self.log("===== " + self.summary + " =====")
+            # 批次结果也推一条（人在外面时最想知道这个）
+            self._notify("<b>📦 LightVela 抢单结束</b>\n成功 <b>%d</b> / %d 个账号\n时间：%s%s"
+                         % (ok, len(job.rows), time.strftime("%Y-%m-%d %H:%M:%S"),
+                            ("\n机器：" + center_machine_id()) if center_machine_id() else ""))
         except Exception as e:
             self.log("监控异常：%s" % e)
             self.summary = "监控异常：" + str(e)
@@ -1399,6 +1875,12 @@ class Api(object):
         self.monitor = None
         self.thread_mon = None
         self._last_accounts = []
+        # ★ 2026-10-27：「推送测试」= 模拟放货持续推送（独立于监控，不需要登录账号）
+        self.test_push_thread = None
+        self.test_push_stop_flag = False
+        self.test_push_count = 0
+        self.test_push_interval = 5
+        self.test_push_last = ""
 
     # 解析预览
     def parse(self, text):
@@ -1513,7 +1995,8 @@ class Api(object):
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
     # ---------------- 放货监控 ----------------
-    def monitor_start(self, text, proxy, interval, parallel, bundle_strategy="launch_ai"):
+    def monitor_start(self, text, proxy, interval, parallel, bundle_strategy="launch_ai",
+                      auto_rush=False, use_saved=False):
         try:
             if self.monitor and not self.monitor.done:
                 return {"ok": False, "error": "监控已在运行"}
@@ -1525,12 +2008,31 @@ class Api(object):
             self.job = None   # 清掉上一次批次残留，避免轮询阶段显示旧表格
             _primary, _fallback = resolve_bundle_strategy(bundle_strategy)
             self.monitor = Monitor(accs, upgrade_socks_scheme(proxy), interval, parallel, self,
-                                   bundle=_primary, bundle_fallback=_fallback)
+                                   bundle=_primary, bundle_fallback=_fallback,
+                                   auto_rush=auto_rush, use_saved=use_saved)
+            # ★ 2026-10-27 修复：策略日志改到 Monitor 建好之后再写。
+            #   原来在创建前调 log_global，那时 self.monitor 还是 None，这行其实一直没打出来。
+            if _fallback:
+                self.monitor.log("监控策略：优先 %s，发满 20 发未成自动改抢 %s"
+                                 % (_primary, _fallback))
+            else:
+                self.monitor.log("监控策略：只抢 %s（未配降级套餐）" % _primary)
+            self.monitor.log("复用已存令牌：%s"
+                             % ("开（首号检测和抢单批次都优先用已存令牌，不重复登录）"
+                                if use_saved else "关（每个号都会登录一次）"))
             self.thread_mon = threading.Thread(target=self.monitor.run, daemon=True)
             self.thread_mon.start()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def log_global(self, msg):
+        """没有任务在跑时也能往界面日志里写一句（借用 monitor 的日志容器）。"""
+        try:
+            if self.monitor:
+                self.monitor.log(msg)
+        except Exception:
+            pass
 
     def monitor_stop(self):
         try:
@@ -1541,14 +2043,131 @@ class Api(object):
         except Exception as e:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
+    def monitor_stop_push(self):
+        """统一「停止推送」：真实监控推送 + 测试模拟推送，一起停。"""
+        try:
+            stopped = []
+            if self.monitor and not self.monitor.done:
+                self.monitor.stop_push()
+                stopped.append("监控推送")
+            if self.test_push_thread and self.test_push_thread.is_alive():
+                self.test_push_stop_flag = True
+                stopped.append("测试推送")
+            if not stopped:
+                return {"ok": False, "error": "当前没有在推送"}
+            return {"ok": True, "stopped": stopped, "pushed": self.test_push_count}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
     def monitor_status(self):
         try:
+            tp = self.tg_test_push_status()
+            tp = {"test_push_running": tp.get("running", False),
+                  "test_push_count": tp.get("count", 0),
+                  "test_push_interval": tp.get("interval", 5),
+                  "test_push_last": tp.get("last", "")}
             if not self.monitor:
-                return {"ok": True, "running": False, "active": False}
+                base = {"ok": True, "running": False, "active": False}
+                base.update(tp)
+                return base
             m = self.monitor
-            return {"ok": True, "running": not m.done, "active": True,
-                    "phase": m.phase, "last_state": m.last_state,
-                    "last_check": m.last_check, "summary": m.summary, "done": m.done}
+            res = {"ok": True, "running": not m.done, "active": True,
+                   "phase": m.phase, "last_state": m.last_state,
+                   "last_check": m.last_check, "summary": m.summary, "done": m.done,
+                   "auto_rush": m.auto_rush, "tg_state": m.tg_state,
+                   "use_saved": m.use_saved,
+                   "tg_result": m.tg_last_result,
+                   "push_count": m.push_count, "push_stopped": m.push_stopped,
+                   "push_interval": m.push_interval}
+            res.update(tp)
+            return res
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    # ---------------- Telegram 推送配置 ----------------
+    def tg_get(self):
+        try:
+            cfg = load_tg_config()
+            tok = cfg.get("token") or ""
+            # 令牌打码返回（面板上只显示尾巴，避免截图外泄；要改就整段重填）
+            masked = (tok[:8] + "…" + tok[-4:]) if len(tok) > 14 else ("已填" if tok else "")
+            return {"ok": True, "token_masked": masked, "has_token": bool(tok),
+                    "chat_id": cfg.get("chat_id") or "", "enabled": bool(cfg.get("enabled", True)),
+                    "path": tg_config_path()}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def tg_set(self, token, chat_id, enabled=True):
+        """保存机器人配置。token 传空字符串 = 保留原令牌（只改会话ID时用）。"""
+        try:
+            old = load_tg_config()
+            tok = (token or "").strip() or (old.get("token") or "")
+            cid = (chat_id or "").strip()
+            if not tok:
+                return {"ok": False, "error": "机器人令牌不能为空"}
+            if not cid:
+                return {"ok": False, "error": "会话ID不能为空"}
+            ok, info = save_tg_config(tok, cid, enabled)
+            if not ok:
+                return {"ok": False, "error": info}
+            return {"ok": True, "path": info}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def tg_test(self, proxy="", interval=5):
+        """「推送测试」= 模拟「现在可以买任意套餐」，每隔 interval 秒推一条，
+        一直推到你点「停止推送」为止。
+
+        ★ 与真实监控完全独立：不需要登录账号、不需要开监控。
+        ★ 内容由 build_available_text 生成，和真实放货通知同一个函数，只是末尾多一行测试标记。
+        """
+        try:
+            cfg = load_tg_config()
+            if not (cfg.get("token") and cfg.get("chat_id")):
+                return {"ok": False, "error": "还没保存机器人令牌或会话ID"}
+            if self.test_push_thread and self.test_push_thread.is_alive() \
+               and not self.test_push_stop_flag:
+                return {"ok": False, "error": "测试推送正在跑，先点「停止推送」"}
+            self.test_push_stop_flag = False
+            self.test_push_count = 0
+            self.test_push_last = ""
+            self.test_push_interval = max(1, int(interval or 5))
+            px = upgrade_socks_scheme(proxy) if (proxy or "").strip() else ""
+            self.test_push_thread = threading.Thread(
+                target=self._test_push_loop, args=(self.test_push_interval, px), daemon=True)
+            self.test_push_thread.start()
+            return {"ok": True, "interval": self.test_push_interval}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+    def _test_push_loop(self, interval, px):
+        """后台循环：每 interval 秒推一条「放货了」，直到 test_push_stop_flag 置位。"""
+        seq = 0
+        try:
+            while not self.test_push_stop_flag:
+                seq += 1
+                text = build_available_text(
+                    BUNDLE_LAUNCH_AI, BUNDLE_LAUNCH,
+                    "AVAILABLE", "AVAILABLE",     # 模拟：两个套餐都能买
+                    accounts_n=0, auto_rush=False, seq=seq, test=True)
+                ok, info = tg_send(text, proxy_url=px or None)
+                self.test_push_count = seq
+                self.test_push_last = ("成功：" if ok else "失败：") + info
+                # 被 TG 限流就退避久一点，别硬刷
+                wait = 60 if (not ok and "429" in (info or "")) else interval
+                for _ in range(int(wait)):
+                    if self.test_push_stop_flag:
+                        break
+                    time.sleep(1)
+        except Exception:
+            pass
+
+    def tg_test_push_status(self):
+        try:
+            running = bool(self.test_push_thread and self.test_push_thread.is_alive()
+                           and not self.test_push_stop_flag)
+            return {"ok": True, "running": running, "count": self.test_push_count,
+                    "interval": self.test_push_interval, "last": self.test_push_last}
         except Exception as e:
             return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 

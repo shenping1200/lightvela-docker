@@ -651,10 +651,120 @@ const SMS_LUBAN = {
   },
 };
 
-// ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu | lubansms，选哪套哪套生效；三套实现并存、互不干扰
+// ===================== 国内版：疾驰短信接码（与豪猪/飞狐/鲁班并存，按 LIGHTVELA_SMS_PROVIDER 切换）=====================
+// 疾驰 API 文档：https://www.jcsms.cc/index/index/apiDoc
+//   鉴权：所有请求 Header 带 fcToken（网页「我的Token」页生成）
+//   取号：POST /api/user/getPhone        form: project_id=<项目ID>          -> data.phone
+//   取码：POST /api/user/getVerifyCode   form: project_id=&phone=           -> {code:1, msg:"<验证码>"}
+//         ★ 验证码放在 msg 字段里，不是 data；同一手机号每 5 秒最多查一次，超了返回「请求过于频繁」
+//   释放：POST /api/user/releasePhone    form: project_id=&phone=
+//   项目：GET  /api/user/projects?project_name=<关键词>  -> data[].id / project_name / money
+//   余额：★ 文档没有余额接口，只能查项目单价（所以 balance() 返回的是单价说明，不是余额）
+// ★ 与鲁班最大的差别：疾驰不给 request_id，取码和释放都靠「项目ID + 手机号」定位。
+function pickJcsmsCode(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  if (/^\d{4,8}$/.test(s)) return s;        // 官方返回就是纯码
+  return pickLubanSmsCode(s);               // 万一返回整条短信原文，复用鲁班那套抠码逻辑
+}
+
+const SMS_JCSMS = {
+  apiBase: (process.env.LIGHTVELA_JCSMS_API_BASE || 'https://www.jcsms.cc').replace(/\/+$/, ''),
+  fcToken: process.env.LIGHTVELA_JCSMS_TOKEN || '',
+  projectId: process.env.LIGHTVELA_JCSMS_PROJECT_ID || '',
+  engine: (process.env.LIGHTVELA_JCSMS_ENGINE || '').trim(),   // 留空=官方引擎；填 b=引擎B
+  async login() {
+    if (!this.fcToken) throw new Error('疾驰未配置（缺少 fcToken）');
+    return null;   // 免登录，每个请求 Header 带 fcToken
+  },
+  async _req(method, path, params) {
+    if (!this.fcToken) throw new Error('疾驰未配置（缺少 fcToken）');
+    const headers = { 'User-Agent': 'Mozilla/5.0 LightVela', 'fcToken': this.fcToken };
+    let target = this.apiBase + path;
+    const init = { method, headers };
+    if (method === 'GET') {
+      const qs = new URLSearchParams(params || {}).toString();
+      if (qs) target += '?' + qs;
+    } else {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      init.body = new URLSearchParams(params || {}).toString();
+    }
+    const r = await fetch(target, init);
+    const t = await r.text();
+    try { return JSON.parse(t); }
+    catch (e) { return { code: 0, msg: '返回非 JSON: ' + t.slice(0, 120) }; }
+  },
+  _base() {
+    const p = { project_id: this.projectId };
+    if (this.engine) p.engine = this.engine;
+    return p;
+  },
+  async rentNumber() {
+    await this.login();
+    if (!this.projectId) throw new Error('疾驰未配置项目 ID（project_id）');
+    const j = await this._req('POST', '/api/user/getPhone', this._base());
+    if (Number(j.code) !== 1) throw new Error('疾驰取号失败: ' + JSON.stringify(j));
+    const rawPhone = (j.data || {}).phone;
+    if (!rawPhone) throw new Error('疾驰取号返回无手机号: ' + JSON.stringify(j));
+    // 与豪猪/飞狐/鲁班保持一致：剥掉 +86 前缀，只留 11 位裸号
+    return normalizeMainlandPhone(rawPhone);
+  },
+  async getCode(phone, { timeoutMs = 180000, intervalMs = 15000 } = {}) {
+    await this.login();
+    const start = Date.now();
+    // ★ 疾驰硬限制：同一手机号每 5 秒最多查一次，低于 5 秒会被判「请求过于频繁」
+    const gap = Math.max(5000, Number(intervalMs) || 5000);
+    while (Date.now() - start < timeoutMs) {
+      const j = await this._req('POST', '/api/user/getVerifyCode',
+                                Object.assign({}, this._base(), { phone: phone }));
+      const msg = String(j.msg == null ? '' : j.msg);
+      if (Number(j.code) === 1) {
+        const code = pickJcsmsCode(msg);
+        if (code) return code;
+        // code=1 但 msg 里抠不出码 → 当「还没到」，继续等
+      } else if (/频繁|稍后再试|请求过多|过多/.test(msg)) {
+        await sleep(gap + 3000);   // 被限流了，多等一会儿
+        continue;
+      } else if (/鉴权|未登录|失效|Token|token/i.test(msg)) {
+        throw new Error('疾驰鉴权失败（fcToken 可能无效）: ' + JSON.stringify(j));
+      } else if (/余额不足|欠费/.test(msg)) {
+        throw new Error('疾驰余额不足: ' + JSON.stringify(j));
+      }
+      // 其余情况（「未收到」「等待」「暂无」等）一律按还没到处理，继续轮询
+      await sleep(gap);
+    }
+    throw new Error('疾驰取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
+  },
+  async release(phone) {
+    try {
+      await this._req('POST', '/api/user/releasePhone',
+                      Object.assign({}, this._base(), { phone: phone }));
+    } catch (e) { /* 释放失败不影响主流程，号卡本身也会自然过期 */ }
+  },
+  async blacklist(phone) {
+    // 疾驰无独立拉黑接口，释放即弃号（与鲁班同策略：一次性号卡，用完不再复用）
+    await this.release(phone);
+  },
+  async balance() {
+    // 疾驰文档没有余额接口 → 改查项目列表，顺带确认 token 是否有效、项目是否存在
+    try {
+      const j = await this._req('GET', '/api/user/projects', { page: 1, pagesize: 100 });
+      if (Number(j.code) !== 1) throw new Error(JSON.stringify(j));
+      const list = Array.isArray(j.data) ? j.data : [];
+      const hit = list.filter((x) => String(x.id) === String(this.projectId))[0];
+      if (hit) return '项目「' + hit.project_name + '」单价 ' + hit.money + '（疾驰无余额接口）';
+      return '已连通（疾驰无余额接口，未在列表中找到项目 ' + (this.projectId || '未填') + '）';
+    } catch (e) {
+      throw new Error('疾驰查项目列表失败: ' + (e && e.message ? e.message : e));
+    }
+  },
+};
+
+// ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu | lubansms | jcsms，选哪套哪套生效；四套实现并存、互不干扰
 const SMS_PROVIDER = (process.env.LIGHTVELA_SMS_PROVIDER || 'haozhuma').toLowerCase();
 const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU
           : SMS_PROVIDER === 'lubansms' ? SMS_LUBAN
+          : SMS_PROVIDER === 'jcsms' ? SMS_JCSMS
           : SMS_HAOZHUMA;
 
 // 账号清单从独立文件加载（单一数据源，批量调度器也 require 它）

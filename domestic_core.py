@@ -62,6 +62,16 @@ DEFAULT_DOMESTIC_CONFIG = {
             "apiKey": "",
             "serviceId": "",
         },
+        # 疾驰短信接码（与豪猪/飞狐/鲁班并存；provider=jcsms 时生效）
+        #   文档：https://www.jcsms.cc/index/index/apiDoc
+        #   鉴权：Header 带 fcToken；取号/取码/释放都靠 project_id（+手机号）定位，没有 request_id
+        #   ★ 验证码在返回的 msg 字段里；同一手机号每 5 秒最多查一次；文档无余额接口
+        "jcsms": {
+            "apiBase": "https://www.jcsms.cc",
+            "fcToken": "",
+            "projectId": "",
+            "engine": "",       # 留空=官方引擎；填 b=引擎B
+        },
     },
     "proxy": {
         "type": "socks5",
@@ -140,15 +150,17 @@ def set_sms_config(apiBase, apiUser, apiPass, projectId):
 
 
 def set_sms_provider(provider):
-    """切换接码平台：haozhuma | feihu | lubansms（选哪套哪套生效）。"""
+    """切换接码平台：haozhuma | feihu | lubansms | jcsms（选哪套哪套生效）。"""
     cfg = _read_config()
     sms = cfg.get("sms") or {}
     p = str(provider).strip().lower()
-    sms["provider"] = p if p in ("feihu", "lubansms") else "haozhuma"
+    sms["provider"] = p if p in ("feihu", "lubansms", "jcsms") else "haozhuma"
     if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
         sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
     if "luban" not in sms or not isinstance(sms.get("luban"), dict):
         sms["luban"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["luban"]))
+    if "jcsms" not in sms or not isinstance(sms.get("jcsms"), dict):
+        sms["jcsms"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["jcsms"]))
     cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True, "provider": sms["provider"]}
@@ -185,6 +197,29 @@ def set_luban_config(apiBase, apiKey, serviceId):
         sms["provider"] = "haozhuma"
     if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
         sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
+    cfg["sms"] = sms
+    _write_config(cfg)
+    return {"ok": True}
+
+
+def set_jcsms_config(apiBase, fcToken, projectId, engine=""):
+    """保存疾驰短信接码配置（fcToken=平台 Token，projectId=项目 ID，engine 留空=官方引擎）。"""
+    cfg = _read_config()
+    sms = cfg.get("sms") or {}
+    jc = sms.get("jcsms") or {}
+    if apiBase and apiBase.strip():
+        jc["apiBase"] = apiBase.strip()
+    jc["fcToken"] = (fcToken or "").strip()
+    jc["projectId"] = str(projectId or "").strip()
+    jc["engine"] = (engine or "").strip().lower()
+    sms["jcsms"] = jc
+    # 保留 provider / feihu / luban / haozhuma 字段，避免覆盖其他几套平台配置
+    if "provider" not in sms:
+        sms["provider"] = "haozhuma"
+    if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
+        sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
+    if "luban" not in sms or not isinstance(sms.get("luban"), dict):
+        sms["luban"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["luban"]))
     cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True}
@@ -232,6 +267,8 @@ def test_sms():
         return test_feihu()
     if provider == "lubansms":
         return test_luban()
+    if provider == "jcsms":
+        return test_jcsms()
     # —— 豪猪 ——
     if not cfg.get("apiUser") or not cfg.get("apiPass"):
         return {"ok": False, "error": "未填写接码平台账号/密码"}
@@ -300,6 +337,42 @@ def test_luban():
         if str(j.get("code")) != "0":
             return {"ok": False, "error": "鲁班查询失败: " + json.dumps(j, ensure_ascii=False)}
         return {"ok": True, "balance": j.get("balance"), "summary": j}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def test_jcsms():
+    """用配置里的疾驰 fcToken 查项目列表，验证 Token 是否有效、项目 ID 是否存在。
+    ★ 疾驰文档没有余额接口，所以这里只能验证连通性 + 项目，返回的 balance 是说明文字不是钱。"""
+    cfg = (_read_config().get("sms") or {}).get("jcsms") or {}
+    api_base = (cfg.get("apiBase") or DEFAULT_DOMESTIC_CONFIG["sms"]["jcsms"]["apiBase"]).rstrip("/")
+    token = (cfg.get("fcToken") or "").strip()
+    pid = str(cfg.get("projectId") or "").strip()
+    if not token:
+        return {"ok": False, "error": "疾驰未填写 fcToken（在平台「我的Token」页生成）"}
+    try:
+        import urllib.request
+        url = api_base + "/api/user/projects?page=1&pagesize=100"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "fcToken": token})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            j = json.loads(r.read().decode("utf-8", errors="replace"))
+        if str(j.get("code")) != "1":
+            return {"ok": False, "error": "疾驰查询失败: " + json.dumps(j, ensure_ascii=False)}
+        items = j.get("data") or []
+        if not isinstance(items, list):
+            items = []
+        if pid:
+            hit = next((x for x in items if str(x.get("id")) == pid), None)
+            if not hit:
+                names = "、".join("%s(id=%s)" % (x.get("project_name"), x.get("id")) for x in items[:10])
+                return {"ok": False,
+                        "error": "Token 有效，但项目 ID %s 不在列表里。可选：%s" % (pid, names or "（空）"),
+                        "projects": items[:20]}
+            return {"ok": True, "balance": "（疾驰无余额接口）",
+                    "project": hit,
+                    "summary": "连通正常，项目「%s」单价 %s" % (hit.get("project_name"), hit.get("money"))}
+        return {"ok": True, "balance": "（疾驰无余额接口）", "projects": items[:20],
+                "summary": "Token 有效，共 %d 个项目（未填项目 ID）" % len(items)}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
 
@@ -449,6 +522,16 @@ def _env_from_config(cfg):
         env["LIGHTVELA_LUBAN_API_KEY"] = lb["apiKey"]
     if lb.get("serviceId"):
         env["LIGHTVELA_LUBAN_SERVICE_ID"] = str(lb["serviceId"])
+    # 疾驰短信凭证（无论当前是否选中都透传，切换即可生效）
+    jc = sms.get("jcsms") or {}
+    if jc.get("apiBase"):
+        env["LIGHTVELA_JCSMS_API_BASE"] = jc["apiBase"]
+    if jc.get("fcToken"):
+        env["LIGHTVELA_JCSMS_TOKEN"] = jc["fcToken"]
+    if jc.get("projectId"):
+        env["LIGHTVELA_JCSMS_PROJECT_ID"] = str(jc["projectId"])
+    if jc.get("engine"):
+        env["LIGHTVELA_JCSMS_ENGINE"] = str(jc["engine"])
     px = (cfg or {}).get("proxy")
     if px:
         env["LIGHTVELA_EGRESS_PROXY"] = _normalize_proxy_cfg(px)
@@ -586,9 +669,7 @@ def _panel_line(s):
     if s.startswith("[订阅]"):
         if any(p in s for p in _SUBSCRIBE_DROP):
             return None
-        if "已有有效订阅" in s:
-            return "[订阅] ✅ 复用已有订阅（跳过重复激活）"
-        if "复核通过" in s:
+        if "已有有效订阅" in s or "复核通过" in s:
             return "[订阅] ✅ 复核通过"
         return None  # 其它 [订阅] 行不显示
     # 模型 / 部署结果
@@ -859,29 +940,26 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
             _state["procs"] = []
         # ★ 启动新运行前，清掉上一轮 webapp 重启留下的孤儿 bot 进程（命令行含 domestic_lightvela_bot.js）
         kill_orphan_bots()
-        # ★ 滑动窗口并发：始终保持最多 CONCURRENCY 个账号在跑，
-        #   任意一个跑完立刻补下一个，不再等整批齐了才走。
+        # ★ 2026-10-26：并发改为「滑动窗口」（信号量），不再整批 join。
+        #   同时最多 CONCURRENCY 个账号在跑；任意一个跑完（槽位释放）立刻补起下一个，
+        #   始终维持设定的并发数在场，消除「最慢那个等验证码把整批拖住、其余空等」的问题。
         sem = threading.Semaphore(CONCURRENCY)
         threads = []
-
-        def _worker(i, acc):
+        def _worker(idx, acc):
             try:
-                if not _state["running"]:
-                    return
-                _run_one(i, acc, mode, tmp, use_saved)
+                _run_one(idx, acc, mode, tmp, use_saved)
             finally:
-                sem.release()
-
-        for i, acc in enumerate(accounts):
-            # ★ 全局停止：每个账号启动前检查，停止后不再启动排队账号
+                sem.release()   # 跑完即腾出槽位，下一个排队账号立刻补位
+        for idx, acc in enumerate(accounts):
+            # 全局停止：不再给排队账号起进程（在跑的会继续跑完或被看门狗杀）
             if not _state["running"]:
                 break
-            sem.acquire()
-            t = threading.Thread(target=_worker, args=(i, acc), daemon=True)
+            sem.acquire()       # 槽位满则阻塞，等某账号跑完腾出位置才放行下一个
+            t = threading.Thread(target=_worker, args=(idx, acc), daemon=True)
             threads.append(t)
             t.start()
         for t in threads:
-            t.join()
+            t.join()           # 等所有在飞账号收尾（停止时也等它们退出）
     finally:
         try:
             os.remove(tmp)

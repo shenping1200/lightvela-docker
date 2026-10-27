@@ -147,27 +147,27 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
     </div>
 
     <div class="card">
-      <h2>代理</h2>
-      <div class="row">
-        <label>类型</label>
-        <select id="pType" style="width:96px">
-          <option value="socks5" selected>socks5</option>
-          <option value="http">http</option>
-          <option value="https">https</option>
-        </select>
-        <button class="btn sm" id="btnTest">测试出口 IP</button>
+      <div class="bar">
+        <button class="btn primary" id="btnStart">▶ 开始</button>
+        <button class="btn danger" id="btnStop" disabled>■ 停止</button>
       </div>
-      <div class="pgrid">
-        <label>地址</label>
-        <input type="text" id="pHost" spellcheck="false" value="a.rr2.kdns.fr" placeholder="a.rr2.kdns.fr">
-        <label>端口</label>
-        <input type="text" id="pPort" spellcheck="false" value="10800" placeholder="10800">
-        <label>账号</label>
-        <input type="text" id="pUser" spellcheck="false" value="6582443" placeholder="可留空">
-        <label>密码</label>
-        <input type="text" id="pPass" spellcheck="false" value="6582443" placeholder="可留空">
+      <div class="bar" style="margin-top:10px">
+        <span style="color:var(--tx2);font-size:12px">导出：</span>
+        <button class="btn sm" id="btnExpAll">全部</button>
+        <button class="btn sm" id="btnExpOk">仅成功</button>
+        <button class="btn sm" id="btnExpFail">仅失败</button>
+        <button class="btn sm" id="btnImpFail">导入失败到账号区</button>
+        <button class="btn sm" id="btnExpCopy">复制到剪贴板</button>
       </div>
-      <div class="hint" id="proxyHint">socks5 会自动按 socks5h 远端解析。地址栏也可直接粘整段 <code>user:pass@host:port</code>。</div>
+      <div class="bar" style="margin-top:8px">
+        <span style="color:var(--tx2);font-size:12px">凭证：</span>
+        <button class="btn sm" id="btnTkExport">导出凭证</button>
+        <button class="btn sm" id="btnTkImport">导入凭证</button>
+        <button class="btn sm" id="btnTkDelOne">删指定账号</button>
+        <button class="btn sm danger" id="btnTkDelAll">删除全部凭证</button>
+        <span class="stat" id="tkStat"></span>
+      </div>
+      <div class="foot" id="foot">导出格式与输入完全一致；可只导出失败账号。凭证存放在服务器数据盘（<code>lv-tokens.json</code>）。跑完可点「删除全部凭证」清空。</div>
     </div>
 
     <div class="card">
@@ -233,9 +233,43 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
       <div class="bar">
         <button class="btn primary" id="btnMonStart">▶ 启动监控</button>
         <button class="btn danger" id="btnMonStop" disabled>■ 停止</button>
+        <label style="display:flex;align-items:center;gap:6px;margin-left:10px;font-size:13px;color:var(--tx2)">
+          <input type="checkbox" id="monAutoRush" style="width:auto;margin:0">
+          发现可买时自动开抢（不勾=只推 TG）
+        </label>
         <span class="stat" id="monPhase"></span>
       </div>
-      <div class="hint" id="monHint">启动后用<b>导入列表的第一个账号</b>做登录检测；通过后按「轮询间隔」轮询套餐状态。所选套餐一旦可购买（或主套餐售罄但降级套餐可买），立即按「并发」数对<b>全部导入账号</b>（含第一个）并发 注册→存凭证→买 0 元；并发留空则沿用「参数」里的并发。批量中若主套餐与降级套餐都售罄，自动停剩余并标记「售罄跳过」。</div>
+
+      <div style="margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--bg2,#f7f7f9)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--tx1)">
+          Telegram 推送 <span class="sub" id="tgStat" style="font-weight:400">读取中…</span>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <div class="grp" style="flex:1">
+            <label>机器人令牌</label>
+            <input type="text" id="tgToken" placeholder="123456789:AAH-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" autocomplete="off">
+          </div>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <div class="grp" style="flex:1">
+            <label>会话 ID</label>
+            <input type="text" id="tgChat" placeholder="8495211478" autocomplete="off">
+          </div>
+        </div>
+        <div class="bar" style="margin-bottom:0">
+          <button class="btn" id="btnTgSave">保存</button>
+          <button class="btn" id="btnTgTest">推送测试</button>
+          <button class="btn danger" id="btnTgStopPush" disabled>停止推送</button>
+          <span class="stat" id="tgMsg"></span>
+        </div>
+        <div class="hint" id="tgPushStat" style="margin-top:6px;color:var(--tx3)"></div>
+        <div class="hint" style="margin-top:8px">令牌留空 = 保留原来那个，只改会话 ID。<br>
+          推送规则：<b>只要主套餐或降级套餐任一变可买，就每 5 秒推一条</b>，一直推到你点「停止推送」为止（监控本身继续轮询，不受影响）；若中途又变回售罄，会自动推一条「又售罄了」并停止推送。<br>
+          「推送测试」= 模拟「现在能买任意套餐」，点一下就开始<b>每 5 秒推一条</b>，一直推到你点「停止推送」。内容与真实放货时<b>完全一样</b>，只是末尾多一行测试标记。</div>
+      </div>
+
+      <div class="hint" id="monHint">启动后用<b>导入列表的第一个账号</b>做登录检测；通过后按「轮询间隔」轮询套餐状态。<b>主套餐（4500）或降级套餐（100）任一变可买</b>，立即发一条 TG 推送。<br>
+        抢单规则：主套餐连发 <b>20 发</b>抢不到 → 自动改抢降级套餐（100）→ 再发满 <b>20 发</b>还抢不到 → 判定失败。（「影子计费账户开通中」这类平台临时状态不计次。）</div>
     </div>
 
     <div class="card">
@@ -249,27 +283,27 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
     </div>
 
     <div class="card">
-      <div class="bar">
-        <button class="btn primary" id="btnStart">▶ 开始</button>
-        <button class="btn danger" id="btnStop" disabled>■ 停止</button>
+      <h2>代理</h2>
+      <div class="row">
+        <label>类型</label>
+        <select id="pType" style="width:96px">
+          <option value="socks5" selected>socks5</option>
+          <option value="http">http</option>
+          <option value="https">https</option>
+        </select>
+        <button class="btn sm" id="btnTest">测试出口 IP</button>
       </div>
-      <div class="bar" style="margin-top:10px">
-        <span style="color:var(--tx2);font-size:12px">导出：</span>
-        <button class="btn sm" id="btnExpAll">全部</button>
-        <button class="btn sm" id="btnExpOk">仅成功</button>
-        <button class="btn sm" id="btnExpFail">仅失败</button>
-        <button class="btn sm" id="btnImpFail">导入失败到账号区</button>
-        <button class="btn sm" id="btnExpCopy">复制到剪贴板</button>
+      <div class="pgrid">
+        <label>地址</label>
+        <input type="text" id="pHost" spellcheck="false" value="a.rr2.kdns.fr" placeholder="a.rr2.kdns.fr">
+        <label>端口</label>
+        <input type="text" id="pPort" spellcheck="false" value="10800" placeholder="10800">
+        <label>账号</label>
+        <input type="text" id="pUser" spellcheck="false" value="6582443" placeholder="可留空">
+        <label>密码</label>
+        <input type="text" id="pPass" spellcheck="false" value="6582443" placeholder="可留空">
       </div>
-      <div class="bar" style="margin-top:8px">
-        <span style="color:var(--tx2);font-size:12px">凭证：</span>
-        <button class="btn sm" id="btnTkExport">导出凭证</button>
-        <button class="btn sm" id="btnTkImport">导入凭证</button>
-        <button class="btn sm" id="btnTkDelOne">删指定账号</button>
-        <button class="btn sm danger" id="btnTkDelAll">删除全部凭证</button>
-        <span class="stat" id="tkStat"></span>
-      </div>
-      <div class="foot" id="foot">导出格式与输入完全一致；可只导出失败账号。凭证存放在服务器数据盘（<code>lv-tokens.json</code>）。跑完可点「删除全部凭证」清空。</div>
+      <div class="hint" id="proxyHint">socks5 会自动按 socks5h 远端解析。地址栏也可直接粘整段 <code>user:pass@host:port</code>。</div>
     </div>
   </div>
 
@@ -315,8 +349,9 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
             <option value="haozhuma" selected>豪猪（默认）</option>
             <option value="feihu">飞狐</option>
             <option value="lubansms">鲁班</option>
+            <option value="jcsms">疾驰短信</option>
           </select>
-          <span class="sub" style="color:var(--tx3)">三套并存，选哪套哪套生效</span>
+          <span class="sub" style="color:var(--tx3)">四套并存，选哪套哪套生效</span>
         </div>
 
         <!-- 豪猪面板 -->
@@ -371,6 +406,33 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <div class="hint" style="margin-top:6px">鲁班免登录，所有请求带 apiKey；取号必须填「服务 ID」（决定国家+应用，类似飞狐 pid），+86 大陆号在鲁班后台查对应编号填入。</div>
       </div>
 
+      <!-- 疾驰短信面板（四平台共存；Header 带 fcToken，取号/取码/释放靠「项目ID + 手机号」定位） -->
+      <div id="domJcPanel" style="display:none">
+        <div class="row">
+          <label>API 地址</label>
+          <input type="text" id="domJcBase" spellcheck="false" placeholder="https://www.jcsms.cc（可不填，默认此值）">
+        </div>
+        <div class="pgrid">
+          <label>fcToken</label>
+          <input type="text" id="domJcToken" spellcheck="false" placeholder="疾驰后台「我的Token」页生成">
+          <label>项目 ID</label>
+          <input type="text" id="domJcSid" spellcheck="false" placeholder="疾驰项目 ID（数字）">
+        </div>
+        <div class="row">
+          <label>引擎</label>
+          <select id="domJcEngine" style="width:150px">
+            <option value="">官方引擎（默认）</option>
+            <option value="b">引擎B</option>
+          </select>
+          <span class="sub" style="color:var(--tx3)">一般留空；选了引擎B 就都按引擎B 走</span>
+        </div>
+        <div class="hint" style="margin-top:6px">
+          疾驰免登录，每个请求 Header 带 <b>fcToken</b>；验证码在返回的 <b>msg</b> 字段里。<br>
+          平台限制：<b>同一手机号每 5 秒最多查一次</b>，程序已自动按 5 秒以上间隔轮询。<br>
+          <b>疾驰没有余额接口</b>，所以「测试连接」验证的是 Token 是否有效、项目 ID 是否存在，查不到余额。
+        </div>
+      </div>
+
         <div class="bar" style="margin-top:4px">
           <button class="btn primary sm" id="domBtnSmsSave">保存配置</button>
           <button class="btn sm" id="domBtnSmsTest">测试连接 + 查余额</button>
@@ -379,32 +441,35 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <div class="hint">「保存配置」会把两套凭证都存下来并切换当前生效平台；「测试连接」测的是当前所选平台。</div>
       </div>
 
-      <!-- ★ 代理（与国内版 bot 子进程一起透传） -->
       <div class="card">
-        <h2>代理 <span class="sub" id="domProxyStat">默认 socks5</span></h2>
+        <h2>参数模式</h2>
         <div class="row">
-          <label>类型</label>
-          <select id="domPType" style="width:96px">
-            <option value="socks5" selected>socks5</option>
-            <option value="http">http</option>
-            <option value="https">https</option>
+          <label>模式</label>
+          <select id="domMode" style="flex:1">
+            <option value="login" selected>① 登录 + 拿凭证（不下单）</option>
+            <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
+            <option value="resume">③ 续跑（已登录+已实名，复用凭证，只跑订阅→建Bot→部署；不取号不花钱）</option>
           </select>
-          <button class="btn sm" id="domBtnProxyTest">测试出口 IP</button>
         </div>
-        <div class="pgrid">
-          <label>地址</label>
-          <input type="text" id="domPHost" spellcheck="false" value="a.rr2.kdns.fr" placeholder="a.rr2.kdns.fr">
-          <label>端口</label>
-          <input type="text" id="domPPort" spellcheck="false" value="10800" placeholder="10800">
-          <label>账号</label>
-          <input type="text" id="domPUser" spellcheck="false" value="6582443" placeholder="可留空">
-          <label>密码</label>
-          <input type="text" id="domPPass" spellcheck="false" value="6582443" placeholder="可留空">
+        <div class="row">
+          <label>复用</label>
+          <label style="min-width:auto">
+            <input type="checkbox" id="domUseSaved"> 复用已存凭证（有则跳过取号/实名；缺则自动取号登录并保存）
+          </label>
         </div>
-        <div class="bar" style="margin-top:4px">
-          <button class="btn primary sm" id="domBtnProxySave">保存配置</button>
+        <div class="row">
+          <label>并发</label>
+          <input type="number" id="domParallel" value="5" min="1" max="20" step="1">
+          <span class="sub" style="color:var(--tx3)">同时处理几个账号（默认 5）</span>
         </div>
-        <div class="hint" id="domProxyHint">socks5 会自动按 socks5h 远端解析。地址栏也可直接粘整段 <code>user:pass@host:port</code>。保存后立即对后续账号生效。</div>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn primary" id="domBtnStart">▶ 开始</button>
+          <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
+          <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
+          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
+          <span id="domRunStat" class="stat"></span>
+        </div>
+        <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
       </div>
 
       <!-- ★ 部署命令（全流程模式原样发给机器人） -->
@@ -449,35 +514,32 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <div class="hint">保存后对<b>新起的账号</b>立即生效（正在跑的账号不中断）；批量调度器下次启动也会读这里的配置。</div>
       </div>
 
+      <!-- ★ 代理（与国内版 bot 子进程一起透传） -->
       <div class="card">
-        <h2>参数模式</h2>
+        <h2>代理 <span class="sub" id="domProxyStat">默认 socks5</span></h2>
         <div class="row">
-          <label>模式</label>
-          <select id="domMode" style="flex:1">
-            <option value="login" selected>① 登录 + 拿凭证（不下单）</option>
-            <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
-            <option value="resume">③ 续跑（已登录+已实名，复用凭证，只跑订阅→建Bot→部署；不取号不花钱）</option>
+          <label>类型</label>
+          <select id="domPType" style="width:96px">
+            <option value="socks5" selected>socks5</option>
+            <option value="http">http</option>
+            <option value="https">https</option>
           </select>
+          <button class="btn sm" id="domBtnProxyTest">测试出口 IP</button>
         </div>
-        <div class="row">
-          <label>复用</label>
-          <label style="min-width:auto">
-            <input type="checkbox" id="domUseSaved"> 复用已存凭证（有则跳过取号/实名；缺则自动取号登录并保存）
-          </label>
+        <div class="pgrid">
+          <label>地址</label>
+          <input type="text" id="domPHost" spellcheck="false" value="a.rr2.kdns.fr" placeholder="a.rr2.kdns.fr">
+          <label>端口</label>
+          <input type="text" id="domPPort" spellcheck="false" value="10800" placeholder="10800">
+          <label>账号</label>
+          <input type="text" id="domPUser" spellcheck="false" value="6582443" placeholder="可留空">
+          <label>密码</label>
+          <input type="text" id="domPPass" spellcheck="false" value="6582443" placeholder="可留空">
         </div>
-        <div class="row">
-          <label>并发</label>
-          <input type="number" id="domParallel" value="5" min="1" max="20" step="1">
-          <span class="sub" style="color:var(--tx3)">同时处理几个账号（默认 5）</span>
+        <div class="bar" style="margin-top:4px">
+          <button class="btn primary sm" id="domBtnProxySave">保存配置</button>
         </div>
-        <div class="bar" style="margin-top:8px">
-          <button class="btn primary" id="domBtnStart">▶ 开始</button>
-          <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
-          <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
-          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
-          <span id="domRunStat" class="stat"></span>
-        </div>
-        <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
+        <div class="hint" id="domProxyHint">socks5 会自动按 socks5h 远端解析。地址栏也可直接粘整段 <code>user:pass@host:port</code>。保存后立即对后续账号生效。</div>
       </div>
       <div class="card">
         <h2>凭证管理 <span class="sub">独立文件 domestic-tokens.json</span></h2>
@@ -728,7 +790,9 @@ async function doMonStart() {
   const r = await API.monitor_start(accPayload(), proxy,
                                     parseInt($('monInterval').value, 10) || 5,
                                     parseInt($('monParallel').value, 10) || parseInt($('parallel').value, 10) || 1,
-                                    $('bundleStrategy').value);
+                                    $('bundleStrategy').value,
+                                    !!$('monAutoRush').checked,
+                                    !!$('useSaved').checked);
   if (!r || !r.ok) { appendLog(['[监控] ✗ 启动失败：' + (r && r.error)]); return; }
   running = true;
   $('log').textContent = ''; logLen = 0;
@@ -741,6 +805,65 @@ async function doMonStart() {
 async function doMonStop() {
   const r = await API.monitor_stop();
   appendLog(['[监控] 已发送停止指令' + ((r && r.ok) ? '' : ('（' + (r && r.error) + '）'))]);
+}
+
+/* ---------- Telegram 推送配置 ---------- */
+async function loadTgConfig() {
+  const r = await API.tg_get();
+  if (!r || !r.ok) { $('tgStat').textContent = '读取失败'; return; }
+  $('tgChat').value = r.chat_id || '';
+  $('tgToken').value = '';
+  if (r.has_token) {
+    $('tgToken').placeholder = '已保存 ' + r.token_masked + '（留空=不修改）';
+    $('tgStat').textContent = r.enabled ? '已配置' : '已配置（推送已关）';
+  } else {
+    $('tgToken').placeholder = '123456789:AAH-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx';
+    $('tgStat').textContent = '未配置';
+  }
+}
+async function doTgSave() {
+  const r = await API.tg_set($('tgToken').value, $('tgChat').value, true);
+  if (!r || !r.ok) { $('tgMsg').textContent = '✗ ' + (r && r.error); return; }
+  $('tgMsg').textContent = '✓ 已保存';
+  appendLog(['[TG] ✓ 配置已保存']);
+  await loadTgConfig();
+}
+let testPushTimer = null;
+async function doTgTest() {
+  $('tgMsg').textContent = '启动中…';
+  const proxy = await proxyArg();
+  const r = await API.tg_test(proxy || '', 5);
+  if (!r || !r.ok) {
+    $('tgMsg').textContent = '✗ ' + (r && r.error);
+    appendLog(['[TG] ✗ 测试推送启动失败：' + (r && r.error)]);
+    return;
+  }
+  $('tgMsg').textContent = '✓ 测试推送已启动';
+  $('btnTgStopPush').disabled = false;
+  appendLog(['[TG] 🧪 开始模拟放货推送：每 ' + (r.interval || 5) + ' 秒一条，点「停止推送」才停']);
+  if (!testPushTimer) testPushTimer = setInterval(pollTestPush, 1000);
+  pollTestPush();
+}
+async function pollTestPush() {
+  const r = await API.tg_test_push_status();
+  if (!r || !r.ok) return;
+  if (r.running) {
+    $('tgPushStat').textContent = '🧪 测试推送中 · 已推 ' + r.count + ' 条 · 每 ' + r.interval + ' 秒一条';
+    $('btnTgStopPush').disabled = false;
+  } else {
+    $('tgPushStat').textContent = '🔕 测试推送已停止（共推 ' + r.count + ' 条）';
+    if (testPushTimer) { clearInterval(testPushTimer); testPushTimer = null; }
+  }
+}
+
+async function doTgStopPush() {
+  const r = await API.monitor_stop_push();
+  if (!r || !r.ok) { $('tgMsg').textContent = '✗ ' + (r && r.error); return; }
+  $('btnTgStopPush').disabled = true;
+  $('tgMsg').textContent = '✓ 已停止推送';
+  appendLog(['[TG] 🔕 已停止推送（' + ((r.stopped || []).join('、') || '无') +
+             '，共推 ' + (r.pushed || 0) + ' 条）；监控继续轮询']);
+  pollTestPush();
 }
 
 /* ---------- 部署命令（全流程 / 抢到后原样发给机器人）---------- */
@@ -851,13 +974,21 @@ async function poll() {
     const phaseMap = {idle: '空闲', detect: '① 检测首号', polling: '② 轮询中', rushing: '③ 抢单中', done: '④ 已完成'};
     $('monStat').textContent = m.running ? '运行中' : '已结束';
     $('monPhase').innerHTML = '阶段：<b>' + (phaseMap[m.phase] || m.phase) + '</b> · 目标包：<b>' +
-      esc(m.last_state || '?') + '</b>' + (m.last_check ? ' · 最近检测 ' + new Date(m.last_check * 1000).toLocaleTimeString() : '');
+      esc(m.last_state || '?') + '</b>' + (m.last_check ? ' · 最近检测 ' + new Date(m.last_check * 1000).toLocaleTimeString() : '') +
+      ' · 复用令牌：<b>' + (m.use_saved ? '开' : '关') + '</b>';
     if (m.running) {
       $('btnMonStart').disabled = true; $('btnMonStop').disabled = false;
       $('btnStart').disabled = true; $('btnStop').disabled = true;
+      $('btnTgStopPush').disabled = !!m.push_stopped;
+      if (!testPushTimer) {
+        $('tgPushStat').textContent = m.push_stopped
+          ? ('🔕 已停止推送（本轮共推 ' + (m.push_count || 0) + ' 条）')
+          : ('📨 已推送 ' + (m.push_count || 0) + ' 条 · 每 ' + (m.push_interval || 5) + ' 秒一条');
+      }
     } else {
       $('btnMonStart').disabled = false; $('btnMonStop').disabled = true;
       $('btnStart').disabled = false; $('btnStop').disabled = true;
+      $('btnTgStopPush').disabled = true;
     }
   }
   if (s.done) {
@@ -926,6 +1057,9 @@ function boot() {
   $('btnStop').onclick = doStop;
   $('btnMonStart').onclick = () => { doMonStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnMonStop').onclick = doMonStop;
+  $('btnTgSave').onclick = doTgSave;
+  $('btnTgTest').onclick = doTgTest;
+  $('btnTgStopPush').onclick = doTgStopPush;
   $('btnExpAll').onclick = () => doDump('all');
   $('btnExpOk').onclick = () => doDump('ok');
   $('btnExpFail').onclick = () => doDump('fail');
@@ -944,6 +1078,7 @@ function boot() {
   doParse();
   doTkInfo();
   loadDeployMsg();
+  loadTgConfig();
   // ---- 国内版 Tab 绑定 ----
   $('tabIntlBtn').onclick = () => switchTab('intl');
   $('tabDomBtn').onclick = () => switchTab('domestic');
@@ -1159,11 +1294,16 @@ async function domTkDel() {
 }
 
 /* ---------- 国内版配置（接码平台 / 代理 / 部署指令）---------- */
+function smsProviderName(p) {
+  return ({ haozhuma: '豪猪', feihu: '飞狐', lubansms: '鲁班', jcsms: '疾驰' })[p] || '豪猪';
+}
+
 function toggleSmsProvider() {
   const p = $('domSmsProvider').value;
   $('domHzPanel').style.display = (p === 'haozhuma') ? '' : 'none';
   $('domFhPanel').style.display = (p === 'feihu') ? '' : 'none';
   $('domLbPanel').style.display = (p === 'lubansms') ? '' : 'none';
+  $('domJcPanel').style.display = (p === 'jcsms') ? '' : 'none';
 }
 
 async function loadDomConfig() {
@@ -1187,7 +1327,13 @@ async function loadDomConfig() {
   $('domLbBase').value = lb.apiBase || 'https://lubansms.com/v2/api';
   $('domLbKey').value = lb.apiKey || '';
   $('domLbSid').value = lb.serviceId || '';
-  const pName = ($('domSmsProvider').value === 'feihu') ? '飞狐' : ($('domSmsProvider').value === 'lubansms') ? '鲁班' : '豪猪';
+  // 疾驰
+  const jc = s.jcsms || {};
+  $('domJcBase').value = jc.apiBase || 'https://www.jcsms.cc';
+  $('domJcToken').value = jc.fcToken || '';
+  $('domJcSid').value = jc.projectId || '';
+  $('domJcEngine').value = jc.engine || '';
+  const pName = smsProviderName($('domSmsProvider').value);
   $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 当前：' + pName;
   toggleSmsProvider();
   const p = r.config.proxy || {};
@@ -1219,10 +1365,16 @@ async function domSmsSave() {
     $('domLbKey').value.trim(),
     $('domLbSid').value.trim()
   );
-  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok))) {
+  const r5 = await API.domestic_jcsms_set(
+    $('domJcBase').value.trim(),
+    $('domJcToken').value.trim(),
+    $('domJcSid').value.trim(),
+    $('domJcEngine').value
+  );
+  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok) && (r5 && r5.ok))) {
     $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败</span>'; return;
   }
-  const pName = (provider === 'feihu') ? '飞狐' : (provider === 'lubansms') ? '鲁班' : '豪猪';
+  const pName = smsProviderName(provider);
   $('domSmsStat').textContent = '已保存 · 当前：' + pName;
   $('domSmsHint').innerHTML = '✓ 已保存（对新任务生效）';
   setTimeout(() => { $('domSmsHint').textContent = ''; }, 2500);
@@ -1236,9 +1388,14 @@ async function domSmsTest() {
   await domSmsSave();  // 先存最新值再测
   const r = await API.domestic_sms_balance();
   btn.disabled = false; btn.textContent = '测试连接 + 查余额';
-  const label = (provider === 'feihu') ? '飞狐' : (provider === 'lubansms') ? '鲁班' : '豪猪';
+  const label = smsProviderName(provider);
   if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(label) + '：' + esc(r && r.error) + '</span>'; return; }
-  $('domSmsHint').innerHTML = '✓ ' + esc(label) + '登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
+  // 疾驰没有余额接口：balance 里放的是说明文字（项目单价），不能当钱显示
+  if (provider === 'jcsms') {
+    $('domSmsHint').innerHTML = '✓ ' + esc(label) + '连通正常：<b>' + esc(String(r.summary || r.balance || '已连通')) + '</b>';
+  } else {
+    $('domSmsHint').innerHTML = '✓ ' + esc(label) + '登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
+  }
 }
 
 async function domProxySave() {

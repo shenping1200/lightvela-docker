@@ -227,6 +227,15 @@ async def api_session(request: Request):
 
 
 # ---------------- 路由：业务接口（全部复用 core.Api） ----------------
+def _truthy(v):
+    """前端传过来的真假值统一判定（可能是 true / "true" / 1 / "1"）。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 HANDLERS = {
     "parse":             lambda a: API.parse(a[0] if a else ""),
     "normalize_proxy":   lambda a: API.normalize_proxy(*a),
@@ -237,9 +246,26 @@ HANDLERS = {
     "monitor_start":     lambda a: API.monitor_start(a[0] if a else "",
                                                      a[1] if len(a) > 1 else "",
                                                      a[2] if len(a) > 2 else 5,
-                                                     a[3] if len(a) > 3 else 1),
+                                                     a[3] if len(a) > 3 else 1,
+                                                     # ★ 2026-10-27 修复：原来只转发 4 个参数，
+                                                     #   面板选的订阅策略（第 5 个）被丢掉，
+                                                     #   监控永远按 launch_ai 跑，选「降级100」等于没选。
+                                                     a[4] if len(a) > 4 else "launch_ai",
+                                                     _truthy(a[5]) if len(a) > 5 else False,
+                                                     # ★ 2026-10-27：第 7 个参数＝「复用已存令牌」，
+                                                     #   原来漏转发，面板勾了也传不进监控。
+                                                     _truthy(a[6]) if len(a) > 6 else False),
     "monitor_stop":      lambda a: API.monitor_stop(),
+    "monitor_stop_push": lambda a: API.monitor_stop_push(),
     "monitor_status":    lambda a: API.monitor_status(),
+    # ---- Telegram 推送配置 ----
+    "tg_get":            lambda a: API.tg_get(),
+    "tg_set":            lambda a: API.tg_set(a[0] if a else "",
+                                              a[1] if len(a) > 1 else "",
+                                              _truthy(a[2]) if len(a) > 2 else True),
+    "tg_test":           lambda a: API.tg_test(a[0] if a else "",
+                                               a[1] if len(a) > 1 else 5),
+    "tg_test_push_status": lambda a: API.tg_test_push_status(),
     "deploy_msg_get":    lambda a: API.deploy_msg_get(),
     "deploy_msg_set":    lambda a: API.deploy_msg_set(a[0] if a else ""),
     "deploy_msg_reset":  lambda a: API.deploy_msg_reset(),
@@ -268,6 +294,9 @@ HANDLERS = {
                                                                 a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else ""),
     "domestic_luban_set":        lambda a: dcore.set_luban_config(a[0] if a else "", a[1] if len(a) > 1 else "",
                                                                 a[2] if len(a) > 2 else ""),
+    "domestic_jcsms_set":        lambda a: dcore.set_jcsms_config(a[0] if a else "", a[1] if len(a) > 1 else "",
+                                                                  a[2] if len(a) > 2 else "",
+                                                                  a[3] if len(a) > 3 else ""),
     "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                                   a[4] if len(a) > 4 else ""),
