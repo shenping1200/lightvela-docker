@@ -645,6 +645,59 @@ def load_tokens():
         return {}
 
 
+# ---------------- 数据中心（凭证中心）对接 2026-10-27 ----------------
+# 规则（老大定）：先问中心（查全量，不分机器，可跨机复用）→ 连不上/查不到再查本地 → 都没有按新号走
+CENTER_BASE = os.environ.get("LIGHTVELA_CENTER", "http://43.167.192.48:18090")
+CENTER_TOKEN = os.environ.get("LIGHTVELA_CENTER_TOKEN", "lvc-9f3a7d2e6b1c4a85")
+CENTER_TIMEOUT = float(os.environ.get("LIGHTVELA_CENTER_TIMEOUT", "6"))
+
+
+def center_machine_id():
+    """本机标识：环境变量 → 数据目录下 machine-id → 空字符串"""
+    v = (os.environ.get("LIGHTVELA_MACHINE_ID") or "").strip()
+    if v:
+        return v
+    try:
+        p = os.path.join(os.path.dirname(token_path()), "machine-id")
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def center_get_token(username):
+    """按用户名问数据中心要令牌。连不上/查不到都返回 None，调用方自行回退本地/登录。"""
+    if not username:
+        return None
+    try:
+        r = requests.get(CENTER_BASE + "/creds/lookup",
+                         params={"platform": "intl", "username": username},
+                         headers={"X-Auth-Token": CENTER_TOKEN}, timeout=CENTER_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        d = r.json() or {}
+        for c in (d.get("creds") or []):
+            if c.get("token"):
+                return c["token"]
+        return None
+    except Exception:
+        return None
+
+
+def center_push_token(username, token):
+    """把令牌推到数据中心（失败只返回 False，本地已存，不影响任务）"""
+    if not (username and token):
+        return False
+    try:
+        r = requests.post(CENTER_BASE + "/creds",
+                          json={"platform": "intl", "account_key": username, "token": token,
+                                "owner": center_machine_id() or None},
+                          headers={"X-Auth-Token": CENTER_TOKEN}, timeout=CENTER_TIMEOUT)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def merge_tokens(local, incoming):
     """合并两份凭证。同一账号【时间新的赢】（老大选的"甲"规则）。
     返回 (merged, added, updated)。"""
@@ -759,11 +812,37 @@ class Job(object):
         self.summary = ""
 
     # --- 上报 ---
+    def _log_file(self):
+        """日志文件句柄（懒加载，只尝试一次）。
+        ★ 2026-10-27 新增：原来日志只存内存 self.logs，容器一重启全丢、出问题没法复盘。
+        现在同时按天写 /data/lv-run-YYYYMMDD.log；任何异常都不影响主流程。"""
+        if getattr(self, "_log_tried", False):
+            return getattr(self, "_log_fh", None)
+        self._log_tried = True
+        self._log_fh = None
+        try:
+            d = os.environ.get("LV_DATA_DIR") or app_dir()
+            p = os.path.join(d, "lv-run-%s.log" % time.strftime("%Y%m%d"))
+            self._log_fh = open(p, "a", encoding="utf-8")
+            self._log_path = p
+        except Exception:
+            self._log_fh = None
+            self._log_path = ""
+        return self._log_fh
+
     def log(self, msg):
+        line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
         with self.lock:
-            self.logs.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))
+            self.logs.append(line)
             if len(self.logs) > 4000:
                 del self.logs[:1500]
+            fp = self._log_file()
+            if fp is not None:
+                try:
+                    fp.write(line + "\n")
+                    fp.flush()
+                except Exception:
+                    pass
 
     def row(self, idx, **kw):
         with self.lock:
@@ -810,6 +889,11 @@ class Job(object):
             token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
                                    log=lambda m: self.log(tag + m))
         self.tokens[name] = token
+        # ★ 同步到数据中心（跨机复用；失败不影响本次）
+        if center_push_token(name, token):
+            self.log(tag + " ☁ 令牌已同步到数据中心")
+        else:
+            self.log(tag + " ⚠ 数据中心同步失败（本地已存，不影响本次）")
         self.log(tag + " ✅ 登录成功（%.1fs）Bearer=%s…" % (time.time() - t0, token[:12]))
         self.row(idx, stage="已登录", detail="Bearer " + token[:12] + "…")
         return token
@@ -835,14 +919,20 @@ class Job(object):
                 token = self.tokens.get(name) or self.tokens.get(acc.get("email", "")) or ""
                 if token:
                     self.log(tag + " 复用已存令牌，跳过登录")
-                elif self.saved_fallback:
-                    # 复用模式但本账号没令牌 → 退回正常登录并保存，下次直接复用
-                    self.log(tag + " 复用模式缺令牌，退回登录并保存 ...")
-                    token = self._do_login(idx, tag, acc, px, name)
                 else:
-                    self.row(idx, stage="失败", detail="无已存令牌", ok=False)
-                    self.log(tag + " ❌ 没有已存令牌（请先跑一次预登录）")
-                    return
+                    # ★ 本地没有 → 问数据中心（查全量，不分机器，可跨机复用）
+                    token = center_get_token(name) or ""
+                    if token:
+                        self.tokens[name] = token
+                        self.log(tag + " ☁ 从数据中心取到令牌，跳过登录")
+                    elif self.saved_fallback:
+                        # 复用模式但本地和数据中心都没有 → 退回正常登录并保存（当新号走）
+                        self.log(tag + " 本地/数据中心都没有令牌，退回登录并保存 ...")
+                        token = self._do_login(idx, tag, acc, px, name)
+                    else:
+                        self.row(idx, stage="失败", detail="无已存令牌", ok=False)
+                        self.log(tag + " ❌ 本地和数据中心都没有令牌（请先跑一次预登录）")
+                        return
             else:
                 token = self._do_login(idx, tag, acc, px, name)
 
@@ -1180,6 +1270,8 @@ class Job(object):
         self.started_at = time.time()
         self.log("===== 开始 | 账号 %d 个 | 模式 %s | 代理 %s ====="
                  % (len(self.accounts), MODE_LABEL.get(self.mode, self.mode), self.proxy or "（直连）"))
+        if getattr(self, "_log_path", ""):
+            self.log("本次日志文件: %s" % self._log_path)
         try:
             if self.parallel > 1 and len(self.accounts) > 1:
                 from concurrent.futures import ThreadPoolExecutor
@@ -1198,6 +1290,14 @@ class Job(object):
             self.summary = "完成：%d/%d 成功（耗时 %.0fs）" % (ok, len(self.rows), time.time() - self.started_at)
             self.done = True
             self.log("===== " + self.summary + " =====")
+            # 关掉日志文件句柄（webapp 是常驻进程，不关会累积）
+            try:
+                if getattr(self, "_log_fh", None) is not None:
+                    self._log_fh.close()
+                    self._log_fh = None
+                    self._log_tried = False
+            except Exception:
+                pass
 
     def save_tokens(self):
         try:
