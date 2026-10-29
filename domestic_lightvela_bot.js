@@ -2322,7 +2322,22 @@ async function main() {
       const subOk = await restSubscribe();
       if (!subOk) throw new Error('抢套餐失败');
       // 3) 建机器人（有就复用，没有就建 + 轮询到 active/running）
-      const botOk = await restCreateBot(INSTANCE_NAME);
+      // ★ 2026-10-29：建 Bot 失败自动重试（默认 3 次，间隔 2 秒），照国际版 bot_retry=3 的做法。
+      //   根因：新号首登会触发影子账户绑定（PASS_SHADOW_BINDING_REQUIRED），绑定还没生效时
+      //   平台建出来的实例就是 Failed；restCreateBot 内部已有「删废实例 + 原地重建一次」，
+      //   这里再兜一层重试，赶不上就等下一把，避免整个号直接判死、非得重跑整批。
+      const botRetry = Math.max(1, parseInt(process.env.LIGHTVELA_BOT_RETRY || '3', 10));
+      let botOk = false;
+      for (let bi = 1; bi <= botRetry; bi++) {
+        botOk = await restCreateBot(INSTANCE_NAME);
+        if (botOk) break;
+        if (bi < botRetry) {
+          console.log('[建Bot] 第 ' + bi + '/' + botRetry + ' 次未成功，2 秒后重试');
+          await sleep(2000);
+        } else {
+          console.log('[建Bot] 第 ' + bi + '/' + botRetry + ' 次仍未成功，放弃本号（下一轮重跑会再建）');
+        }
+      }
       if (!botOk) throw new Error('建机器人失败');
       // 4) 把部署消息发给机器人 + 抓回复（runChat 内部会自动设主模型，否则机器人不回话；
       //    判失败会自动 F 主动验证 + D 免费重试，最多 LIGHTVELA_DEPLOY_RETRY 次）

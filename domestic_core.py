@@ -586,6 +586,141 @@ def _read_tokens():
     return merged
 
 
+# ---------------- 数据中心（凭证中心）对接 2026-10-29 ----------------
+# 规则（老大定）：勾了「复用凭证」时，本地令牌库没有的号 → 按身份证号问数据中心，
+#   要到的凭证追加写进本地 domestic-tokens.ndjson；bot.js 的 readDomesticToken
+#   本来就按 idCard 读这个文件，所以自然复用上，不用重新取号/实名（省钱、不换号）。
+#   ★ 国内版数据中心接口与别的平台不同：GET /creds/lookup?platform=domestic&id_card=xxx
+#     （不是 username；传 username 会返回 400 id_card required）
+CENTER_BASE = os.environ.get("LIGHTVELA_CENTER", "http://43.167.192.48:18090")
+CENTER_TOKEN = os.environ.get("LIGHTVELA_CENTER_TOKEN", "lvc-9f3a7d2e6b1c4a85")
+CENTER_TIMEOUT = float(os.environ.get("LIGHTVELA_CENTER_TIMEOUT", "6"))
+
+
+def center_lookup(id_card):
+    """按身份证号问数据中心要国内版凭证。连不上/查不到都返回 None（调用方自行回退）。"""
+    if not id_card:
+        return None
+    try:
+        import urllib.parse
+        import urllib.request
+        q = urllib.parse.urlencode({"platform": "domestic", "id_card": id_card})
+        req = urllib.request.Request(CENTER_BASE + "/creds/lookup?" + q,
+                                     headers={"X-Auth-Token": CENTER_TOKEN})
+        with urllib.request.urlopen(req, timeout=CENTER_TIMEOUT) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        for c in (d.get("creds") or []):
+            if c.get("token"):
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def _prefetch_center_creds(accounts):
+    """批次开跑前：本地没有的号去数据中心取凭证，取到就追加进本地 ndjson。
+    返回 (取到数, 查过数)。任何异常都不影响主流程。"""
+    try:
+        local = _read_tokens()
+    except Exception:
+        local = {}
+    have = set()
+    for k, v in (local or {}).items():
+        if k:
+            have.add(k)
+        if isinstance(v, dict) and v.get("idCard"):
+            have.add(v["idCard"])
+    got = 0
+    asked = 0
+    nd = token_nd_path()
+    for a in (accounts or []):
+        idc = (a.get("idCard") or "").strip()
+        if not idc or idc in have:
+            continue
+        asked += 1
+        c = center_lookup(idc)
+        if not c:
+            continue
+        rec = {"name": c.get("name") or a.get("name") or "",
+               "idCard": idc,
+               "phone": c.get("phone") or "",
+               "uid": c.get("account_key") or "",
+               "bearer": c.get("token") or ""}
+        if not rec["bearer"]:
+            continue
+        try:
+            with open(nd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            got += 1
+            have.add(idc)
+        except Exception:
+            pass
+    return got, asked
+
+
+def _center_machine_id():
+    """本机标识：环境变量 → 数据目录下 machine-id → 空字符串。"""
+    v = (os.environ.get("LIGHTVELA_MACHINE_ID") or "").strip()
+    if v:
+        return v
+    try:
+        p = os.path.join(_data_dir(), "machine-id")
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def center_push_cred(cred, instance_id=None):
+    """把一条国内版凭证推到数据中心（新增或覆盖同一身份证号的记录）。
+
+    ★ 2026-10-29 新增：老大反馈「国内版只读不上传」——本函数补上「写」。
+      之前只有 center_lookup / _prefetch_center_creds 两个读函数，登录/实名拿到的
+      凭证只落在本机 ndjson，10 台机器互相看不见，A 机登录的号 B 机还得重登（触发 2FA/接码）。
+      接口：POST /creds，必填 platform + account_key，其余字段按数据中心 CredIn 定义传。
+
+    失败只返回 False，绝不抛异常、绝不影响本次任务（本地已经存了，缺这一次上传不致命）。
+    """
+    if not isinstance(cred, dict):
+        return False
+    idc = str(cred.get("idCard") or "").strip()
+    bearer = str(cred.get("bearer") or "").strip()
+    if not (idc and bearer):
+        return False
+    if str(os.environ.get("LIGHTVELA_CENTER_PUSH", "1")).strip() == "0":
+        return False
+    try:
+        import urllib.request
+        # ★ account_key 的约定：数据中心国内版记录里存的是 uid（usr_xxx），不是身份证号
+        #   （_prefetch_center_creds 读的时候就是拿 account_key 当 uid 用）。
+        #   所以上传也必须传 uid，否则新建的记录 account_key 会变成身份证号，读回来 uid 就错了。
+        #   uid 拿不到时退回身份证号，至少保证记录能建起来。
+        acct_key = str(cred.get("uid") or "").strip() or idc
+        payload = {
+            "platform": "domestic",
+            "account_key": acct_key,
+            "token": bearer,
+            "name": (cred.get("name") or None),
+            "id_card": idc,
+            "phone": (cred.get("phone") or None),
+            "instance_id": (instance_id or cred.get("instanceId") or None),
+            "owner": (_center_machine_id() or None),
+            "status": "ok",
+            "extra": {"uid": (cred.get("uid") or None)},
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            CENTER_BASE + "/creds",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Auth-Token": CENTER_TOKEN},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=CENTER_TIMEOUT) as r:
+            return int(getattr(r, "status", 200)) == 200
+    except Exception:
+        return False
+
+
 def parse_accounts(text):
     """解析「姓名 + 身份证」文本（每行一条，姓名与身份证之间可用空格/----/——/|/、/逗号等任意分隔）。
     返回 [{name, idCard}]。优先按 18 位身份证特征抓取，姓名取其前的文字。"""
@@ -899,6 +1034,17 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False):
             "error": err_msg,
             "log": os.path.basename(log_file),
         }
+        # ★ 2026-10-29：凭证上传数据中心。之前国内版只有「读」，登录/实名拿到的凭证
+        #   只落在本机 ndjson，10 台机器互相看不见。这里补上「写」——账号一跑完（成功失败
+        #   都算，只要拿到 bearer）就推一条，跨机可复用，避免重复登录触发 2FA/接码。
+        if cred.get("bearer"):
+            try:
+                if center_push_cred(cred, res.get("instanceId")):
+                    _append_log("[数据中心] ☁ 凭证已上传（%s）" % (acc.get("name") or acc.get("idCard") or ""))
+                else:
+                    _append_log("[数据中心] ⚠ 凭证上传未成功（本地已存，不影响本次）")
+            except Exception:
+                pass
         with _lock:
             while len(_state["results"]) <= idx:
                 _state["results"].append(None)
@@ -940,6 +1086,15 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
             _state["procs"] = []
         # ★ 启动新运行前，清掉上一轮 webapp 重启留下的孤儿 bot 进程（命令行含 domestic_lightvela_bot.js）
         kill_orphan_bots()
+        # ★ 数据中心取凭证（2026-10-29 新增）：勾了「复用凭证」时，本地令牌库没有的号
+        #   按身份证号问数据中心要，要到的追加进本地 ndjson，机器人自然复用上，不用重新取号/实名。
+        if use_saved or mode == "resume":
+            try:
+                _got, _asked = _prefetch_center_creds(accounts)
+                if _asked:
+                    _append_log("☁ 数据中心：查了 %d 个号，取到 %d 个凭证" % (_asked, _got))
+            except Exception as _e:
+                _append_log("⚠ 数据中心预取凭证失败（不影响本次）：%s" % _e)
         # ★ 2026-10-26：并发改为「滑动窗口」（信号量），不再整批 join。
         #   同时最多 CONCURRENCY 个账号在跑；任意一个跑完（槽位释放）立刻补起下一个，
         #   始终维持设定的并发数在场，消除「最慢那个等验证码把整批拖住、其余空等」的问题。
