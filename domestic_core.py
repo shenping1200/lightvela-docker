@@ -128,7 +128,23 @@ def _write_config(cfg):
 
 
 def get_config():
-    return {"ok": True, "config": _read_config()}
+    """读配置返回给前端。★ 2026-10-29：顺带把四套接码平台（豪猪/飞狐/鲁班/疾驰）的段
+    补齐——老配置文件里没有 jcsms 段，前端虽然用 `|| 默认值` 兜着，但「当前：xx」这类
+    回填会不准。这里只在内存里补，不写盘，等用户点保存才落盘。"""
+    cfg = _read_config()
+    try:
+        sms = cfg.get("sms")
+        if not isinstance(sms, dict):
+            sms = {}
+        for k in ("feihu", "luban", "jcsms"):
+            if not isinstance(sms.get(k), dict):
+                sms[k] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"][k]))
+        if "provider" not in sms:
+            sms["provider"] = "haozhuma"
+        cfg["sms"] = sms
+    except Exception:
+        pass
+    return {"ok": True, "config": cfg}
 
 
 def set_sms_config(apiBase, apiUser, apiPass, projectId):
