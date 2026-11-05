@@ -108,8 +108,3 @@ _audit/
 
 # ===== ★ 2026-11-06 补：一次性补丁脚本（内含明文数据中心地址/token，绝不提交）=====
 patch_center.py
-
-# ===== ★ 2026-11-06 补：历史探针副本（早期实验残留，功能已被 domestic_lightvela_bot.js 覆盖）=====
-#   注：domestic_active_probe_fp.js 已被远端仓库跟踪，gitignore 对已跟踪文件无效；
-#       如需清理请用 git rm --cached（本次保留远端版本，不删）。
-domestic_active_probe.js

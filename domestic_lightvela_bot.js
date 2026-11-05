@@ -103,7 +103,68 @@ const CFG = {
   // ★ 出口代理：让纯代码走"环境代理"，做到账号隔离（出口 IP = 环境 IP）
   egressProxy:   null,      // 由 LIGHTVELA_EGRESS_PROXY(JSON) 解析而来
   noAutoclose:   process.env.LIGHTVELA_NO_AUTOCLOSE === '1',  // 1=跑完不自动关环境（由外层编排统一关）
+  fp:            null,   // ★ 设备指纹（按账号种子化生成，见 setFingerprint）
 };
+
+// ===================== 设备指纹（按账号种子化，2026-10-26 起） =====================
+// 背景：原来所有请求共用写死的 UA 'Mozilla/5.0 LightVelaPureCode'，
+//   并发跑时平台看到「同一个客户端同时操作多个账号」→ 回话但积分不记账。
+// 做法：按身份证/姓名做种子，同一账号永远同一张脸，不同账号一定不同脸。
+// 来源：合并前散落在 domestic_deploy_probe.js / intl_probe.js 等 4 个探针副本里，
+//   2026-11-06 收敛进主流程，探针副本已删除。
+function _seedHash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+const _UA_POOL = [
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', ch: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', ch: '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="99"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36', ch: '"Google Chrome";v="129", "Chromium";v="129", "Not_A Brand";v="24"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36', ch: '"Google Chrome";v="128", "Chromium";v="128", "Not_A Brand";v="24"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36', ch: '"Google Chrome";v="132", "Chromium";v="132", "Not_A Brand";v="24"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', ch: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', plat: '"macOS"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36', ch: '"Google Chrome";v="129", "Chromium";v="129", "Not_A Brand";v="24"', plat: '"macOS"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', ch: '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="99"', plat: '"macOS"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0', ch: '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"', plat: '"Windows"', mob: '?0' },
+  { ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0', ch: '"Microsoft Edge";v="130", "Chromium";v="130", "Not_A Brand";v="99"', plat: '"Windows"', mob: '?0' },
+];
+
+const _LANG_POOL = [
+  'zh-CN,zh;q=0.9',
+  'zh-CN,zh;q=0.9,en;q=0.8',
+  'zh-CN,zh;q=0.8,en-US;q=0.7,en;q=0.6',
+  'zh-CN,zh-Hans;q=0.9,zh;q=0.8',
+  'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+];
+
+const _REF_POOL = [
+  'https://www.lightvela.com/',
+  'https://www.lightvela.com/console',
+  'https://www.lightvela.com/dashboard',
+  'https://www.lightvela.com/chat',
+];
+
+function setFingerprint(seedStr) {
+  const seed = _seedHash(String(seedStr || 'x'));
+  const u = _UA_POOL[seed % _UA_POOL.length];
+  const lang = _LANG_POOL[(seed >>> 3) % _LANG_POOL.length];
+  const ref = _REF_POOL[(seed >>> 7) % _REF_POOL.length];
+  CFG.fp = {
+    'User-Agent': u.ua,
+    'sec-ch-ua': u.ch,
+    'sec-ch-ua-mobile': u.mob,
+    'sec-ch-ua-platform': u.plat,
+    'Accept-Language': lang,
+    'Origin': 'https://www.lightvela.com',
+    'Referer': ref,
+  };
+  return CFG.fp;
+}
 
 // ★ 出口代理（2026-10-16 起支持代理池）：所有 LightVela API 请求走这里。
 //   支持两种格式：单个代理对象 或 数组（代理池）；数组时每次请求随机挑一个 → 实现"每请求换 IP"。
@@ -1165,7 +1226,7 @@ function httpsReq(method, path, { bearer = CFG.bearer, cookie = CFG.cookie, body
     const h = Object.assign({
       'User-Agent': 'Mozilla/5.0 LightVelaPureCode',
       'Accept': 'application/json',
-    }, headers);
+    }, (CFG.fp || {}), headers);   // ★ 指纹优先，调用方显式 headers 最高优先
     if (bearer) h['Authorization'] = 'Bearer ' + bearer;
     if (cookie) h['Cookie'] = cookie;
     if (data) { h['Content-Type'] = 'application/json'; h['Content-Length'] = Buffer.byteLength(data); }
@@ -2312,6 +2373,9 @@ async function main() {
     // ★ 换账号时强制换新隧道 → 该账号的出口 IP 与上一个账号不同（单进程批量模式必需；
     //   子进程模式本循环只跑一次、且 agent 是全新的，reset 为空操作，无副作用）
     if (EGRESS_AGENTS.length) EGRESS_AGENTS.forEach(resetHttpsAgent);
+    // ★ 换账号同时换脸：按身份证做种子生成设备指纹（同一账号每次都是同一张脸，
+    //   不同账号一定不同脸），避免平台看出「同一个客户端在并发操作多个账号」。
+    setFingerprint(acc.idCard || acc.name);
     // ★ 实名补救跨进程协调：本身份若已被别的账号补救占用（consumed），本子进程直接跳过，不再注册本身份
     const selfStatus = await markSelfRunning(idx);
     if (selfStatus === 'skipped') {
