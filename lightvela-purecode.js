@@ -635,6 +635,7 @@ async function restSetPrimaryModel(instanceId) {
     'HERMES_PROFILE_ROOT="${HERMES_HOME:-$HOME/.hermes}"\n' +
     'export HERMES_HOME="$HERMES_PROFILE_ROOT"\n' +
     'HERMES_PYTHON="$HERMES_ROOT/hermes-agent/venv/bin/python"\n' +
+    'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_REAL=$(dirname $(readlink -f $HERMES_ROOT/hermes-agent)); HERMES_PYTHON="$HERMES_REAL/venv/bin/python"; fi\n' +
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="python3"; fi\n' +
     'printf \'%s\n\' \'' + bootstrap + "' | \"$HERMES_PYTHON\" - \"" + payload + "\" \"" + HERMES_MODEL_CFG_SCRIPT_B64 + "\"";
 
@@ -650,7 +651,9 @@ async function restSetPrimaryModel(instanceId) {
   let r = null;
   let lastCode = '';
   let lastErr = null;
+  let attempts = 0;   // ★ 2026-11-03 记录实际尝试次数（原来报错写死"已重试5次"）
   for (let i = 1; i <= 5; i++) {
+    attempts = i;
     console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec) 第 ' + i + ' 次');
     try {
       r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
@@ -675,7 +678,7 @@ async function restSetPrimaryModel(instanceId) {
   }
   if (!r || !r.json || r.json.code !== 'OK') {
     const tail = (r && r.text) ? String(r.text) : (lastCode || '');
-    throw new Error('debug/exec 失败(已重试5次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
+    throw new Error('debug/exec 失败(实际尝试 ' + attempts + ' 次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
   }
   const data = r.json.data || {};
   const output = typeof data.output === 'string' ? data.output : '';

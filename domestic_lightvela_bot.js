@@ -1038,6 +1038,7 @@ async function domesticLogin(acc, idx) {
         phone = await SMS.rentNumber();
         console.log(`  手机号(取号#${attempt}${rr > 0 ? '-重取' + rr : ''}):`, phone);
         if (isMainlandPhone(phone)) break;
+        try { await SMS.release(phone); } catch (_) {}
         try { await SMS.blacklist(phone); } catch (_) {}
         console.log(`  ⛔ 已拉黑非大陆号码（${String(phone).length} 位）：${phone}，重新取号…`);
         phone = null;
@@ -1066,7 +1067,7 @@ async function domesticLogin(acc, idx) {
               //   （lv-proxy.js: keepAlive + maxSockets:1 + 缓存 TLS socket），重发多少次都是同一个脏IP，
               //   硬重试只会白等 60s×N、白烧号码。下次重跑 = 新进程 = 新连接 = 新出口IP，自然就好了。
               console.log(`  ⛔ 限流类型=IP脏(${rlType})：出口IP被官方限频，直接判定失败（不重试/不换号），稍后重跑会自动换新出口IP`);
-              if (phone) { try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（IP脏放弃，号源一次性）:', phone); } catch (_) {} }
+              if (phone) { try { await SMS.release(phone); } catch (_) {} try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（IP脏放弃，号源一次性）:', phone); } catch (_) {} }
               throw new Error('IP脏限频：出口IP被官方限频，已放弃本次尝试（不重试/不换号）。稍后重跑会自动换新出口IP');
             } else {
               // 其他限流：非IP问题，保持原等待后重发即可
@@ -1084,13 +1085,14 @@ async function domesticLogin(acc, idx) {
       if (!sentOk) {
         // ★ 限频拉黑：同一号码重试上限仍被限频 → 拉黑该号（不再分配，防止二手号回收复用），换号重试
         lastErr = new Error('验证码发送过于频繁，已用同一号码重试 ' + RESEND_MAX + ' 次仍被限频: ' + JSON.stringify(lastRateJson).slice(0, 200));
-        if (phone) { try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（限频重试耗尽）:', phone); } catch (_) {} }
+        if (phone) { try { await SMS.release(phone); } catch (_) {} try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（限频重试耗尽）:', phone); } catch (_) {} }
         console.log('  ⚠️ 该号限频重试耗尽，换号重试…');
         continue;   // 走 attempt++ 换号（至多 MAX_RENT 个号）
       }
       const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
       console.log('  验证码:', code);
       // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
+      try { await SMS.release(phone); } catch (_) {}
       try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（已成功取码，号源即用即弃）:', phone); } catch (_) {}
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
       const token = v.json && v.json.session && v.json.session.sessionToken;
@@ -1129,6 +1131,7 @@ async function domesticLogin(acc, idx) {
       const isRentFail    = /豪猪取号失败|没有取到号码/.test(e.message || '');
       if (isCodeTimeout && phone) {
         // 取到号但没收到验证码 → 拉黑这个号（避免下次再分到它），然后换号重试
+        try { await SMS.release(phone); } catch (_) {}
         try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（超时未收到验证码）:', phone); } catch (_) {}
       }
       if (!isCodeTimeout && !isRentFail) {
@@ -1305,8 +1308,30 @@ async function restSubscribe() {
       return rtc * (100 - disc) / 100;
     };
     const zero = online.filter((b) => { const e = effCost(b); return !isNaN(e) && Math.abs(e) < 0.01; });
-    zero.sort((a, b) => (b.bundle_type === 'ai' ? 1 : 0) - (a.bundle_type === 'ai' ? 1 : 0));
-    for (const b of zero) push(b.bundle_id);
+    // ★ 2026-11-01 新增：订购套餐策略（对齐国际版三档）
+    //   launch_ai        = 只订 4500 积分的启航 Launch AI（常售罄）
+    //   launch           = 只订 100 积分的启航 Launch（现货）
+    //   auto_ai_fallback = AI 优先，其余 0 元包跟上（= 改动前的原行为，保持向后兼容）
+    //   ★ 铁律不变：无论哪档，都只在【折后 0 元】的包里挑，绝不自动订阅付费包。
+    const STRATEGY = (process.env.LIGHTVELA_BUNDLE_STRATEGY || 'auto_ai_fallback').trim();
+    const isAI = (b) => b.bundle_type === 'ai' || /_ai_/i.test(String(b.bundle_id || ''));
+    if (STRATEGY === 'launch_ai' || STRATEGY === 'launch') {
+      const wantAI = STRATEGY === 'launch_ai';
+      const picked = zero.filter((b) => isAI(b) === wantAI);
+      // 只订 100 积分档时，让 bundle_launch_01 排最前（其余非 AI 的 0 元包作兜底）
+      picked.sort((a, b) => (/launch/i.test(String(b.bundle_id || '')) ? 1 : 0)
+                          - (/launch/i.test(String(a.bundle_id || '')) ? 1 : 0));
+      for (const b of picked) push(b.bundle_id);
+      console.log('[订阅] 策略=' + STRATEGY + '（只订' + (wantAI ? '4500积分AI档' : '100积分档') +
+                  '），0 元命中 ' + picked.length + ' 个');
+      if (!picked.length) {
+        console.log('[订阅] ⚠️ 策略=' + STRATEGY + '：当前 0 元包里没有这一档（多半售罄），' +
+                    '现有 0 元包：' + (zero.map((b) => b.bundle_id).join(', ') || '(无)'));
+      }
+    } else {
+      zero.sort((a, b) => (b.bundle_type === 'ai' ? 1 : 0) - (a.bundle_type === 'ai' ? 1 : 0));
+      for (const b of zero) push(b.bundle_id);
+    }
     if (!zero.length) {
       console.log('[订阅] ⚠️ 当前无 0 元免费套餐（所有在线包折后均 >0，免费活动疑似已结束），在线包：' +
         online.map((b) => b.bundle_id + '(折后￥' + (effCost(b) / 100).toFixed(2) + ')').join(', ') +
@@ -1555,6 +1580,7 @@ async function restSetPrimaryModel(instanceId) {
     'HERMES_PROFILE_ROOT="${HERMES_HOME:-$HOME/.hermes}"\n' +
     'export HERMES_HOME="$HERMES_PROFILE_ROOT"\n' +
     'HERMES_PYTHON="$HERMES_ROOT/hermes-agent/venv/bin/python"\n' +
+    'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_REAL=$(dirname $(readlink -f $HERMES_ROOT/hermes-agent)); HERMES_PYTHON="$HERMES_REAL/venv/bin/python"; fi\n' +
     'if [ ! -x "$HERMES_PYTHON" ]; then HERMES_PYTHON="python3"; fi\n' +
     'printf \'%s\n\' \'' + bootstrap + "' | \"$HERMES_PYTHON\" - \"" + payload + "\" \"" + HERMES_MODEL_CFG_SCRIPT_B64 + "\"";
 
@@ -1567,7 +1593,9 @@ async function restSetPrimaryModel(instanceId) {
   let r = null;
   let lastCode = '';
   let lastErr = null;
+  let attempts = 0;   // ★ 2026-11-03 记录实际尝试次数（原来报错写死"已重试5次"）
   for (let i = 1; i <= 5; i++) {
+    attempts = i;
     console.log('[模型] 设主模型: custom/auto (POST /v1/instances/' + instanceId + '/debug/exec) 第 ' + i + ' 次');
     try {
       r = await httpsReq('POST', '/v1/instances/' + instanceId + '/debug/exec', {
@@ -1592,7 +1620,7 @@ async function restSetPrimaryModel(instanceId) {
   }
   if (!r || !r.json || r.json.code !== 'OK') {
     const tail = (r && r.text) ? String(r.text) : (lastCode || '');
-    throw new Error('debug/exec 失败(已重试5次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
+    throw new Error('debug/exec 失败(实际尝试 ' + attempts + ' 次' + (lastErr ? '，最后一次:' + String(lastErr.message || lastErr) : '') + '): ' + tail.slice(0, 240));
   }
   const data = r.json.data || {};
   const output = typeof data.output === 'string' ? data.output : '';
