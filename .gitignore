@@ -43,3 +43,72 @@ domestic-deploy-msg.txt
 domestic-tokens.ndjson
 lv-tokens.json
 *.bak*
+
+# ===== ★ 2026-11-01 补：账号区自动保存草稿（明文账号密码，绝对不能提交）=====
+#   由 lv_gui_core.draft_path() 写在程序目录，面板一跑、账号框一打字就会生成
+lv-account-draft.json
+lv-account-draft.json.*
+
+# ===== ★ 2026-11-01 补：其余运行时配置 / 状态（含密钥或真实数据）=====
+domestic-config.json
+domestic-sms-claims.json
+lv-tg.json
+
+# ===== ★ 2026-11-01 补：本地调试临时产物（已确认含真实账号/密码，绝不提交）=====
+#   注：已被跟踪的 _deploy_msg.example.txt / _probe_full.js / _probe_instances.js /
+#       _recheck_probe.js 是正式文件，不受下面规则影响（git 不会因 ignore 移除已跟踪文件）
+_ghmain/
+_cmp/
+_b64_call.txt
+_b64_func.txt
+_check206.js
+_check_patch.py
+_e2e_center.py
+_gen_patch.py
+_logstat.txt
+_logstat2.txt
+_origin_main.py
+_probe_auth.py
+_probe_auth_out.txt
+_probe_bundles.py
+_probe_out.txt
+_stat2.py
+_stat_logs.py
+_test_dc.py
+_test_mon.py
+_test_mon_out.txt
+_verify.py
+_verify_js.js
+_verify_js_out.txt
+_verify_out.txt
+_vjs.js
+_vjs_out.txt
+_*_out.txt
+check_lv.js
+commit_msg.txt
+
+# ===== ★ 2026-11-01 补：VPS 对照副本（含线上凭据/机器指纹，只在本机留档）=====
+*_80.py
+*_80.js
+*.80
+lv_gui_core.py.80
+master/
+
+# ===== ★ 2026-11-01 补：启动脚本（内含明文面板密码，只在本机保留）=====
+#   若需在新机器部署，请新建同名文件并按 .env.example 的方式填自己的密码
+start_lightvela.bat
+
+# ===== ★ 2026-11-01 补：运行期日志 / 错误输出（每次重启都会生成，无版本价值）=====
+*.err
+*.log
+lv-run-*.log
+
+# ===== ★ 2026-11-01 补：审查留档目录（另一 AI 审查时留下的源码副本，无版本价值）=====
+_audit/
+
+# ===== ★ 2026-11-06 补：一次性补丁脚本（内含明文数据中心地址/token，绝不提交）=====
+patch_center.py
+
+# ===== ★ 2026-11-06 补：历史探针副本（早期实验残留，功能已被 domestic_lightvela_bot.js 覆盖）=====
+domestic_active_probe.js
+domestic_active_probe_fp.js
