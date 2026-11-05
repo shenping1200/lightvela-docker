@@ -112,6 +112,25 @@ TOKEN_FILE = "lv-tokens.json"
 
 
 # ---------------- 账号解析 ----------------
+_B32_RE = re.compile(r"^[A-Z2-7]+$")
+
+
+def looks_like_totp(s):
+    """★ 2026-11-01 新增：判断一段字符串像不像 TOTP 密钥（base32）。
+    为什么需要它：谷歌账号格式是 邮箱----密码----辅助邮箱[----创建时间]----google，
+    第 3 段既可能是辅助邮箱、也可能是 2FA 密钥。原来只靠"含不含 @"区分，
+    于是「邮箱----密码----2026-10-17 16:18:34----google」这种把创建时间放在第 3 段的写法，
+    创建时间会被当成 2FA 密钥 → 登录时 base32 解码直接抛异常 → 整个号跑挂。
+    现在只有真正符合 base32 特征（A-Z 与 2-7，长度 >=16）才认作密钥，其余一律当创建时间。
+    """
+    if not s:
+        return False
+    t = re.sub(r"[\s\-]", "", str(s)).upper()
+    if len(t) < 16:
+        return False
+    return bool(_B32_RE.match(t))
+
+
 def parse_accounts(text):
     """每行：GitHub 两种格式均可 —— 用户名----密码----2FA[----创建时间]（无邮箱，推荐），或 邮箱----密码----用户名----2FA[----创建时间]（兼容旧格式）。
     谷歌账号：在任意段标 google/g 即为谷歌账号，格式
@@ -123,10 +142,20 @@ def parse_accounts(text):
         s = raw.strip()
         if not s or s.startswith("#"):
             continue
-        parts = [p.strip() for p in re.split(r"-{2,}", s)]
+        # ★ 2026-11-01 修（严重）：分隔符改成两级，绝不再和 ---- 混用。
+        #   原来是把 | , ; : / 和 ---- 塞进同一个正则，后果是——密码里只要含这几个符号
+        #   任意一个就被切成两半：Pa:ss:word 被解析成 密码=Pa / 2FA=ss，密码错 → 登录必失败，
+        #   而且失败还会被当成"账号质量问题"去排查。带日期、带特殊符号的密码太常见了。
+        #   现在：整行有 ---- 就只按 ---- 切（密码里有什么符号都不影响）；
+        #         一个 ---- 都没有时，才用 | ; , 和制表符兜底（兼容从表格粘贴）。
+        #   冒号、斜杠永远不当分隔符——密码和网址里太常见，当分隔符得不偿失。
+        if re.search(r"-{2,}", s):
+            parts = [p.strip() for p in re.split(r"-{2,}", s) if p.strip()]
+        else:
+            parts = [p.strip() for p in re.split(r"\t|\||;|,", s) if p.strip()]
         r = {"idx": len(rows) + 1, "raw_parts": parts, "ok": False, "err": "",
              "email": "", "password": "", "login": "", "tfa": "", "created": "",
-             "provider": "github", "recovery": ""}
+             "provider": "github", "recovery": "", "totp": ""}
         # provider 判定：任意段精确等于 google/g -> 谷歌；github/gh -> GitHub；否则默认 GitHub
         provider = "github"
         for p in parts:
@@ -137,38 +166,64 @@ def parse_accounts(text):
                 provider = "github"; break
         r["provider"] = provider
         if provider == "google":
-            # 邮箱----密码----辅助邮箱[----创建时间]----google
+            # 谷歌：邮箱----密码----(辅助邮箱 或 2FA验证字符串)[----创建时间]----google
+            #   第 3 段含 @ → 辅助邮箱（recovery）；不含 @ → 2FA 验证字符串（totp，base32，登录时现算 6 位码）
+            #   末尾段可含 : 和空格（创建时间），故剩余段拼回 created
             if not parts[0] or not parts[1]:
-                r["err"] = "谷歌账号需 邮箱----密码[----辅助邮箱][----创建时间]----google"
+                r["err"] = "谷歌账号需 邮箱----密码[----辅助邮箱或2FA验证串][----创建时间]----google"
             else:
                 r["email"], r["password"] = parts[0], parts[1]
-                r["recovery"] = parts[2] or ""
+                third = parts[2] if len(parts) > 2 else ""
+                if third.lower() in ("google", "g", "github", "gh"):
+                    third = ""                   # 第 3 段其实是 provider 标记（如 邮箱----密码----google）
+                if third:
+                    if "@" in third:
+                        r["recovery"] = third               # 辅助邮箱
+                    elif looks_like_totp(third):
+                        r["totp"] = third.replace(" ", "")  # 2FA 验证字符串（base32），登录时现算验证码
+                    else:
+                        # ★ 2026-11-01：既不是邮箱也不是 base32 密钥 → 说明是创建时间，
+                        #   放回 created，绝不能当密钥（否则登录时 base32 解码抛异常）
+                        r["created"] = third
                 r["login"] = parts[0]            # 仅用于命名/凭据 key，登录不依赖
                 r["tfa"] = ""
-                tail = parts[3] if len(parts) > 3 else ""
-                r["created"] = tail if tail and tail.lower() not in ("google", "g", "github", "gh") else ""
+                tail = [t for t in parts[3:] if t.lower() not in ("google", "g", "github", "gh")]
+                if tail:
+                    r["created"] = " ".join(([r["created"]] if r["created"] else []) + tail)
                 r["ok"] = True
         else:
             # GitHub 两种格式都支持：
-            #   第一段含 @ → 原格式：邮箱----密码----用户名----2FA[----创建时间]
-            #   第一段不含 @ → 新格式：用户名----密码----2FA[----创建时间]（无邮箱）
+            #   第一段含 @ → 邮箱登录：邮箱----密码----2FA（3 段）或 邮箱----密码----用户名----2FA（4 段）[----创建时间]
+            #   第一段不含 @ → 用户名----密码----2FA（3 段）[----创建时间]
             if len(parts) < 3:
                 r["err"] = "字段不足（GitHub 需 用户名----密码----2FA，或 邮箱----密码----用户名----2FA）"
             elif "@" in (parts[0] or ""):
-                if not parts[1] or not parts[2] or not parts[3]:
-                    r["err"] = "邮箱/密码/用户名/2FA 不能为空"
+                if len(parts) < 3:
+                    r["err"] = "邮箱/密码/2FA 不能为空"
+                elif len(parts) == 3:
+                    if not parts[1] or not parts[2]:
+                        r["err"] = "邮箱/密码/2FA 不能为空"
+                    else:
+                        r["email"] = parts[0]
+                        r["login"] = parts[0]          # 邮箱即登录名
+                        r["password"] = parts[1]
+                        r["tfa"] = parts[2]
+                        r["ok"] = True
                 else:
-                    r["email"], r["password"] = parts[0], parts[1]
-                    r["login"], r["tfa"] = parts[2], parts[3]
-                    r["created"] = parts[4] if len(parts) > 4 else ""
-                    r["ok"] = True
+                    if not parts[1] or not parts[2] or not parts[3]:
+                        r["err"] = "邮箱/密码/用户名/2FA 不能为空"
+                    else:
+                        r["email"], r["password"] = parts[0], parts[1]
+                        r["login"], r["tfa"] = parts[2], parts[3]
+                        r["created"] = " ".join(parts[4:]) if len(parts) > 4 else ""
+                        r["ok"] = True
             else:
                 if not parts[1] or not parts[2]:
                     r["err"] = "用户名/密码/2FA 不能为空"
                 else:
                     r["login"], r["password"], r["tfa"] = parts[0], parts[1], parts[2]
                     r["email"] = ""
-                    r["created"] = parts[3] if len(parts) > 3 else ""
+                    r["created"] = " ".join(parts[3:]) if len(parts) > 3 else ""
                     r["ok"] = True
         rows.append(r)
     return rows
@@ -360,7 +415,18 @@ def run_node(js, args, extra_env=None, timeout=600):
 
 # ---------------- TOTP ----------------
 def totp(secret, offset=0):
-    key = base64.b32decode(secret.upper().replace(" ", ""))
+    """算 6 位动态码。
+    ★ 2026-11-01：加了容错。原来密钥不合法（长度不是 8 的倍数、含非法字符、空串）时
+      base64.b32decode 会直接抛异常，把整个账号任务打断。现在统一补齐 padding、
+      失败返回空串，由调用方按"2FA 失败"正常报错，不炸整个线程。"""
+    s = re.sub(r"[\s\-]", "", str(secret or "")).upper().rstrip("=")
+    if not s:
+        return ""
+    try:
+        s += "=" * ((8 - len(s) % 8) % 8)     # base32 必须 8 的倍数，不够补 =
+        key = base64.b32decode(s)
+    except Exception:
+        return ""
     counter = int(time.time() // 30) + offset
     h = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
     o = h[-1] & 0x0F
@@ -430,7 +496,10 @@ def gh_login(login, password, tfa, proxy, log=None):
     if "two-factor" in r3.url or "two-factor" in r3.text[:4000]:
         L("  需要 2FA，提交动态码")
         d3 = parse_inputs(r3.text)
-        d3["app_otp"] = totp(tfa)
+        code = totp(tfa)
+        if not code:      # ★ 2026-11-01：密钥不合法时明确报错，别拿空码去撞接口
+            raise RuntimeError("2FA 密钥格式不对（不是合法 base32），请检查该号第 3/4 段")
+        d3["app_otp"] = code
         r4 = s.post("https://github.com/sessions/two-factor", data=d3, timeout=40, allow_redirects=False)
         if r4.status_code >= 400:
             d3["app_otp"] = totp(tfa, 1)
@@ -522,9 +591,10 @@ def _find_node_modules():
     return None
 
 
-def google_login(email, password, recovery, px=None, log=None):
+def google_login(email, password, recovery, px=None, log=None, totp_secret=""):
     """谷歌授权登录（node + Playwright）-> 返回 LightVela Bearer。失败抛异常。
-    px（代理）保留以与 GitHub 路径对齐；node 脚本默认走自身网络（容器内直连/系统代理）。"""
+    出口代理：把 px（与 GitHub 路径同款）经 LIGHTVELA_EGRESS_PROXY 下发给 node 脚本，
+    做到「每账号独立指纹 + 独立出口 IP」，绕过 Google 对机房 IP 的风控。px 为空回退默认代理池。"""
     def L(m):
         if log:
             log(m)
@@ -539,16 +609,24 @@ def google_login(email, password, recovery, px=None, log=None):
         env["PLAYWRIGHT_PKG"] = os.path.join(nm, "playwright")
     else:
         L("  ⚠️ 未找到 playwright 模块目录（可在 LIGHTVELA_NODE_MODULES 指定；容器需内置）")
+    # ★ 出口代理：px 优先，否则用默认旋转代理池（与 domestic DEFAULT_EGRESS_PROXY 一致）
+    eff_px = (px or DEFAULT_PROXY or "").strip()
+    if eff_px:
+        env["LIGHTVELA_EGRESS_PROXY"] = json.dumps(proxy_to_json(eff_px), ensure_ascii=False)
+        L("  出口代理已下发: " + eff_px.split("@")[-1])  # 只打 host:port，不泄凭据
     args = [NODE_BIN, GOOGLE_LOGIN_JS, "--email=" + email, "--password=" + password]
     if recovery:
         args.append("--recovery=" + recovery)
+    if totp_secret:
+        args.append("--totp=" + totp_secret)   # 2FA 验证字符串，脚本内现算 6 位码
     L("  启动谷歌无头浏览器登录 ...")
     try:
-        # 超时放宽到 360s：小内存机器(如 952MB 的 80 VPS)上实测谷歌登录要 150~300s，
-        # 原 180s 会误杀近一半账号（观测到最慢 298.5s）。
-        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=360)
+        # ★ 2026-10-30：206 实测「打开谷歌登录页」单步就要 200 秒（2 核 950MB 无 swap，
+        #   页内 goto 已放宽到 240s），360s 会在流程中途被杀掉。放宽到 900s。
+        #   注意：超时只杀 node、不杀 chromium 子进程，会留下僵尸（206 上积了 21 个）。
+        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=900)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("谷歌登录超时（浏览器流程 >360s）")
+        raise RuntimeError("谷歌登录超时（浏览器流程 >900s）")
     except FileNotFoundError:
         raise RuntimeError("找不到 node 可执行文件（请设置 LIGHTVELA_NODE_BIN，并确保容器内置 node）")
     out = (r.stdout or "").strip()
@@ -563,13 +641,13 @@ def google_login(email, password, recovery, px=None, log=None):
     return data["token"]
 
 
-def google_login_retry(email, password, recovery, px=None, log=None, max_attempts=3, retry_delay=5.0):
+def google_login_retry(email, password, recovery, px=None, log=None, max_attempts=3, retry_delay=5.0, totp_secret=""):
     """谷歌登录 + 环境层失败重试（超时 / node 缺失 / 输出解析失败）。
     账号密码错、辅助邮箱验证不通过等「真失败」不重试，直接抛出。"""
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return google_login(email, password, recovery, px, log=log)
+            return google_login(email, password, recovery, px, log=log, totp_secret=totp_secret)
         except RuntimeError as e:
             msg = str(e)
             if "超时" in msg or "node" in msg or "脚本输出无法解析" in msg or "缺少谷歌登录脚本" in msg:
@@ -618,6 +696,118 @@ def probe_token(s):
 
 
 # ---------------- 凭证文件（令牌库）----------------
+def read_day_log_tail(limit=400, max_bytes=2 * 1024 * 1024):
+    """★ 2026-11-01 新增：读当天日志文件的最后若干行，给"面板重启过、内存任务已丢"的场景兜底回放。
+    ★ 2026-11-01 优化：原来是把整个日志文件 read() 进内存再切最后 400 行。这个函数在
+      "没有内存任务"时会被前端状态轮询反复调用（约每秒一次），当天日志跑到几万个号、
+      几十 MB 时就是每秒读几十 MB，白吃内存和磁盘。
+      现在改成从文件尾部往前翻：先读 64KB，行数不够就翻倍再来，总读取量封顶 max_bytes，
+      永远不整文件读入，代价恒定。
+    只读、不写、任何异常都返回空列表，绝不影响主流程。"""
+    try:
+        d = os.environ.get("LV_DATA_DIR") or app_dir()
+        p = os.path.join(d, "lv-run-%s.log" % time.strftime("%Y%m%d"))
+        if not os.path.isfile(p):
+            return []
+        size = os.path.getsize(p)
+        if size <= 0:
+            return []
+        chunk = 64 * 1024
+        lines = []
+        while True:
+            take = min(chunk, size, max_bytes)
+            start = size - take
+            with open(p, "rb") as f:
+                f.seek(start)
+                data = f.read()
+            if start > 0:
+                # 从中间切进来的，第一行大概率是半截，丢掉
+                nl = data.find(b"\n")
+                data = data[nl + 1:] if nl >= 0 else b""
+                # ★ 2026-11-01 补：文件末尾那一行可能正在被追加写、还没写完，
+                #   读到的就是半截。本程序写日志每次都是 line + "\n" 再 flush，
+                #   所以"末尾不是换行"就等于没写完，丢掉这半行。
+                #   只在从中间读（start>0）时做这个判断，从头读的小文件不受影响。
+                if data and not data.endswith(b"\n"):
+                    cut = data.rfind(b"\n")
+                    data = data[:cut + 1] if cut >= 0 else b""
+            lines = data.decode("utf-8", "replace").splitlines()
+            if len(lines) >= limit or start == 0 or take >= max_bytes:
+                break
+            chunk *= 2
+        return [ln for ln in lines[-limit:] if ln.strip()]
+    except Exception:
+        return []
+
+
+# ---------------- 账号区草稿：存到程序这边，换浏览器/换电脑都不丢 ----------------
+DRAFT_FILE = "lv-account-draft.json"
+_DRAFT_LOCK = threading.Lock()   # 多窗口同时自动保存时串行化，防止"读-改-写"互相覆盖
+
+
+def draft_path():
+    d = os.environ.get("LV_DATA_DIR") or app_dir()
+    return os.path.join(d, DRAFT_FILE)
+
+
+def load_draft():
+    """读出 {gh: 国际版GitHub标签原文, gg: 国际版谷歌标签原文, dom: 国内版原文}。
+    文件不存在就返回全空；任何异常也只返回全空，绝不影响页面打开。"""
+    out = {"gh": "", "gg": "", "dom": ""}
+    try:
+        p = draft_path()
+        if os.path.isfile(p):
+            raw = json.load(open(p, encoding="utf-8"))
+            if isinstance(raw, dict):
+                for k in out:
+                    v = raw.get(k)
+                    out[k] = v if isinstance(v, str) else ""
+    except Exception:
+        pass
+    return out
+
+
+def save_draft(key, text):
+    """写某一个分栏的账号原文（gh/gg/dom）。只覆盖指定那一栏，其它栏保持原样。
+    ★ 多窗口同时自动保存时，靠 _DRAFT_LOCK 串行化，避免"读-改-写"互相覆盖丢内容。"""
+    if key not in ("gh", "gg", "dom"):
+        return {"ok": False, "error": "未知的账号栏：%s" % key}
+    with _DRAFT_LOCK:
+        cur = load_draft()
+        cur[key] = "" if text is None else str(text)
+        try:
+            p = draft_path()
+            # 直接覆写而非"写临时文件再替换"：Windows 上文件被另一窗口占读时 os.replace 会偶发失败
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            return {"ok": True, "bytes": len(cur[key])}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+def clear_draft(key):
+    """手动清空：把某一栏抹掉。'all' 表示三栏全清。"""
+    with _DRAFT_LOCK:
+        if key == "all":
+            try:
+                p = draft_path()
+                if os.path.isfile(p):
+                    os.remove(p)
+                return {"ok": True}
+            except Exception as e:
+                return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        cur = load_draft()
+        if key not in cur:
+            return {"ok": False, "error": "未知的账号栏：%s" % key}
+        cur[key] = ""
+        try:
+            with open(draft_path(), "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
 def token_path():
     """凭证文件位置。
     优先用环境变量 LV_DATA_DIR（Docker 版指向挂载的数据盘）；
@@ -1006,7 +1196,7 @@ class Job(object):
         t0 = time.time()
         if acc.get("provider") == "google":
             token = google_login_retry(acc["email"], acc["password"], acc.get("recovery", ""), px,
-                                       log=lambda m: self.log(tag + m))
+                                       log=lambda m: self.log(tag + m), totp_secret=acc.get("totp", ""))
         else:
             token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
                                    log=lambda m: self.log(tag + m))
@@ -1489,11 +1679,19 @@ class Job(object):
                 except Exception:
                     old = {}
             now = int(time.time())
+            changed = 0
             for k, v in self.tokens.items():
                 if k and v:
+                    prev = old.get(k)
+                    if (not isinstance(prev, dict)) or (prev.get("token") != v):
+                        changed += 1          # 新增（磁盘上没有）或更新（令牌值变了）
                     old[k] = {"token": v, "ts": now}
+            if changed == 0:
+                # 本次没有任何新增/更新的令牌（例如账号全部登录失败）→ 不写盘，也不谎报"已存"
+                self.log("本次未获取到新令牌，令牌库未变（共 %d 条）" % len(old))
+                return
             write_tokens(old)
-            self.log("令牌已存：%s（共 %d 条）" % (p, len(old)))
+            self.log("令牌已存：%s（本次新增/更新 %d 条，共 %d 条）" % (p, changed, len(old)))
         except Exception as e:
             self.log("存令牌失败：%s" % e)
 
@@ -1706,7 +1904,7 @@ class Monitor(object):
         try:
             if acc.get("provider") == "google":
                 token = google_login_retry(acc["email"], acc["password"], acc.get("recovery", ""),
-                                           px, log=lambda m: self.log(tag + m))
+                                           px, log=lambda m: self.log(tag + m), totp_secret=acc.get("totp", ""))
             else:
                 token = gh_login_retry(acc["login"], acc["password"], acc["tfa"], px,
                                        log=lambda m: self.log(tag + m))
@@ -2222,6 +2420,12 @@ class Api(object):
                                     "bundle_fallback": m.bundle_fallback}}
             # 无监控：走原逻辑
             if not self.job:
+                # ★ 2026-11-01：面板重启过（内存任务没了）时，把当天日志文件的尾部回放给页面，
+                #   免得老大一刷新/一重启界面就一片空白，不知道刚才跑成什么样。纯只读兜底。
+                old = read_day_log_tail()
+                if old:
+                    return {"ok": True, "logs": old, "rows": [], "done": True,
+                            "summary": "", "running": False, "from_file": True}
                 return {"ok": True, "logs": [], "rows": [], "done": True, "summary": "", "running": False}
             snap = self.job.snapshot()
             snap["ok"] = True

@@ -270,16 +270,25 @@ HANDLERS = {
     "deploy_msg_set":    lambda a: API.deploy_msg_set(a[0] if a else ""),
     "deploy_msg_reset":  lambda a: API.deploy_msg_reset(),
     "export_text":       lambda a: API.export_text(a[0] if a else "all"),
+    # ---- 账号区草稿：存到程序目录，换浏览器/换电脑/清缓存都不丢 ----
+    #   get  → 读出三栏原文 {gh, gg, dom}
+    #   save → 存某一栏（前端打字时自动存，防抖后调用）
+    #   clear→ 手动清空：传 'gh'/'gg'/'dom' 清对应栏，传 'all' 三栏全清
+    "account_draft_get":   lambda a: dict({"ok": True}, **core.load_draft()),
+    "account_draft_save":  lambda a: core.save_draft(a[0] if a else "", a[1] if len(a) > 1 else ""),
+    "account_draft_clear": lambda a: core.clear_draft(a[0] if a else ""),
     "tokens_info":       lambda a: API.tokens_info(),
     "export_tokens":     lambda a: _export_tokens(),
     "import_tokens_text": lambda a: _import_tokens_text(a[0] if a else ""),
     "delete_tokens":     lambda a: _delete_tokens(a[0] if a else ""),
     # ---- 国内版（与国际版逻辑隔离，凭证走 domestic-tokens.json）----
     "domestic_parse":   lambda a: (lambda t: {"ok": True, "accounts": t, "count": len(t)})(dcore.parse_accounts(a[0] if a else "")),
-    "domestic_login":   lambda a: dcore.start("login", a[0] if a else "", a[1] if len(a) > 1 else None),
-    "domestic_run":     lambda a: dcore.start("full", a[0] if a else "", a[1] if len(a) > 1 else None, a[2] if len(a) > 2 else False),
+    "domestic_login":   lambda a: dcore.start("login", a[0] if a else ""),
+    "domestic_run":     lambda a: dcore.start("full", a[0] if a else "", a[1] if len(a) > 1 else False,
+                                              a[2] if len(a) > 2 else "auto_ai_fallback"),
     # 续跑：账号已登录+已实名，只补跑「订阅→建Bot→部署」。复用已落盘凭证，不取号、不花钱、不换号。
-    "domestic_resume":  lambda a: dcore.start("resume", a[0] if a else "", a[1] if len(a) > 1 else None),
+    "domestic_resume":  lambda a: dcore.start("resume", a[0] if a else "", False,
+                                              a[1] if len(a) > 1 else "auto_ai_fallback"),
     "domestic_stop":    lambda a: dcore.stop(),
     "domestic_status":  lambda a: dcore.status(),
     "domestic_tokens":  lambda a: dcore.tokens_info(),
@@ -300,11 +309,14 @@ HANDLERS = {
     "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                                   a[4] if len(a) > 4 else ""),
-    "domestic_test_sms":         lambda a: dcore.test_sms(),
+    "domestic_test_sms":         lambda a: dcore.test_sms(a[0] if a else None),
     "domestic_test_proxy":       lambda a: dcore.test_proxy(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                             a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                             a[4] if len(a) > 4 else ""),
-    "domestic_sms_balance":      lambda a: dcore.sms_balance(),
+    # ★ 多平台并行：设置启用的接码平台 + 每平台并发数
+    "domestic_sms_platforms_set": lambda a: dcore.set_sms_platforms(a[0] if a else [],
+                                                                    (a[1] if len(a) > 1 else {}) or {}),
+    "domestic_sms_balance":      lambda a: dcore.sms_balance(a[0] if a else None),
     "domestic_test_feihu":       lambda a: dcore.test_feihu(),
     "domestic_deploy_set":       lambda a: dcore.set_deploy_config(
         a[0] if len(a) > 0 else True,
@@ -314,6 +326,25 @@ HANDLERS = {
     "domestic_deploy_msg_get":   lambda a: dcore.get_deploy_msg(),
     "domestic_deploy_msg_set":   lambda a: dcore.set_deploy_msg(a[0] if a else ""),
     "domestic_deploy_msg_reset": lambda a: dcore.reset_deploy_msg(),
+    # ★ 国内版放货监控 2026-10-30（照搬国际版；域名走 .com、凭证用国内版 bearer、
+    #   TG 的 token/chat_id 沿用国际版 lv-tg.json、推送开关国内版独立）
+    "domestic_monitor_start":    lambda a: dcore.domestic_monitor_start(
+        a[0] if a else "",                              # 账号文本
+        a[1] if len(a) > 1 else "",                     # 代理
+        a[2] if len(a) > 2 else 5,                      # 轮询间隔(秒)
+        a[3] if len(a) > 3 else 1,                      # 并发
+        a[4] if len(a) > 4 else "launch_ai",            # 套餐策略
+        _truthy(a[5]) if len(a) > 5 else False,         # 自动开抢（默认关）
+        _truthy(a[6]) if len(a) > 6 else True),         # ★ 复用凭证（默认开）
+    "domestic_monitor_stop":      lambda a: dcore.domestic_monitor_stop(),
+    "domestic_monitor_stop_push": lambda a: dcore.domestic_monitor_stop_push(),
+    "domestic_monitor_status":    lambda a: dcore.domestic_monitor_status(),
+    "domestic_tg_test":           lambda a: dcore.domestic_tg_test(
+        a[0] if len(a) > 0 else "",                     # 代理（与国际版 tg_test 顺序一致）
+        a[1] if len(a) > 1 else 5),                     # 间隔秒
+    "domestic_tg_set_enabled":    lambda a: dcore.dom_tg_set_enabled(
+        _truthy(a[0]) if a else True),
+    "domestic_tg_status":         lambda a: dcore.dom_tg_config(),
 }
 
 
