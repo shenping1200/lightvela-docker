@@ -8,6 +8,11 @@
   :root{
     --bg:#f5f6f8; --card:#ffffff; --line:#e3e6ea; --line2:#cfd4da;
     --tx:#1f2328; --tx2:#5b636d; --tx3:#8b939c;
+    /* ★ 2026-11-01 补：--tx1 / --bg2 之前被「Telegram 推送」小面板用了，
+       但从来没定义过。--bg2 写了兜底值所以看不出问题；--tx1 没写兜底，
+       浏览器会当成无效值直接忽略（颜色靠继承父级才碰巧显示正常）。
+       这里补成 --tx / 浅灰的别名，老写法不用改。 */
+    --tx1:#1f2328; --bg2:#f7f7f9;
     --blue:#2f6fed; --blue-bg:#eaf1fe;
     --green:#1a7f47; --green-bg:#e8f6ee;
     --red:#c0362c; --red-bg:#fdecea;
@@ -16,14 +21,18 @@
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--tx);
-    font:13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+    font:13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    /* ★ 2026-11-01：整页改成「上顶栏 + 下面填满」的弹性布局，高度交给浏览器自己算。
+       原来两处写死「100vh 减 45px / 减 92px」，实测顶栏是 52px，结果国际版底部溢出 7px
+       冒出竖向滚动条、国内版底部空 40px。数字写死迟早会和真实高度对不上，这里根治。 */
+    display:flex;flex-direction:column;height:100vh}
   header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--card);
-    border-bottom:1px solid var(--line)}
+    border-bottom:1px solid var(--line);flex:none}
   header h1{font-size:15px;font-weight:500;margin:0}
   .chip{font-size:12px;padding:2px 9px;border-radius:20px;background:var(--green-bg);color:var(--green)}
   .chip.off{background:var(--amber-bg);color:var(--amber)}
   .spacer{flex:1}
-  main{display:flex;gap:12px;padding:12px;height:calc(100vh - 45px)}
+  main{display:flex;gap:12px;padding:12px;flex:1;min-height:0}
   .col{display:flex;flex-direction:column;gap:12px;min-height:0}
   .col.left{flex:0 0 var(--left-w,460px);width:var(--left-w,460px);max-width:68vw;overflow-y:auto;overflow-x:hidden}
   .col.right{flex:1;min-width:0}
@@ -35,8 +44,25 @@
   .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;
     display:flex;flex-direction:column;min-height:0;flex:none}
   .card h2{font-size:13px;font-weight:500;margin:0 0 8px;color:var(--tx);
-    display:flex;align-items:center;gap:8px}
-  .card h2 .sub{font-weight:400;color:var(--tx3);font-size:12px}
+    display:flex;align-items:center;gap:8px;
+    /* ★ 2026-11-01：标题栏加了折叠按钮后，右边空间被占掉一截，
+       「账号」这种两字标题会被挤成「账」上「号」下两行。这里禁止标题换行，
+       太长的说明文字（.sub）自己用省略号收尾。 */
+    white-space:nowrap;min-width:0}
+  .card h2 .sub{font-weight:400;color:var(--tx3);font-size:12px;
+    min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* ---- 折叠抽屉：每块带标题的卡片右上角加展开/收起按钮 ---- */
+  .foldbtn{margin-left:auto;cursor:pointer;border:1px solid var(--line2);background:#fff;color:var(--tx2);
+    border-radius:6px;font-size:12px;line-height:1;padding:3px 10px;white-space:nowrap;flex:none}
+  .foldbtn:hover{border-color:var(--blue);color:var(--blue)}
+  .card .cbody{display:flex;flex-direction:column;min-height:0;flex:1}
+  .card.collapsed .cbody{display:none}
+  /* ★ 2026-11-01：两个账号卡片上写了内联 min-height:212px，
+     只压 flex 压不住它，结果折叠后内容藏了、卡片还是占 212px 高，等于白折。
+     这里用 !important 一并压掉（内联样式只有 !important 才能盖过）。 */
+  .card.collapsed{flex:none!important;min-height:0!important}
+  /* ★ 2026-11-01：收起后标题的 8px 下边距会让卡片底部空出一块，收干净 */
+  .card.collapsed h2{margin-bottom:0}
   textarea{width:100%;flex:1;min-height:120px;resize:vertical;border:1px solid var(--line2);
     border-radius:8px;padding:8px;font:12px/1.55 var(--mono);color:var(--tx);background:#fcfcfd}
   textarea:focus,input:focus,select:focus{outline:none;border-color:var(--blue)}
@@ -93,6 +119,8 @@
   .tabbtn:hover{border-color:var(--blue);color:var(--blue)}
   .tabbtn.active{background:var(--blue);border-color:var(--blue);color:#fff}
   .tabpane{display:none}
+  /* ★ 2026-11-01：国内版整页容器跟随 body 弹性撑满（原来是写死 100vh-92px，底部空 40px） */
+  #tab-domestic{flex:1;min-height:0;overflow:hidden}
   #login{position:absolute;inset:0;background:var(--bg);display:none;
     align-items:center;justify-content:center;z-index:99}
   #login .box{background:var(--card);border:1px solid var(--line);border-radius:12px;
@@ -138,7 +166,7 @@
       </h2>
       <textarea id="acc" spellcheck="false" placeholder="每行一个账号：
 puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYNTE----2026-09-29 21:42:19"></textarea>
-      <textarea id="accG" spellcheck="false" style="display:none" placeholder="每行一个账号（Google）：&#10;you@gmail.com----你的密码----辅助邮箱（可选）"></textarea>
+      <textarea id="accG" spellcheck="false" style="display:none" placeholder="每行一个账号（Google）：&#10;you@gmail.com----你的密码----2FA验证字符串（可选）"></textarea>
       <div class="bar" style="margin-top:8px">
         <button class="btn sm" id="btnImport">导入 txt</button>
         <button class="btn sm" id="btnClear">清空</button>
@@ -154,8 +182,8 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
       <div class="bar" style="margin-top:10px">
         <span style="color:var(--tx2);font-size:12px">导出：</span>
         <button class="btn sm" id="btnExpAll">全部</button>
-        <button class="btn sm" id="btnExpOk">仅成功</button>
-        <button class="btn sm" id="btnExpFail">仅失败</button>
+        <button class="btn sm" id="btnExpOk">导出成功</button>
+        <button class="btn sm" id="btnExpFail">导出失败</button>
         <button class="btn sm" id="btnImpFail">导入失败到账号区</button>
         <button class="btn sm" id="btnExpCopy">复制到剪贴板</button>
       </div>
@@ -328,7 +356,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
 
 <!-- ============ 国内版 Tab（与国际版逻辑隔离，凭证走 domestic-tokens.json） ============ -->
 <div id="tab-domestic" class="tabpane" style="display:none">
-  <div style="display:flex;gap:12px;padding:12px;height:calc(100vh - 92px)">
+  <div style="display:flex;gap:12px;padding:12px;height:100%">
     <div class="col left">
       <div class="card" style="flex:1;min-height:212px">
         <h2>国内版账号 <span class="sub">姓名----身份证（每行一条）</span></h2>
@@ -340,19 +368,131 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         </div>
       </div>
 
+      <!-- ★ 参数模式（原在接码平台下方，现移至账号区正下方） -->
+      <div class="card">
+        <h2>参数模式</h2>
+        <div class="row">
+          <label>模式</label>
+          <select id="domMode" style="flex:1">
+            <option value="login" selected>① 登录 + 拿凭证（不下单）</option>
+            <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
+            <option value="resume">③ 续跑（已登录+已实名，复用凭证，只跑订阅→建Bot→部署；不取号不花钱）</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>复用</label>
+          <label style="min-width:auto">
+            <input type="checkbox" id="domUseSaved"> 复用已存凭证（有则跳过取号/实名；缺则自动取号登录并保存）
+          </label>
+        </div>
+        <!-- ★ 2026-11-01 新增：国内版「订购套餐」三档（对齐国际版）
+             与国际版 bundleStrategy 一一对应；只对模式②全流程 / ③续跑生效，模式①登录不下单 -->
+        <div class="row">
+          <label>订购套餐</label>
+          <select id="domBundleStrategy" style="flex:1">
+            <option value="launch_ai">订购 4500 积分（启航 Launch AI，常售罄）</option>
+            <option value="launch">订购 100 积分（启航 Launch，现货）</option>
+            <option value="auto_ai_fallback" selected>优先 4500，售罄降级 100</option>
+          </select>
+        </div>
+        <div class="bar" style="margin-top:8px">
+          <button class="btn primary" id="domBtnStart">▶ 开始</button>
+          <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
+          <button class="btn sm" id="domBtnExportSuccess" disabled>导出成功</button>
+          <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
+          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
+          <span id="domRunStat" class="stat"></span>
+        </div>
+        <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见「部署策略」卡）。</div>
+      </div>
+
+      <!-- ★ 国内版放货监控 2026-10-30
+           照搬国际版；三处不同：域名 api.lightvela.com、凭证用国内版 bearer（复用已存）、
+           TG 的 token/chat_id 沿用国际版 lv-tg.json 但推送开关国内版独立 -->
+      <div class="card">
+        <h2>国内版放货监控 <span class="sub" id="domMonStat">未启动</span></h2>
+        <div class="row">
+          <label>套餐策略</label>
+          <select id="domMonBundle" style="flex:1">
+            <option value="launch_ai" selected>只盯 启航 Launch AI（4500 积分）</option>
+            <option value="launch">只盯 启航 Launch（100 积分）</option>
+            <option value="auto_ai_fallback">优先 4500，售罄降级 100</option>
+          </select>
+        </div>
+        <div class="mrow">
+          <div class="grp">
+            <label>轮询间隔</label>
+            <input type="number" id="domMonInterval" value="5" min="1" max="600" step="1">
+            <span class="unit">秒 / 轮</span>
+          </div>
+          <div class="grp">
+            <label>并发</label>
+            <input type="number" id="domMonParallel" value="1" min="1" max="50" step="1">
+            <span class="unit">个 / 批</span>
+          </div>
+        </div>
+        <div class="bar">
+          <button class="btn primary" id="domBtnMonStart">▶ 启动监控</button>
+          <button class="btn danger" id="domBtnMonStop" disabled>■ 停止</button>
+          <button class="btn sm" id="domBtnMonStopPush">🔕 停止推送</button>
+          <label style="display:flex;align-items:center;gap:6px;margin-left:10px;font-size:13px;color:var(--tx2)">
+            <input type="checkbox" id="domMonAutoRush" style="width:auto;margin:0">
+            自动开抢（不勾=只推 TG）
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--tx2)">
+            <input type="checkbox" id="domMonUseSaved" checked style="width:auto;margin:0">
+            复用已存凭证
+          </label>
+          <span class="stat" id="domMonPhase"></span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label>状态</label>
+          <span class="sub" id="domMonState" style="flex:1">—</span>
+        </div>
+        <div class="hint">监控日志统一输出到<b>右侧「日志」区</b>（与国际版一致），不看这里。</div>
+
+        <div style="margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--bg2,#f7f7f9)">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--tx1)">
+            Telegram 推送 <span class="sub" id="domTgStat" style="font-weight:400">读取中…</span>
+          </div>
+          <div class="hint" style="margin-bottom:8px">机器人令牌 / 会话 ID <b>沿用国际版</b>（读 lv-tg.json）；下面开关<b>只管国内版</b>，与国际版互不影响。</div>
+          <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:13px;color:var(--tx2)">
+            <input type="checkbox" id="domTgEnabled" checked style="width:auto;margin:0">
+            启用国内版推送
+          </label>
+          <div class="bar" style="margin-bottom:0">
+            <button class="btn sm" id="domBtnTgTest">📨 推送测试</button>
+            <span class="stat" id="domTgTestStat"></span>
+          </div>
+        </div>
+        <div class="hint">盯的是国内站 <b>api.lightvela.com</b>（不是国际版 .ai）。放货后每 5 秒推一条，直到点「停止推送」；勾了自动开抢才会跑全流程。启动需本地已有国内版凭证（复用，不重新取号花钱）。</div>
+      </div>
+
       <!-- ★ 接码平台 API 配置（平台切换 / 豪猪 / 飞狐 并存） -->
       <div class="card">
         <h2>接码平台 API <span class="sub" id="domSmsStat">默认账密</span></h2>
-        <div class="row">
-          <label>平台</label>
-          <select id="domSmsProvider" style="width:150px">
-            <option value="haozhuma" selected>豪猪（默认）</option>
-            <option value="feihu">飞狐</option>
-            <option value="lubansms">鲁班</option>
-            <option value="jcsms">疾驰短信</option>
-          </select>
-          <span class="sub" style="color:var(--tx3)">四套并存，选哪套哪套生效</span>
+        <!-- ★ 多平台并行：可同时启用多家，共用同一批账号池 -->
+        <div class="row" style="align-items:start">
+          <label>并行平台</label>
+          <div style="display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center">
+            <span class="sub" style="font-weight:600">启用</span>
+            <span class="sub" style="font-weight:600">接码平台</span>
+            <span class="sub" style="font-weight:600">并发数</span>
+            <input type="checkbox" id="domHzEn" checked>
+            <span>豪猪（默认）</span>
+            <input type="number" id="domHzConc" value="2" min="1" max="20" style="width:72px">
+            <input type="checkbox" id="domFhEn">
+            <span>飞狐</span>
+            <input type="number" id="domFhConc" value="2" min="1" max="20" style="width:72px">
+            <input type="checkbox" id="domLbEn">
+            <span>鲁班</span>
+            <input type="number" id="domLbConc" value="2" min="1" max="20" style="width:72px">
+            <input type="checkbox" id="domJcEn">
+            <span>疾驰短信</span>
+            <input type="number" id="domJcConc" value="2" min="1" max="20" style="width:72px">
+          </div>
         </div>
+        <div class="hint">勾选多家即「多平台并行」：所有平台<b>共用同一批账号</b>，某账号被任一平台成功取号即打标记、其余平台不再取它；某平台取号失败会自动换另一家有空位的平台重试。各平台并发数独立设置。</div>
 
         <!-- 豪猪面板 -->
         <div id="domHzPanel">
@@ -374,7 +514,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         </div>
 
         <!-- 飞狐面板 -->
-        <div id="domFhPanel" style="display:none">
+        <div id="domFhPanel">
           <div class="row">
             <label>API 地址</label>
             <input type="text" id="domFhBase" spellcheck="false" placeholder="http://api.feihu2026.com/api/sms">
@@ -392,7 +532,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
       </div>
 
       <!-- 鲁班面板（三平台共存，+86 国内号；service_id 留空填 +86 中国编号） -->
-      <div id="domLbPanel" style="display:none">
+      <div id="domLbPanel">
         <div class="row">
           <label>API 地址</label>
           <input type="text" id="domLbBase" spellcheck="false" placeholder="https://lubansms.com/v2/api（可不填，默认此值）">
@@ -407,7 +547,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
       </div>
 
       <!-- 疾驰短信面板（四平台共存；Header 带 fcToken，取号/取码/释放靠「项目ID + 手机号」定位） -->
-      <div id="domJcPanel" style="display:none">
+      <div id="domJcPanel">
         <div class="row">
           <label>API 地址</label>
           <input type="text" id="domJcBase" spellcheck="false" placeholder="https://www.jcsms.cc（可不填，默认此值）">
@@ -438,38 +578,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <button class="btn sm" id="domBtnSmsTest">测试连接 + 查余额</button>
           <span id="domSmsHint" class="stat"></span>
         </div>
-        <div class="hint">「保存配置」会把两套凭证都存下来并切换当前生效平台；「测试连接」测的是当前所选平台。</div>
-      </div>
-
-      <div class="card">
-        <h2>参数模式</h2>
-        <div class="row">
-          <label>模式</label>
-          <select id="domMode" style="flex:1">
-            <option value="login" selected>① 登录 + 拿凭证（不下单）</option>
-            <option value="full">② 全流程（注册→登录→实名→抢套餐→建Bot→部署，失败标红）</option>
-            <option value="resume">③ 续跑（已登录+已实名，复用凭证，只跑订阅→建Bot→部署；不取号不花钱）</option>
-          </select>
-        </div>
-        <div class="row">
-          <label>复用</label>
-          <label style="min-width:auto">
-            <input type="checkbox" id="domUseSaved"> 复用已存凭证（有则跳过取号/实名；缺则自动取号登录并保存）
-          </label>
-        </div>
-        <div class="row">
-          <label>并发</label>
-          <input type="number" id="domParallel" value="5" min="1" max="20" step="1">
-          <span class="sub" style="color:var(--tx3)">同时处理几个账号（默认 5）</span>
-        </div>
-        <div class="bar" style="margin-top:8px">
-          <button class="btn primary" id="domBtnStart">▶ 开始</button>
-          <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
-          <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
-          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
-          <span id="domRunStat" class="stat"></span>
-        </div>
-        <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见上方「部署策略」卡）。</div>
+        <div class="hint">「保存配置」会把四套凭证都存下来，并按上面勾选+并发设置多平台并行；「测试连接」逐家验证所有已启用平台。</div>
       </div>
 
       <!-- ★ 部署命令（全流程模式原样发给机器人） -->
@@ -580,6 +689,7 @@ const esc = s => String(s == null ? '' : s)
   .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 let pollTimer = null, logLen = 0, running = false, booted = false;
 let currentTab = 'intl', domRunning = false, domLogLen = 0, lastDomStatus = null, domResumedOnce = false;
+let intlResumedOnce = false;   // ★ 2026-11-01：国际版"刷新后续接显示"只做一次，避免心跳重复回填
 
 /* ---------- 后端桥：把 window.pywebview.api 换成 fetch ---------- */
 const API = new Proxy({}, {
@@ -618,6 +728,9 @@ async function doLogin() {
   hideLogin();
   setStatus('已就绪', true);
   boot();
+  // ★ 2026-11-01：密码登录是不刷页面的，必须在这里补一次账号草稿初始化，
+  //   否则"每次打开都要输密码"的浏览器永远不会装上自动保存。
+  await draftRestoreAll();
 }
 async function doLogout() {
   await API.logout();
@@ -715,25 +828,40 @@ function switchAccTab(which) {
   } else {
     $('acc').style.display = 'none'; $('accG').style.display = '';
     $('tabGgBtn').classList.add('active'); $('tabGhBtn').classList.remove('active');
-    $('accSub').textContent = '邮箱----密码----辅助邮箱（每行一个）';
+    $('accSub').textContent = '邮箱----密码----2FA验证字符串（每行一个）';
   }
   doParse();   // 切换后立即刷新解析统计
 }
 function accPayload() {
-  // 提交用：GitHub 原样 + Google 每行自动补 ----google（后端据此判谷歌账号）
-  const gh = $('acc').value.trim();
-  const ggRaw = $('accG').value.trim();
-  const gg = ggRaw.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
-    const low = l.toLowerCase();
-    return (low.endsWith('----google') || low.endsWith('----g')) ? l : (l + '----google');
-  }).join('\n');
-  return [gh, gg].filter(Boolean).join('\n');
+  // 只取当前激活的账号标签（GitHub / Google），两个标签不串
+  const raw = (currentAccEl().value || '').trim();
+  if ($('accG').style.display !== 'none') {
+    // Google 标签可见：每行补 ----google 标记，后端据此判谷歌账号
+    return raw.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+      const low = l.toLowerCase();
+      return (low.endsWith('----google') || low.endsWith('----g')) ? l : (l + '----google');
+    }).join('\n');
+  }
+  return raw; // GitHub 标签：原样
 }
 
 /* ---------- 各功能 ---------- */
+/* ★ 2026-11-01：原来输入框每敲一个字就把整份账号文本 POST 给后端重新解析，
+   几万个号时（几百 KB）每敲一下就发一次请求 + 跑一遍正则，打字会明显发涩。
+   现在输入事件走 300ms 防抖，并且内容没变化就不重复请求。
+   显式调用 doParse() 的地方（导入、开始任务、切 Tab）照旧立即执行，不受影响。 */
+let parseTimer = null;
+let lastParseSig = null;
+function doParseSoon() {
+  if (parseTimer) clearTimeout(parseTimer);
+  parseTimer = setTimeout(() => { parseTimer = null; doParse(); }, 300);
+}
 async function doParse() {
-  const r = await API.parse(currentAccValue());
-  if (!r || !r.ok) { $('parseStat').textContent = '解析失败'; return; }
+  const payload = accPayload();
+  if (payload === lastParseSig) return;      // 内容没变，没必要再问一次后端
+  const r = await API.parse(payload);   // 用带 ----google 标记的内容，让谷歌号在预览里被正确识别
+  if (!r || !r.ok) { $('parseStat').textContent = '解析失败'; lastParseSig = null; return; }
+  lastParseSig = payload;                    // 只有成功才记指纹，失败了下次还能重试
   const bad = r.invalid;
   $('parseStat').innerHTML = '共 <b>' + r.total + '</b> 个 · 有效 <b>' + r.valid + '</b>' +
     (bad ? ' · <span class="bad">无效 ' + bad + '</span>' : '');
@@ -741,7 +869,9 @@ async function doParse() {
 async function doImport() {
   const text = await pickFile($('fileTxt'));
   if (text == null) return;
-  currentAccEl().value = text;
+  const el = currentAccEl();
+  el.value = text;
+  el.dispatchEvent(new Event('input'));   // ★ 2026-11-01：导入是脚本赋值的，不触发 input，手动派一次让草稿立刻落盘
   appendLog(['[已导入] ' + text.split('\n').filter(Boolean).length + ' 行']);
   doParse();
 }
@@ -800,7 +930,11 @@ async function doMonStart() {
   $('btnStart').disabled = true; $('btnStop').disabled = true;
   $('monStat').textContent = '运行中';
   setStatus('监控中…', false);
-  if (!pollTimer) pollTimer = setInterval(poll, 700);
+  // ★ 2026-10-30 修：这里原来写的是 setInterval(poll, 700)，但 pollTimer 已经由页面初始化
+  //   用 pollDispatch 占着了，所以这行永远不会执行；万一 pollTimer 被清空过（任务结束时清），
+  //   又会启动一个绕过分发器的 poll，切到国内版标签页时面板就不刷新。
+  //   统一走 pollDispatch（它自己会按当前标签页分发到 poll / domPoll）。
+  if (!pollTimer) pollTimer = setInterval(pollDispatch, 700);
 }
 async function doMonStop() {
   const r = await API.monitor_stop();
@@ -903,7 +1037,7 @@ async function doCopy(which) {
 async function doDump(which) {
   const r = await API.export_text(which);
   if (!r || !r.ok) { appendLog(['[导出] ✗ ' + (r && r.error)]); return; }
-  const label = {all: '全部', ok: '仅成功', fail: '仅失败'}[which] || which;
+  const label = {all: '全部', ok: '成功', fail: '失败'}[which] || which;
   appendLog(['=== 导出 ' + label + '：' + r.count + ' 个账号（可直接鼠标拖选复制）===']);
   appendLog([r.text]);
 }
@@ -915,7 +1049,7 @@ async function doImportFailed() {
   if (!text) { appendLog(['[导入失败] 没有失败账号 ✓']); return; }
   currentAccEl().value = '';                          // 先清空当前标签账号区
   currentAccEl().value = text;                        // 填入失败账号
-  currentAccEl().dispatchEvent(new Event('input'));   // 触发解析刷新账号数
+  currentAccEl().dispatchEvent(new Event('input'));   // 触发解析刷新账号数 + 草稿落盘
   appendLog(['[导入失败] 已清空账号区并填入 ' + (r.count || 0) + ' 个失败账号（可直接点开始重跑）']);
 }
 async function doTkInfo() {
@@ -959,6 +1093,12 @@ async function poll() {
   if (!running) return;
   const s = await API.poll();
   if (!s || !s.ok) return;
+  // ★ 2026-11-01：后端日志超过 4000 行会丢掉最前面 1500 行，此时 s.logs.length 会突然变小。
+  //   老代码只判断 length > logLen，一旦被截断就永远追不上，界面表现为"日志卡住不再刷新"。
+  if (s.logs && s.logs.length < logLen) {
+    appendLog(['[日志过长，前段已被后端丢弃，下面只补最新的部分]']);
+    logLen = Math.max(0, s.logs.length - 200);
+  }
   if (s.logs && s.logs.length > logLen) { appendLog(s.logs.slice(logLen)); logLen = s.logs.length; }
   // 监控阶段（放货前）显示占位提示；触发后显示账号表格
   if (s.monitor && s.monitor.running && (!s.rows || !s.rows.length)) {
@@ -1000,6 +1140,56 @@ async function poll() {
     clearInterval(pollTimer); pollTimer = null;
     doTkInfo();
   }
+}
+
+/* ---------- 刷新/重开页面后，把后端已有的任务重新显示出来 ----------
+   ★ 2026-11-01 修：老大反馈"刷新一下界面，正在跑的任务日志就没了"。
+   根因：poll() 第一句是 if (!running) return;，而 running 只在前端点「开始」时才置 true。
+   页面一刷新这个开关就复位成 false，于是一次都不去取日志 —— 日志本身好好躺在后端内存和
+   当天日志文件里，只是没人显示。
+   现在页面加载时主动取一次快照：有任务就回填日志+表格+汇总，并把按钮状态也复原。 */
+async function intlResume() {
+  if (intlResumedOnce || running) return;
+  let s = null;
+  try { s = await API.poll(); } catch (e) { return; }
+  if (!s || !s.ok) return;
+  const logs = s.logs || [], rows = s.rows || [];
+  const summary = (s.summary == null ? '' : String(s.summary)).trim();
+  const hasJob = logs.length || rows.length || s.running || summary;
+  if (!hasJob) return;                       // 后端确实什么都没有，不打扰
+  intlResumedOnce = true;
+
+  // 情形一：面板重启过，内存里任务已丢，只能从当天日志文件回放历史
+  if (s.from_file) {
+    appendLog(['[日志回放] 面板重启过，内存任务已消失，以下是今天日志文件里的记录（只读，无法再看实时进度）']);
+    logLen = logs.length;
+    appendLog(logs);
+    setStatus('历史日志', false);
+    return;
+  }
+
+  // 情形二：任务还在后端内存里（运行中 或 刚跑完）→ 完整续接
+  logLen = logs.length;
+  $('btnStart').disabled = true; $('btnStop').disabled = false;
+  appendLog(['[续接显示] 检测到后端任务：' + (s.running ? '仍在运行' : '已结束') + '，补全日志与结果中…']);
+  if (logs.length) appendLog(logs);
+  if (s.monitor && s.monitor.running) {
+    $('btnMonStart').disabled = true; $('btnMonStop').disabled = false;
+  }
+  if (s.done) {
+    // 已经跑完：直接把结果表、汇总、按钮状态一次性摆好，不再开轮询
+    running = false;
+    $('btnStart').disabled = false; $('btnStop').disabled = true;
+    $('btnMonStart').disabled = false; $('btnMonStop').disabled = true;
+    setStatus('已完成', true);
+    $('summary').textContent = s.summary || '';
+    if (rows.length) renderRows(rows);   // 有结果行才重画，避免把"还没有任务"的占位糊上去
+    doTkInfo();
+    return;
+  }
+  // 还在跑：交给正常轮询接手（logLen 已对齐，不会重复刷屏）
+  running = true;
+  if (!pollTimer) pollTimer = setInterval(pollDispatch, 700);
 }
 
 /* ---------- 左右栏拖动分隔条（国际版 + 国内版 共用，根据当前可见的左栏自动适配）---------- */
@@ -1051,7 +1241,11 @@ function boot() {
   if (booted) { doParse(); doTkInfo(); return; }
   booted = true;
   $('btnImport').onclick = doImport;
-  $('btnClear').onclick = () => { currentAccEl().value = ''; doParse(); };
+  $('btnClear').onclick = () => {
+    // ★ 2026-11-01：原来只抹界面、不删存档，一刷新内容又自己回来。现在清空=真删。
+    const key = ($('accG').style.display === 'none') ? 'gh' : 'gg';
+    draftClear(currentAccEl(), key, doParse);
+  };
   $('btnTest').onclick = doTestProxy;
   $('btnStart').onclick = () => { doStart(); if (!pollTimer) pollTimer = setInterval(pollDispatch, 700); };
   $('btnStop').onclick = doStop;
@@ -1072,7 +1266,7 @@ function boot() {
   $('btnLogout').onclick = doLogout;
   $('btnDepSave').onclick = doDepSave;
   $('btnDepReset').onclick = doDepReset;
-  $('acc').addEventListener('input', doParse);
+  $('acc').addEventListener('input', doParseSoon);
   $('mode').addEventListener('change', syncMode);
   syncMode();
   doParse();
@@ -1083,9 +1277,13 @@ function boot() {
   $('tabIntlBtn').onclick = () => switchTab('intl');
   $('tabDomBtn').onclick = () => switchTab('domestic');
   $('domBtnImport').onclick = domImport;
-  $('domBtnClear').onclick = () => { $('domAcc').value = ''; domParse(); };
+  $('domBtnClear').onclick = () => {
+    // ★ 2026-11-01：清空=真删存档，下次打开才什么都没有
+    draftClear($('domAcc'), 'dom', domParse);
+  };
   $('domBtnStart').onclick = domStart;
   $('domBtnStop').onclick = domStop;
+  $('domBtnExportSuccess').onclick = domExportSuccess;
   $('domBtnExportFailed').onclick = domExportFailed;
   $('domBtnImportFailed').onclick = domImportFailed;
   $('domBtnTkInfo').onclick = domTkInfo;
@@ -1093,20 +1291,27 @@ function boot() {
   $('domBtnTkDel').onclick = domTkDel;
   $('domBtnSmsSave').onclick = domSmsSave;
   $('domBtnSmsTest').onclick = domSmsTest;
-  $('domSmsProvider').onchange = toggleSmsProvider;
   $('domBtnProxySave').onclick = domProxySave;
   $('domBtnProxyTest').onclick = domProxyTest;
   $('domBtnStratSave').onclick = domStrategySave;
   $('domBtnStratReset').onclick = domStrategyReset;
   $('domBtnDepSave').onclick = domDepSave;
   $('domBtnDepReset').onclick = domDepReset;
-  $('domAcc').addEventListener('input', domParse);
+  // ---- 国内版放货监控 ----
+  $('domBtnMonStart').onclick = domMonStart;
+  $('domBtnMonStop').onclick = domMonStop;
+  $('domBtnMonStopPush').onclick = domMonStopPush;
+  $('domBtnTgTest').onclick = domTgTest;
+  $('domTgEnabled').onchange = domTgToggle;
+  domTgLoad();   // 载入国内版推送开关（token/chat_id 沿用国际版）
+  $('domAcc').addEventListener('input', domParseSoon);
   loadDomConfig();
   loadDomStrategy();
   loadDomDeployMsg();
   switchTab('intl');
   if (!pollTimer) pollTimer = setInterval(pollDispatch, 700);
   domResume();   // 页面加载时：后端若已有国内版任务在跑，自动续接显示
+  intlResume();  // ★ 2026-11-01：国际版同理，刷新后把日志/结果续接回来，不再一片空白
   initSplitter();
 }
 /* 登录按钮必须在"未登录"时也绑上（不能放进 boot，否则登录页点不动） */
@@ -1138,9 +1343,20 @@ function appendDomLog(lines) {
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
+/* ★ 2026-11-01：国内版账号框也改成"停手 300ms 再解析 + 内容没变不重复请求"，
+   跟国际版保持一致。原来每敲一个字就把整段姓名身份证发给后端解析一遍。 */
+let domParseTimer = null;
+let lastDomParseSig = null;
+function domParseSoon() {
+  if (domParseTimer) clearTimeout(domParseTimer);
+  domParseTimer = setTimeout(() => { domParseTimer = null; domParse(); }, 300);
+}
 async function domParse() {
-  const r = await API.domestic_parse($('domAcc').value);
-  if (!r || !r.ok) { $('domParseStat').textContent = '解析失败'; return; }
+  const payload = $('domAcc').value;
+  if (payload === lastDomParseSig) return;      // 内容没变，不用再问一次后端
+  const r = await API.domestic_parse(payload);
+  if (!r || !r.ok) { $('domParseStat').textContent = '解析失败'; lastDomParseSig = null; return; }
+  lastDomParseSig = payload;
   $('domParseStat').innerHTML = '共 <b>' + r.count + '</b> 个';
 }
 
@@ -1148,30 +1364,127 @@ async function domImport() {
   const text = await pickFile($('fileDomTxt'));
   if (text == null) return;
   $('domAcc').value = text;
+  $('domAcc').dispatchEvent(new Event('input'));   // ★ 2026-11-01：导入后立刻存草稿
   appendDomLog(['[已导入] ' + text.split('\n').filter(Boolean).length + ' 行']);
   domParse();
+}
+
+/* 总并发 = 所有「启用」的接码平台并发数之和（各家独立设置，严格隔离不串台） */
+function _domTotalConc() {
+  let s = 0;
+  if ($('domHzEn').checked)  s += Math.max(1, parseInt($('domHzConc').value, 10) || 1);
+  if ($('domFhEn').checked)  s += Math.max(1, parseInt($('domFhConc').value, 10) || 1);
+  if ($('domLbEn').checked)  s += Math.max(1, parseInt($('domLbConc').value, 10) || 1);
+  if ($('domJcEn').checked)  s += Math.max(1, parseInt($('domJcConc').value, 10) || 1);
+  return s;
 }
 
 async function domStart() {
   await domParse();
   const mode = $('domMode').value;
-  const conc = parseInt($('domParallel').value, 10) || 5;
   const useSaved = $('domUseSaved').checked;
+  // ★ 总并发 = 所有启用接码平台的并发数之和（参数设置里的「并发」输入框已移除，由各家平台并发控制）
+  const totalConc = _domTotalConc();
   // 模式③「续跑」：复用已登录凭证，跳过取号/登录/实名（不花豪猪钱、不换号）
   // 模式② + 勾选「复用已存凭证」：有凭证跳过取号/实名，缺凭证自动取号登录补全（对齐国际版"有就用、没有就登录补全并保存"）
   const modeLabel = mode === 'login' ? '① 登录+拿凭证'
                   : (mode === 'resume' ? '③ 续跑（复用凭证）'
                   : (useSaved ? '② 全流程（复用凭证）' : '② 全流程'));
+  // ★ 2026-11-01：订购套餐策略（三档，对齐国际版）；模式①登录不下单，忽略即可
+  const bundleStrategy = $('domBundleStrategy') ? $('domBundleStrategy').value : 'auto_ai_fallback';
   let r;
-  if (mode === 'login')        r = await API.domestic_login($('domAcc').value, conc);
-  else if (mode === 'resume') r = await API.domestic_resume($('domAcc').value, conc);
-  else                         r = await API.domestic_run($('domAcc').value, conc, useSaved);
+  if (mode === 'login')        r = await API.domestic_login($('domAcc').value);
+  else if (mode === 'resume') r = await API.domestic_resume($('domAcc').value, bundleStrategy);
+  else                         r = await API.domestic_run($('domAcc').value, useSaved, bundleStrategy);
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
-  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
+  domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportSuccess').disabled = true; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
   switchTab('domestic');
-  appendDomLog(['[已启动] 模式=' + modeLabel + ' · 并发=' + conc + ' · 复用=' + (useSaved ? '是' : '否') + ' · 共 ' + r.total + ' 个']);
+  const bundleLabel = mode === 'login' ? '（登录模式不下单）'
+                    : (bundleStrategy === 'launch_ai' ? '只订4500'
+                    : (bundleStrategy === 'launch' ? '只订100' : '优先4500→降级100'));
+  appendDomLog(['[已启动] 模式=' + modeLabel + ' · 套餐策略=' + bundleLabel + ' · 总并发=' + totalConc + '（各接码平台并发之和） · 复用=' + (useSaved ? '是' : '否') + ' · 共 ' + r.total + ' 个']);
   domPoll();   // 启动成功立刻拉一次结果，不等轮询器第一跳
+}
+
+/* ---------- 国内版放货监控（照搬国际版；域名 .com、凭证复用、TG开关独立） ---------- */
+let domMonTimer = null;
+let domMonLogLen = 0;   // 监控日志已输出到【右侧日志区】的条数（增量追加用）
+
+async function domMonStart() {
+  const proxy = '';   // 国内版默认直连（后端会自动「直连优先、失败走代理」）
+  const r = await API.domestic_monitor_start(
+    $('domAcc').value,
+    proxy,
+    parseInt($('domMonInterval').value, 10) || 5,
+    parseInt($('domMonParallel').value, 10) || 1,
+    $('domMonBundle').value,
+    !!$('domMonAutoRush').checked,
+    !!$('domMonUseSaved').checked);
+  if (!r || !r.ok) { alert('监控启动失败：' + (r && r.error)); return; }
+  // ★ 日志统一走【右侧日志区】（与国际版一致）：清空并重置两边计数
+  $('domLog').textContent = ''; domLogLen = 0; domMonLogLen = 0;
+  $('domBtnMonStart').disabled = true;
+  $('domBtnMonStop').disabled = false;
+  $('domMonStat').textContent = '运行中';
+  if (!domMonTimer) domMonTimer = setInterval(domMonPoll, 1500);
+  domMonPoll();
+}
+
+async function domMonStop() {
+  const r = await API.domestic_monitor_stop();
+  if (!r || !r.ok) { alert('停止失败：' + (r && r.error)); return; }
+  $('domMonStat').textContent = '已停止';
+  $('domBtnMonStart').disabled = false;
+  $('domBtnMonStop').disabled = true;
+  if (domMonTimer) { clearInterval(domMonTimer); domMonTimer = null; }
+}
+
+async function domMonStopPush() {
+  const r = await API.domestic_monitor_stop_push();
+  if (!r || !r.ok) { alert('停止推送失败：' + (r && r.error)); return; }
+  $('domMonPhase').textContent = '🔕 已停止推送（共推 ' + (r.pushed || 0) + ' 条）';
+}
+
+async function domMonPoll() {
+  const r = await API.domestic_monitor_status();
+  if (!r || !r.ok) return;
+  $('domMonStat').textContent = r.running ? ('运行中 · ' + (r.phase || '')) : '未启动';
+  $('domMonPhase').textContent = r.state || '';
+  $('domMonState').textContent = r.state || '—';
+  // ★ 增量追加到【右侧日志区】（与任务日志同一块地方，不再单独一个小框）
+  const logs = r.logs || [];
+  if (logs.length < domMonLogLen) domMonLogLen = 0;   // 后端重置过（新监控）→ 从头再来
+  if (logs.length > domMonLogLen) {
+    appendDomLog(logs.slice(domMonLogLen));
+    domMonLogLen = logs.length;
+  }
+  $('domBtnMonStart').disabled = !!r.running;
+  $('domBtnMonStop').disabled = !r.running;
+  if (!r.running && domMonTimer) { clearInterval(domMonTimer); domMonTimer = null; }
+}
+
+/* ---------- 国内版 TG（token/chat_id 沿用国际版，开关各管各的） ---------- */
+async function domTgLoad() {
+  const r = await API.domestic_tg_status();
+  if (!r || !r.ok) { $('domTgStat').textContent = '读取失败'; return; }
+  $('domTgEnabled').checked = !!r.enabled;
+  $('domTgStat').textContent = (r.token && r.chat_id)
+    ? (r.enabled ? '已配置（沿用国际版 · 推送开）' : '已配置（沿用国际版 · 国内版推送已关）')
+    : '未配置（请在上面国际版填 token/chat_id）';
+}
+
+async function domTgToggle() {
+  const r = await API.domestic_tg_set_enabled($('domTgEnabled').checked);
+  if (!r || !r.ok) { alert('保存失败：' + (r && r.error)); return; }
+  domTgLoad();
+}
+
+async function domTgTest() {
+  const r = await API.domestic_tg_test('', 5);
+  $('domTgTestStat').textContent = (r && r.ok)
+    ? ('✓ 测试推送已启动（每 ' + (r.interval || 5) + ' 秒一条，点「停止推送」才停）')
+    : ('✗ ' + (r && r.error));
 }
 
 /* 页面刷新/切到国内版时：后端若已有任务在跑，自动续接显示（只恢复显示，不动任务） */
@@ -1183,13 +1496,25 @@ async function domResume() {
     domResumedOnce = true;   // ★ 标记已续接，之后心跳不再重复拉
     domRunning = true;
     $('domBtnStart').disabled = !s.running; $('domBtnStop').disabled = s.running;
-    $('domBtnExportFailed').disabled = s.running; $('domBtnImportFailed').disabled = s.running;
+    $('domBtnExportSuccess').disabled = s.running; $('domBtnExportFailed').disabled = s.running; $('domBtnImportFailed').disabled = s.running;
     appendDomLog([(s.running ? '[续接显示] 检测到后端任务运行中' : '[续接显示] 检测到已完成任务') + '：共 ' + (s.total || 0) + ' · 完成 ' + (s.done || 0)]);
     domPoll();
   }
 }
 
 async function domStop() { await API.domestic_stop(); }
+
+/* 导出成功账号到右侧日志区：把本次运行结果里 ok===true 的账号打印出来，方便鼠标拖选复制 */
+async function domExportSuccess() {
+  const s = lastDomStatus;
+  if (!s || !s.results) { appendDomLog(['[导出成功] 还没有运行记录']); return; }
+  const okList = (s.results || []).filter(r => r && r.ok === true);
+  if (!okList.length) { appendDomLog(['[导出成功] 没有成功账号']); return; }
+  const lines = okList.map(r => (r.name || '') + ' ' + (r.idCard || ''));   // ★ 与「导入失败到账号区」同款：每行 姓名 身份证
+  appendDomLog(['=== 成功账号（姓名 身份证，可直接鼠标拖选复制）===']);
+  appendDomLog(lines);
+  appendDomLog(['[导出成功] 共 ' + okList.length + ' 个（已显示在上方，未生成文件）']);
+}
 
 async function domExportFailed() {
   const s = lastDomStatus;
@@ -1211,7 +1536,7 @@ async function domImportFailed() {
   const text = failed.map(r => (r.name || '') + ' ' + (r.idCard || '')).join('\n');
   $('domAcc').value = '';                              // 先清空账号区
   $('domAcc').value = text;                            // 填入失败账号
-  $('domAcc').dispatchEvent(new Event('input'));       // 触发解析刷新账号数
+  $('domAcc').dispatchEvent(new Event('input'));       // 触发解析刷新账号数 + 草稿落盘
   appendDomLog(['[导入失败] 已清空账号区并填入 ' + failed.length + ' 个失败账号（可直接点开始重跑）']);
 }
 
@@ -1266,7 +1591,7 @@ async function domPoll() {
     (s.running ? ' · 运行中…' : ' · 已结束');
   if (!s.running) {
     domRunning = false;
-    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportFailed').disabled = false; $('domBtnImportFailed').disabled = false;
+    $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportSuccess').disabled = false; $('domBtnExportFailed').disabled = false; $('domBtnImportFailed').disabled = false;
     appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
     doTkInfo();
   }
@@ -1298,19 +1623,21 @@ function smsProviderName(p) {
   return ({ haozhuma: '豪猪', feihu: '飞狐', lubansms: '鲁班', jcsms: '疾驰' })[p] || '豪猪';
 }
 
-function toggleSmsProvider() {
-  const p = $('domSmsProvider').value;
-  $('domHzPanel').style.display = (p === 'haozhuma') ? '' : 'none';
-  $('domFhPanel').style.display = (p === 'feihu') ? '' : 'none';
-  $('domLbPanel').style.display = (p === 'lubansms') ? '' : 'none';
-  $('domJcPanel').style.display = (p === 'jcsms') ? '' : 'none';
-}
-
 async function loadDomConfig() {
   const r = await API.domestic_config_get();
   if (!r || !r.ok || !r.config) return;
   const s = r.config.sms || {};
-  $('domSmsProvider').value = (s.provider || 'haozhuma');
+  // ★ 多平台并行：读取启用的平台 + 每平台并发（缺省回退豪猪/并发2）
+  const en = (s.enabled && s.enabled.length) ? s.enabled : [s.provider || 'haozhuma'];
+  const cc = s.concurrency || {};
+  $('domHzEn').checked   = en.includes('haozhuma');
+  $('domFhEn').checked   = en.includes('feihu');
+  $('domLbEn').checked   = en.includes('lubansms');
+  $('domJcEn').checked   = en.includes('jcsms');
+  $('domHzConc').value = cc.haozhuma || 2;
+  $('domFhConc').value = cc.feihu    || 2;
+  $('domLbConc').value = cc.lubansms || 2;
+  $('domJcConc').value = cc.jcsms    || 2;
   // 豪猪
   $('domSmsBase').value = s.apiBase || 'https://api.haozhuma.com';
   $('domSmsUser').value = s.apiUser || '';
@@ -1333,9 +1660,10 @@ async function loadDomConfig() {
   $('domJcToken').value = jc.fcToken || '';
   $('domJcSid').value = jc.projectId || '';
   $('domJcEngine').value = jc.engine || '';
-  const pName = smsProviderName($('domSmsProvider').value);
-  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 当前：' + pName;
-  toggleSmsProvider();
+  // 状态栏：显示启用平台 + 总并发
+  const labels = en.map(p => smsProviderName(p));
+  const totalConc = en.reduce((sum, p) => sum + (parseInt(cc[p] || 2, 10) || 2), 0);
+  $('domSmsStat').textContent = (s.apiUser ? '已配置' : '默认账密') + ' · 并行：' + labels.join('/') + '（总并发 ' + totalConc + '）';
   const p = r.config.proxy || {};
   $('domPType').value = p.type || 'socks5';
   $('domPHost').value = p.host || '';
@@ -1346,8 +1674,15 @@ async function loadDomConfig() {
 }
 
 async function domSmsSave() {
-  const provider = $('domSmsProvider').value;
-  const r1 = await API.domestic_sms_provider_set(provider);
+  // ★ 多平台并行：收集启用的平台 + 每平台并发数
+  const enabled = [];
+  const conc = {};
+  if ($('domHzEn').checked) { enabled.push('haozhuma'); conc.haozhuma = parseInt($('domHzConc').value, 10) || 2; }
+  if ($('domFhEn').checked) { enabled.push('feihu');    conc.feihu    = parseInt($('domFhConc').value, 10) || 2; }
+  if ($('domLbEn').checked) { enabled.push('lubansms'); conc.lubansms = parseInt($('domLbConc').value, 10) || 2; }
+  if ($('domJcEn').checked) { enabled.push('jcsms');    conc.jcsms    = parseInt($('domJcConc').value, 10) || 2; }
+  if (!enabled.length) enabled.push('haozhuma');  // 至少启用一家，防全空
+  const r0 = await API.domestic_sms_platforms_set(enabled, conc);
   const r2 = await API.domestic_sms_set(
     $('domSmsBase').value.trim(),
     $('domSmsUser').value.trim(),
@@ -1371,31 +1706,42 @@ async function domSmsSave() {
     $('domJcSid').value.trim(),
     $('domJcEngine').value
   );
-  if (!((r1 && r1.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok) && (r5 && r5.ok))) {
+  if (!((r0 && r0.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok) && (r5 && r5.ok))) {
     $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败</span>'; return;
   }
-  const pName = smsProviderName(provider);
-  $('domSmsStat').textContent = '已保存 · 当前：' + pName;
+  const labels = enabled.map(p => smsProviderName(p));
+  const totalConc = enabled.reduce((sum, p) => sum + (conc[p] || 2), 0);
+  $('domSmsStat').textContent = '已保存 · 并行：' + labels.join('/') + '（总并发 ' + totalConc + '）';
   $('domSmsHint').innerHTML = '✓ 已保存（对新任务生效）';
   setTimeout(() => { $('domSmsHint').textContent = ''; }, 2500);
 }
 
 async function domSmsTest() {
   const btn = $('domBtnSmsTest');
-  const provider = $('domSmsProvider').value;
   btn.disabled = true; btn.textContent = '查询中…';
   $('domSmsHint').textContent = '';
   await domSmsSave();  // 先存最新值再测
-  const r = await API.domestic_sms_balance();
-  btn.disabled = false; btn.textContent = '测试连接 + 查余额';
-  const label = smsProviderName(provider);
-  if (!r || !r.ok) { $('domSmsHint').innerHTML = '<span style="color:var(--red)">✗ ' + esc(label) + '：' + esc(r && r.error) + '</span>'; return; }
-  // 疾驰没有余额接口：balance 里放的是说明文字（项目单价），不能当钱显示
-  if (provider === 'jcsms') {
-    $('domSmsHint').innerHTML = '✓ ' + esc(label) + '连通正常：<b>' + esc(String(r.summary || r.balance || '已连通')) + '</b>';
-  } else {
-    $('domSmsHint').innerHTML = '✓ ' + esc(label) + '登录成功，余额：<b>' + esc(String(r.balance)) + '</b> 元';
+  // 收集已启用平台，逐家测
+  const enabled = [];
+  if ($('domHzEn').checked) enabled.push('haozhuma');
+  if ($('domFhEn').checked) enabled.push('feihu');
+  if ($('domLbEn').checked) enabled.push('lubansms');
+  if ($('domJcEn').checked) enabled.push('jcsms');
+  if (!enabled.length) enabled.push('haozhuma');
+  const parts = [];
+  for (const p of enabled) {
+    const r = await API.domestic_sms_balance(p);
+    const label = smsProviderName(p);
+    if (!r || !r.ok) { parts.push('✗ ' + label + '：' + (r && r.error || '失败')); continue; }
+    // 疾驰没有余额接口：返回的是说明文字（项目单价），不能当钱显示
+    if (p === 'jcsms') {
+      parts.push('✓ ' + label + '连通：' + String(r.summary || r.balance || '已连通'));
+    } else {
+      parts.push('✓ ' + label + '余额 ' + String(r.balance) + ' 元');
+    }
   }
+  btn.disabled = false; btn.textContent = '测试连接 + 查余额';
+  $('domSmsHint').innerHTML = parts.map(x => esc(x)).join('&nbsp;|&nbsp;');
 }
 
 async function domProxySave() {
@@ -1484,18 +1830,192 @@ async function domDepReset() {
   appendDomLog(['[部署命令] 已恢复默认']);
 }
 
+/* ---------- 折叠抽屉：给所有带标题的卡片加展开/收起按钮 ----------
+   ★ 2026-11-01 改进三点：
+     ① 折叠状态记到浏览器本地存储，刷新页面 / 重启面板后保持原样。
+        原来一刷新全部弹开，折了等于白折（卡片一多尤其烦）。
+     ② 按钮提示文字随状态变：展开中提示"收起"，收起时提示"展开"。
+     ③ 国际版和国内版都有「日志」「代理」「账号」这类同名卡片，
+        按出现顺序编号区分（日志#1 / 日志#2），各折各的，不会一起动。 */
+const FOLD_KEY = 'lv_fold_state_v1';
+function foldLoadState() {
+  try { return JSON.parse(localStorage.getItem(FOLD_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function foldSaveState(st) {
+  try { localStorage.setItem(FOLD_KEY, JSON.stringify(st)); } catch (e) {}
+}
+function initDrawers() {
+  const state = foldLoadState();
+  const seen = {};
+  document.querySelectorAll('.card').forEach(card => {
+    if (card.dataset.drawerReady) return;   // ★ 防重复：这个函数万一被调两次，
+                                            //   会把已包好的内容再套一层 .cbody、再加一个按钮
+    card.dataset.drawerReady = '1';
+    const h2 = card.querySelector(':scope > h2');
+    if (!h2) return;                       // 无标题的卡片（如纯按钮条）不做抽屉
+    // 标题文字取 h2 里第一个文本节点，避开 <span class="sub"> 的动态状态（如"未启动"），
+    // 否则「未启动」一变「运行中」折叠记录就对不上了
+    const t0 = h2.childNodes[0];
+    const title = ((t0 && t0.nodeType === 3) ? t0.textContent : h2.textContent).trim();
+    seen[title] = (seen[title] || 0) + 1;
+    const key = title + '#' + seen[title];  // 同名卡片按出现顺序编号
+    const btn = document.createElement('button');
+    btn.className = 'foldbtn';
+    btn.type = 'button';
+    btn.dataset.foldKey = key;             // 便于排查时在控制台看到是哪块
+    const apply = (collapsed) => {
+      card.classList.toggle('collapsed', collapsed);
+      btn.textContent = collapsed ? '▸' : '▾';
+      btn.title = collapsed ? '展开' : '收起';
+    };
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const now = !card.classList.contains('collapsed');
+      apply(now);
+      state[key] = now;
+      foldSaveState(state);
+    };
+    h2.appendChild(btn);                  // 标题栏右上角出现折叠按钮
+    // 把 h2 之后的所有内容包进 .cbody，收起时整体隐藏
+    const body = document.createElement('div');
+    body.className = 'cbody';
+    while (h2.nextSibling) body.appendChild(h2.nextSibling);
+    card.appendChild(body);
+    apply(!!state[key]);                  // 恢复上次的折叠状态
+  });
+}
+
+/* ================= 账号区草稿（存到程序目录，换浏览器/换电脑/清缓存都不丢） =================
+   ★ 2026-11-01 方案B：原来国际版只把内容记在浏览器本地存储里，关闭网页能留、换浏览器就空，
+     而且点「清空」不会删记忆（一刷新内容又回来了）；国内版压根没存。
+   现在三栏统一走程序这边的 lv-account-draft.json：
+     · 打开页面 → account_draft_get 读取回填；
+     · 打字/导入 → 防抖 400ms 自动存；
+     · 点「清空」→ account_draft_clear 真删（清空才是唯一的"下次什么都没有"开关）。
+   浏览器本地存储的老数据会在首次读取时迁移过来，之后改用程序这份。 */
+/* ★ 2026-11-01：定时器按栏分开。原来三个输入框共用一个 draftTimer，
+   在 A 栏打字会把 B 栏还没落盘的待存任务一起取消掉，导致 B 栏内容丢失。
+   现在每个键（gh / gg / dom）各自一个定时器，互不干扰。
+   ★ 2026-11-01 再修：所有写盘统一走 draftWrite，并记下"这一栏最后一次写进去的内容"。
+     原因：一个输入框失焦时，change 和 blur 会先后各触发一次（等于连发两个请求）；
+     关页面前 beforeunload 又会把三栏不分青红皂白全写一遍。
+     账号文本几万个号、几百 KB 时，这些重复写盘纯属浪费。
+     现在内容跟上次写的一模一样就直接跳过，重复路径自然消失。 */
+const draftTimers = {};
+const draftLastSaved = {};          // 每栏最后一次写进磁盘的内容
+function draftWrite(key, text) {
+  const v = (text == null) ? '' : String(text);
+  if (draftLastSaved[key] === v) return;      // 内容没变，不用再发一次
+  draftLastSaved[key] = v;
+  // 失败就把指纹清掉，下次还能重试（不然一次网络抖动会让这栏再也不保存）
+  API.account_draft_save(key, v).catch(() => { draftLastSaved[key] = null; });
+}
+function draftSave(key, text) {     // 打字：攒 400ms 再写
+  if (draftTimers[key]) clearTimeout(draftTimers[key]);
+  draftTimers[key] = setTimeout(() => {
+    draftTimers[key] = null;
+    draftWrite(key, text);
+  }, 400);
+}
+async function draftRestoreAll() {
+  if (draftRestoreAll.done) return;      // ★ 只做一次：重复执行会把用户刚打的字盖掉
+  draftRestoreAll.done = true;
+  let d = null;
+  try { d = await API.account_draft_get(); } catch (e) { d = null; }
+  if (!d || !d.ok) {                     // ★ 读取失败（例如未登录被拒）→ 允许下次重试，别把功能永久废掉
+    draftRestoreAll.done = false;
+    return;
+  }
+  let migrated = false;
+  // 首次迁移：程序里是空的、但浏览器本地存储里有老数据 → 搬到程序这边
+  if (!d.gh) {
+    const old = localStorage.getItem('lv_acc_gh');
+    if (old) { d.gh = old; API.account_draft_save('gh', old).catch(() => {}); migrated = true; }
+  }
+  if (!d.gg) {
+    const old = localStorage.getItem('lv_acc_gg');
+    if (old) { d.gg = old; API.account_draft_save('gg', old).catch(() => {}); migrated = true; }
+  }
+  if (migrated) { try { localStorage.removeItem('lv_acc_gh'); localStorage.removeItem('lv_acc_gg'); } catch (e) {} }
+  // 回填三栏（只在框里还是空的时候填，别盖掉用户这一瞬间刚打的字）
+  if (!$('acc').value) $('acc').value = d.gh || '';
+  if (!$('accG').value) $('accG').value = d.gg || '';
+  if (!$('domAcc').value) $('domAcc').value = d.dom || '';
+  // ★ 2026-11-01：把"刚回填进来的内容"登记成已保存状态，
+  //   这样紧接着的失焦 / 关页面不会把一模一样的内容再写一遍
+  draftLastSaved.gh = $('acc').value;
+  draftLastSaved.gg = $('accG').value;
+  draftLastSaved.dom = $('domAcc').value;
+  // 绑定"输入即存"（三个框各自的键，互不干扰）
+  bindDraft($('acc'), 'gh');
+  bindDraft($('accG'), 'gg');
+  bindDraft($('domAcc'), 'dom');
+  // ★ 2026-11-01：这里原来还有一段"内容一变化就立刻存"的 input 监听，
+  //   和 bindDraft 里的防抖监听叠在同一个框上，结果是每敲一个字就把防抖取消掉、
+  //   立刻写一次盘 —— 防抖等于没有，磁盘被反复写。已删掉。
+  //   真正的"保险"由 bindDraft 里的 change / blur 加下面的 beforeunload 承担。
+  doParse();
+  if (typeof domParse === 'function') domParse();
+}
+/* 立即写盘（不等防抖），只取消本栏的待存任务；内容没变会自动跳过 */
+function draftSaveNow(key, text) {
+  if (draftTimers[key]) { clearTimeout(draftTimers[key]); draftTimers[key] = null; }
+  draftWrite(key, text);
+}
+/* 离开页面前把三个框的内容强制写盘一次，防止"打完字马上刷新"被吞。
+   ★ 2026-11-01：先比一下内容有没有变，没变就不发——原来是不管三七二十一三栏全写一遍。 */
+window.addEventListener('beforeunload', () => {
+  if (!draftRestoreAll.done) return;
+  const pairs = [['gh', $('acc')], ['gg', $('accG')], ['dom', $('domAcc')]];
+  pairs.forEach(([k, el]) => {
+    if (!el) return;
+    const v = el.value == null ? '' : String(el.value);
+    if (draftLastSaved[k] === v) return;          // 没改过，不用写
+    try {
+      // 用同步请求保证页面关闭前一定发出（sendBeacon 更可靠，但这里保持简单）
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/account_draft_save', false);   // false = 同步
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.send(JSON.stringify({args: [k, v]}));
+    } catch (e) {}
+  });
+});
+function bindDraft(el, key) {
+  if (!el || el.dataset.draftBound) return;   // 只绑一次，防止重复监听导致多次写盘
+  el.dataset.draftBound = '1';
+  // 打字走防抖（省磁盘），失焦/粘贴后立刻落盘（防丢）
+  // ★ 2026-11-01：失焦时 change 和 blur 会先后各来一次，等于连发两个请求。
+  //   保留两条是为了保险（不同浏览器/输入法对 input 的触发时机不完全一致，
+  //   少一条万一漏了就是丢数据），真正的去重由 draftWrite 按内容比对兜住——
+  //   第二次内容和刚写的一模一样，直接跳过，不会真的发出去。
+  el.addEventListener('input', () => draftSave(key, el.value));
+  el.addEventListener('change', () => draftSaveNow(key, el.value));
+  el.addEventListener('blur', () => draftSaveNow(key, el.value));
+}
+/* 手动清空：既抹界面、也删程序里的存档，这样下次打开才真的什么都没有 */
+async function draftClear(el, key, after) {
+  el.value = '';
+  if (draftTimers[key]) { clearTimeout(draftTimers[key]); draftTimers[key] = null; }
+  // ★ 2026-11-01：把本栏登记成"已清空"。否则紧接着的失焦会把空串再写回磁盘，
+  //   刚删掉的存档又被建出来（内容是空的不丢数据，但文件会莫名其妙复活）。
+  draftLastSaved[key] = '';
+  try { await API.account_draft_clear(key); } catch (e) {}
+  if (typeof after === 'function') after();
+}
+
 window.addEventListener('load', async () => {
   wireLogin();
-  // 账号双标签：分别载入已存内容 + 绑定输入持久化（GitHub/Google 分开记）
-  $('acc').value = localStorage.getItem('lv_acc_gh') || '';
-  $('accG').value = localStorage.getItem('lv_acc_gg') || '';
-  $('accG').addEventListener('input', doParse);
-  $('acc').addEventListener('input', () => { try { localStorage.setItem('lv_acc_gh', $('acc').value); } catch (e) {} });
-  $('accG').addEventListener('input', () => { try { localStorage.setItem('lv_acc_gg', $('accG').value); } catch (e) {} });
+  initDrawers();
+  $('accG').addEventListener('input', doParseSoon);
   try {
     const r = await fetch('/api/session').then(x => x.json());
-    if (r && r.logged_in) { hideLogin(); setStatus('已就绪', true); boot(); }
-    else { showLogin(); }
+    if (r && r.logged_in) {
+      hideLogin(); setStatus('已就绪', true);
+      boot();
+      // ★ 2026-11-01：文档加载后必调一次，覆盖"会话已有效、无需再登录"的常见情况
+      //   （失败会自动重试，见 draftRestoreAll 里的 done 复位逻辑）
+      await draftRestoreAll();
+    } else { showLogin(); }
   } catch (e) { showLogin(); }
 });
 </script>
