@@ -149,7 +149,24 @@ def _write_config(cfg):
 
 
 def get_config():
-    return {"ok": True, "config": _read_config()}
+    """读配置返回给前端。★ 2026-10-29（合并自远端）：顺带把四套接码平台
+    （豪猪/飞狐/鲁班/疾驰）的段补齐——老配置文件里没有 jcsms 段，前端虽然用
+    `|| 默认值` 兜着，但「当前：xx」这类回填会不准。这里只在内存里补，不写盘，
+    等用户点保存才落盘。"""
+    cfg = _read_config()
+    try:
+        sms = cfg.get("sms")
+        if not isinstance(sms, dict):
+            sms = {}
+        for k in ("feihu", "luban", "jcsms"):
+            if not isinstance(sms.get(k), dict):
+                sms[k] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"][k]))
+        if "provider" not in sms:
+            sms["provider"] = "haozhuma"
+        cfg["sms"] = sms
+    except Exception:
+        pass
+    return {"ok": True, "config": cfg}
 
 
 def set_sms_config(apiBase, apiUser, apiPass, projectId):
@@ -672,6 +689,68 @@ CENTER_TOKEN = os.environ.get("LIGHTVELA_CENTER_TOKEN", "lvc-9f3a7d2e6b1c4a85")
 CENTER_TIMEOUT = float(os.environ.get("LIGHTVELA_CENTER_TIMEOUT", "6"))
 
 
+def _center_machine_id():
+    """本机标识：环境变量 → 数据目录下 machine-id → 空字符串。"""
+    v = (os.environ.get("LIGHTVELA_MACHINE_ID") or "").strip()
+    if v:
+        return v
+    try:
+        p = os.path.join(_data_dir(), "machine-id")
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def center_push_cred(cred, instance_id=None):
+    """把一条国内版凭证推到数据中心（新增或覆盖同一身份证号的记录）。
+
+    ★ 2026-10-29（合并自远端）：补上「写」。之前只有 center_lookup / _prefetch_center_creds
+      两个读函数，登录/实名拿到的凭证只落在本机 ndjson，多台机器互相看不见，
+      A 机登录的号 B 机还得重登（触发 2FA/接码）。
+      接口：POST /creds，必填 platform + account_key。
+
+    失败只返回 False，绝不抛异常、绝不影响本次任务（本地已经存了，缺这一次上传不致命）。
+    """
+    if not isinstance(cred, dict):
+        return False
+    idc = str(cred.get("idCard") or "").strip()
+    bearer = str(cred.get("bearer") or "").strip()
+    if not (idc and bearer):
+        return False
+    if str(os.environ.get("LIGHTVELA_CENTER_PUSH", "1")).strip() == "0":
+        return False
+    try:
+        import urllib.request
+        # ★ account_key 的约定：数据中心国内版记录里存的是 uid（usr_xxx），不是身份证号
+        #   （_prefetch_center_creds 读的时候就是拿 account_key 当 uid 用）。
+        #   上传也必须传 uid，否则新建记录的 account_key 会变成身份证号，读回来 uid 就错了。
+        acct_key = str(cred.get("uid") or "").strip() or idc
+        payload = {
+            "platform": "domestic",
+            "account_key": acct_key,
+            "token": bearer,
+            "name": (cred.get("name") or None),
+            "id_card": idc,
+            "phone": (cred.get("phone") or None),
+            "instance_id": (instance_id or cred.get("instanceId") or None),
+            "owner": (_center_machine_id() or None),
+            "status": "ok",
+            "extra": {"uid": (cred.get("uid") or None)},
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            CENTER_BASE + "/creds",
+            data=body,
+            headers={"Content-Type": "application/json", "X-Auth-Token": CENTER_TOKEN},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=CENTER_TIMEOUT) as r:
+            return int(getattr(r, "status", 200)) == 200
+    except Exception:
+        return False
+
+
 def center_lookup(id_card):
     """按身份证号问数据中心要国内版凭证。连不上/查不到都返回 None（调用方自行回退）。"""
     if not id_card:
@@ -1054,6 +1133,17 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
             "error": err_msg,
             "log": os.path.basename(log_file),
         }
+        # ★ 2026-10-29（合并自远端）：凭证上传数据中心。之前国内版只有「读」，登录/实名拿到的
+        #   凭证只落在本机 ndjson，多台机器互相看不见。这里补上「写」——账号一跑完（成功失败
+        #   都算，只要拿到 bearer）就推一条，跨机可复用，避免重复登录触发 2FA/接码。
+        if cred.get("bearer"):
+            try:
+                if center_push_cred(cred, res.get("instanceId")):
+                    _append_log("[数据中心] ☁ 凭证已上传（%s）" % (acc.get("name") or acc.get("idCard") or ""))
+                else:
+                    _append_log("[数据中心] ⚠ 凭证上传未成功（本地已存，不影响本次）")
+            except Exception:
+                pass
         with _lock:
             while len(_state["results"]) <= idx:
                 _state["results"].append(None)
