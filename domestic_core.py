@@ -702,29 +702,56 @@ def _center_machine_id():
         return ""
 
 
-def center_push_cred(cred, instance_id=None):
-    """把一条国内版凭证推到数据中心（新增或覆盖同一身份证号的记录）。
+# ---------------- 上传重试 + 待补传队列（2026-11-06 老大要求）----------------
+# ① 当场重试 3 次（1s / 3s / 8s）—— 解决网络抖动
+# ② 仍失败 → 落 pending 队列，不丢
+# ③ ★ 只有队列非空时才启动补传线程；队列空了线程自己退出（不空转、不占资源）
+# ④ 补传超 20 次或滞留超 7 天 → 移入死信池，不再自动重试，但保留可查
+_PENDING_PATH = os.path.join(_data_dir(), "center_push_pending.ndjson")
+_DEAD_PATH = os.path.join(_data_dir(), "center_push_dead.ndjson")
+_PENDING_MAX_TRIES = 20
+_PENDING_MAX_DAYS = 7
+_PENDING_INTERVAL = 600          # 补传间隔 10 分钟
+_pending_lock = threading.Lock()
+_pending_worker = None
 
-    ★ 2026-10-29（合并自远端）：补上「写」。之前只有 center_lookup / _prefetch_center_creds
-      两个读函数，登录/实名拿到的凭证只落在本机 ndjson，多台机器互相看不见，
-      A 机登录的号 B 机还得重登（触发 2FA/接码）。
-      接口：POST /creds，必填 platform + account_key。
 
-    失败只返回 False，绝不抛异常、绝不影响本次任务（本地已经存了，缺这一次上传不致命）。
-    """
-    if not isinstance(cred, dict):
-        return False
-    idc = str(cred.get("idCard") or "").strip()
-    bearer = str(cred.get("bearer") or "").strip()
+def _pending_count():
+    """待补传条数（文件不存在 = 0）。"""
+    try:
+        n = 0
+        with open(_PENDING_PATH, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def pending_stats():
+    """给面板用：待补传 / 死信 各多少条。"""
+    dead = 0
+    try:
+        with open(_DEAD_PATH, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    dead += 1
+    except Exception:
+        pass
+    return {"pending": _pending_count(), "dead": dead}
+
+
+def _center_post(cred, instance_id=None):
+    """真正发一次 POST /creds。返回 (ok, err)。不抛异常。"""
+    idc = str(cred.get("idCard") or cred.get("id_card") or "").strip()
+    bearer = str(cred.get("bearer") or cred.get("token") or "").strip()
     if not (idc and bearer):
-        return False
+        return False, "缺 idCard/bearer"
     if str(os.environ.get("LIGHTVELA_CENTER_PUSH", "1")).strip() == "0":
-        return False
+        return False, "上传开关已关"
     try:
         import urllib.request
-        # ★ account_key 的约定：数据中心国内版记录里存的是 uid（usr_xxx），不是身份证号
-        #   （_prefetch_center_creds 读的时候就是拿 account_key 当 uid 用）。
-        #   上传也必须传 uid，否则新建记录的 account_key 会变成身份证号，读回来 uid 就错了。
         acct_key = str(cred.get("uid") or "").strip() or idc
         payload = {
             "platform": "domestic",
@@ -733,22 +760,168 @@ def center_push_cred(cred, instance_id=None):
             "name": (cred.get("name") or None),
             "id_card": idc,
             "phone": (cred.get("phone") or None),
-            "instance_id": (instance_id or cred.get("instanceId") or None),
+            "instance_id": (instance_id or cred.get("instanceId") or cred.get("instance_id") or None),
             "owner": (_center_machine_id() or None),
             "status": "ok",
             "extra": {"uid": (cred.get("uid") or None)},
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            CENTER_BASE + "/creds",
-            data=body,
+            CENTER_BASE + "/creds", data=body,
             headers={"Content-Type": "application/json", "X-Auth-Token": CENTER_TOKEN},
-            method="POST",
-        )
+            method="POST")
         with urllib.request.urlopen(req, timeout=CENTER_TIMEOUT) as r:
-            return int(getattr(r, "status", 200)) == 200
+            code = int(getattr(r, "status", 200))
+            return (code == 200), ("" if code == 200 else "HTTP %d" % code)
+    except Exception as e:
+        return False, repr(e)[:120]
+
+
+def _pending_add(cred, err, tries=0):
+    """上传彻底失败 → 落待补传队列（绝不丢），并确保补传线程起来了。"""
+    rec = {
+        "uid": str(cred.get("uid") or ""),
+        "bearer": str(cred.get("bearer") or ""),
+        "name": cred.get("name"),
+        "idCard": cred.get("idCard") or cred.get("id_card"),
+        "phone": cred.get("phone"),
+        "instanceId": cred.get("instanceId") or cred.get("instance_id"),
+        "tries": int(tries),
+        "first_fail": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last_try": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "err": (err or "")[:120],
+    }
+    try:
+        with _pending_lock:
+            with open(_PENDING_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
+        return
+    ensure_pending_worker()
+
+
+def ensure_pending_worker():
+    """★ 老大要求：只有队列里有东西、且当前没有补传线程在跑，才启动一个。"""
+    global _pending_worker
+    with _pending_lock:
+        if _pending_worker is not None and _pending_worker.is_alive():
+            return
+        if _pending_count() <= 0:
+            return
+        _pending_worker = threading.Thread(target=_pending_loop,
+                                           name="center-push-retry", daemon=True)
+        _pending_worker.start()
+
+
+def _pending_loop():
+    """补传循环：进来先补一次，之后每 10 分钟一次；队列清空就退出线程（不常驻）。"""
+    global _pending_worker
+    while True:
+        left = _pending_flush()
+        if left <= 0:
+            with _pending_lock:
+                # ★ 再确认一次：flush 收尾这几毫秒里可能又有新失败的条目追加进来，
+                #   此时直接退出会导致「队列有货但没线程补」。有就继续跑。
+                if _pending_count() > 0:
+                    need_more = True
+                else:
+                    _pending_worker = None
+                    need_more = False
+            if need_more:
+                time.sleep(1)
+                continue
+            return
+        time.sleep(_PENDING_INTERVAL)
+
+
+def _pending_flush():
+    """把队列逐条重试一遍：成功删掉；失败 tries+1；超限进死信。返回剩余条数。
+
+    ★ 并发安全（2026-11-06）：先把队列文件**原子改名**成 .processing 再处理，
+      处理期间新失败的条目会追加到新的 pending 文件，不会被本轮写回覆盖。
+      （旧写法用 "w" 覆盖，补传那几秒里新失败的条目会被静默抹掉。）
+    """
+    proc = _PENDING_PATH + ".processing"
+    try:
+        with _pending_lock:
+            if not os.path.exists(_PENDING_PATH):
+                return 0
+            os.replace(_PENDING_PATH, proc)
+    except Exception:
+        return _pending_count()
+    try:
+        with open(proc, encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+    except Exception:
+        lines = []
+    keep, dead = [], []
+    now = time.time()
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        tries = int(rec.get("tries") or 0)
+        try:
+            t0 = time.mktime(time.strptime(rec.get("first_fail") or "",
+                                           "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            t0 = now
+        if tries >= _PENDING_MAX_TRIES:
+            rec["dead_reason"] = "重试超 %d 次" % _PENDING_MAX_TRIES
+            dead.append(rec)
+            continue
+        if (now - t0) > _PENDING_MAX_DAYS * 86400:
+            rec["dead_reason"] = "滞留超 %d 天" % _PENDING_MAX_DAYS
+            dead.append(rec)
+            continue
+        ok, err = _center_post(rec, rec.get("instanceId"))
+        if ok:
+            continue
+        rec["tries"] = tries + 1
+        rec["last_try"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        rec["err"] = (err or "")[:120]
+        keep.append(rec)
+    # 写回：追加到新的 pending（本轮期间新失败的条目已经在里面，不会覆盖）
+    if keep:
+        try:
+            with _pending_lock:
+                with open(_PENDING_PATH, "a", encoding="utf-8") as f:
+                    for r in keep:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    if dead:
+        try:
+            with open(_DEAD_PATH, "a", encoding="utf-8") as f:
+                for r in dead:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+    try:
+        os.remove(proc)
+    except Exception:
+        pass
+    return _pending_count()
+
+
+def center_push_cred(cred, instance_id=None):
+    """上传一条凭证：当场重试 3 次（1s/3s/8s），仍失败 → 落待补传队列。
+
+    返回 bool（兼容旧调用方：True=已上传，False=失败但已入队，本地也已存）。
+    绝不抛异常、绝不影响本次任务。
+    """
+    if not isinstance(cred, dict):
         return False
+    err = ""
+    for k, wait in enumerate((1, 3, 8)):
+        ok, err = _center_post(cred, instance_id)
+        if ok:
+            return True
+        if k < 2:
+            time.sleep(wait)
+    _pending_add(cred, err)
+    return False
 
 
 def center_lookup(id_card):
@@ -763,9 +936,11 @@ def center_lookup(id_card):
                                      headers={"X-Auth-Token": CENTER_TOKEN})
         with urllib.request.urlopen(req, timeout=CENTER_TIMEOUT) as r:
             d = json.loads(r.read().decode("utf-8"))
+        hit = None
         for c in (d.get("creds") or []):
             if c.get("token"):
-                return c
+                hit = c        # ★ 取最后一条（id 最大 = 最新注册的），不是第一条（最老的）
+        return hit
     except Exception:
         pass
     return None
@@ -964,8 +1139,11 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
     args = [NODE_BIN, BOT, "--account-idx", str(idx)]
     if mode == "login":
         args.append("--login-only")
-    if mode == "resume" or (mode == "full" and use_saved):
-        args.append("--resume")   # 复用/补全：bot.js 自行判断"有凭证复用、无凭证登录补全"
+    # ★ 2026-11-06 修复（老大定的）：只有「续跑」才复用本地凭证。
+    #   做新号时若传 --resume，js 会按身份证去本地 ndjson 捞"这个人之前的号码"的凭证复用，
+    #   同一身份证的第二个号码就被顶掉、压根没注册（今天 3,451 个凭证丢失的主因）。
+    if mode == "resume":
+        args.append("--resume")   # 续跑：复用已登录凭证，跳过取号/登录/实名
     env = dict(os.environ)
     env["LIGHTVELA_ACCOUNTS_FILE"] = accounts_file
     env["LIGHTVELA_DOMESTIC_TOKENS"] = token_path()
@@ -1203,7 +1381,10 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
         kill_orphan_bots()
         # ★ 数据中心取凭证（2026-10-29 新增）：勾了「复用凭证」时，本地令牌库没有的号
         #   按身份证号问数据中心要，要到的追加进本地 ndjson，机器人自然复用上，不用重新取号/实名。
-        if use_saved or mode == "resume":
+        # ★ 2026-11-06 修复（老大定的）：只有「续跑」才去中心按身份证预取凭证。
+        #   勾「复用凭证」做新号时绝不能预取 —— 同一身份证的新号会被老号凭证顶掉，
+        #   新号白注册、凭证压根不上传（今天 3,451 个凭证丢失就是这么来的）。
+        if mode == "resume":
             try:
                 _got, _asked = _prefetch_center_creds(accounts)
                 if _asked:
@@ -1336,6 +1517,11 @@ def start(mode, text, use_saved=False, bundle_strategy="auto_ai_fallback"):
     global BUNDLE_STRATEGY
     _bs = (bundle_strategy or "auto_ai_fallback").strip()
     BUNDLE_STRATEGY = _bs if _bs in BUNDLE_STRATEGY_CHOICES else "auto_ai_fallback"
+    # ★ 2026-11-06：上次有没传上去的凭证，这里把补传线程拉起来（队列空则什么都不做，不占资源）
+    try:
+        ensure_pending_worker()
+    except Exception:
+        pass
     accs = parse_accounts(text)
     if not accs:
         return {"ok": False, "error": "没有解析到账号（支持空格/----/——/|/、/逗号等任意分隔，每行一条：姓名 身份证）"}
