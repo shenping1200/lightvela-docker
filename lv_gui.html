@@ -364,7 +364,19 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
         <div class="bar" style="margin-top:8px">
           <button class="btn sm" id="domBtnImport">导入 txt</button>
           <button class="btn sm" id="domBtnClear">清空</button>
-          <span id="domParseStat" class="stat"></span>
+          <!-- ★ 账号数量（原本就在这个位置，2026-11-07 加镜像按钮时曾被我误删，已恢复） -->
+          <span id="domParseStat" class="stat" style="margin-top:0"></span>
+          <!-- ★ 2026-11-07 老大要求：把「参数模式」卡里那组运行按钮复制一份到这里，
+               好处是折叠其它区域后账号区更大、不用来回滚。
+               副本不带 id，用 data-mirror 指向原按钮 / data-mirror-text 指向原统计，
+               点击、禁用状态、统计文字全部由 bindMirror() 自动跟随，原逻辑一行没改。
+               左栏只有 434px，放不下会自动折行。 -->
+          <button class="btn primary sm" data-mirror="domBtnStart">▶ 开始</button>
+          <button class="btn danger sm" data-mirror="domBtnStop">■ 停止</button>
+          <button class="btn sm" data-mirror="domBtnExportSuccess">导出成功</button>
+          <button class="btn sm" data-mirror="domBtnExportFailed">导出失败</button>
+          <button class="btn sm" data-mirror="domBtnImportFailed">导入失败到账号区</button>
+          <span class="stat" data-mirror-text="domRunStat" style="margin-top:0"></span>
         </div>
       </div>
 
@@ -2003,9 +2015,33 @@ async function draftClear(el, key, after) {
   if (typeof after === 'function') after();
 }
 
+/* ★ 2026-11-07：账号区那排「开始/停止/导出…」是【镜像副本】。
+   点副本 = 点原按钮；原按钮的禁用状态、右侧统计文字一变，副本立刻跟上。
+   好处：原逻辑一行不用改，也不会出现两套状态打架。 */
+function bindMirror() {
+  // 1) 按钮：禁用状态 + 点击转发
+  document.querySelectorAll('[data-mirror]').forEach(m => {
+    const src = $(m.getAttribute('data-mirror'));
+    if (!src) return;
+    m.disabled = src.disabled;
+    m.addEventListener('click', () => { if (!src.disabled) src.click(); });
+    new MutationObserver(() => { m.disabled = src.disabled; })
+      .observe(src, { attributes: true, attributeFilter: ['disabled'] });
+  });
+  // 2) 统计文字：原本是 innerHTML 写的（带 <b>），副本照搬
+  document.querySelectorAll('[data-mirror-text]').forEach(m => {
+    const src = $(m.getAttribute('data-mirror-text'));
+    if (!src) return;
+    m.innerHTML = src.innerHTML;
+    new MutationObserver(() => { m.innerHTML = src.innerHTML; })
+      .observe(src, { childList: true, characterData: true, subtree: true });
+  });
+}
+
 window.addEventListener('load', async () => {
   wireLogin();
   initDrawers();
+  bindMirror();
   $('accG').addEventListener('input', doParseSoon);
   try {
     const r = await fetch('/api/session').then(x => x.json());
