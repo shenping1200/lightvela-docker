@@ -8,12 +8,18 @@
   3. 上传成功 → 写入 .uploaded
   4. 老凭证永远不查 → 耗时不随总量增长
 
+★ 2026-11-07 新增：上传时带 instance_id（实例号）
+  - 以前上传不带实例号，导致数据中心很多号明明有 bot 却显示"没 bot"，
+    活跃/部署任务会把它们整批跳过。
+  - 现在实例号来源：本地凭证的 instanceId → 数据中心 /export 里已登记的值
+  - 每次启动拉一次 /export（全量映射，一次请求），对比出"本地有、中心缺"
+    的条目做一次性回填；回填完差异归零，以后每次都是 0 秒，不会越来越慢。
+
 部署：cron 每 30 分钟跑一次
   */30 * * * * /usr/bin/python3 /root/lightvela-docker/backfill_creds.py >> /root/lightvela-docker/backfill.log 2>&1
 """
 import json
 import os
-import platform
 import sys
 import time
 import urllib.parse
@@ -57,19 +63,60 @@ def save_mark(s):
         print("[backfill] 写标记失败:", repr(e)[:60])
 
 
-def push(c):
-    """上传一条，返回 True/False"""
-    body = {
-        "platform": "domestic",
-        "account_key": c.get("uid") or c["idCard"],
-        "token": c["bearer"],
-        "name": c.get("name"),
-        "id_card": c["idCard"],
-        "phone": c.get("phone"),
-        "owner": "backfill-" + (os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "local"),
-        "status": "ok",
-        "extra": {"uid": c.get("uid")},
-    }
+def center_instances():
+    """一次拉全量，拿到数据中心已登记的 uid -> instance_id 映射"""
+    try:
+        url = CENTER + "/export?platform=domestic"
+        req = urllib.request.Request(url, headers={"X-Auth-Token": TOKEN})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            txt = r.read().decode("utf-8", "replace")
+        m = {}
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("instanceId") and o.get("uid"):
+                m[o["uid"]] = o["instanceId"]
+        return m
+    except Exception as e:
+        print("[backfill] 拉取中心实例号失败（不影响本次上传）:", repr(e)[:80])
+        return {}
+
+
+def local_instance(c):
+    """兼容几种字段名"""
+    for k in ("instanceId", "instance_id", "ins"):
+        v = c.get(k)
+        if v:
+            return v
+    return ""
+
+
+def push(c, center_map=None, only_ins=False):
+    """上传一条，返回 True/False。only_ins=True 时只补实例号，不动其他字段。"""
+    uid = c.get("uid") or c["idCard"]
+    ins = local_instance(c) or (center_map or {}).get(uid, "")
+    if only_ins:
+        body = {"platform": "domestic", "account_key": uid, "instance_id": ins}
+    else:
+        body = {
+            "platform": "domestic",
+            "account_key": uid,
+            "token": c["bearer"],
+            "name": c.get("name"),
+            "id_card": c["idCard"],
+            "phone": c.get("phone"),
+            "owner": "backfill-" + (os.environ.get("COMPUTERNAME")
+                                    or os.environ.get("HOSTNAME") or "local"),
+            "status": "ok",
+            "extra": {"uid": c.get("uid")},
+        }
+        if ins:
+            body["instance_id"] = ins
     try:
         req = urllib.request.Request(
             CENTER + "/creds",
@@ -98,23 +145,45 @@ def main():
         if o.get("bearer") and o.get("idCard"):
             creds.append(o)
 
-    new = [c for c in creds if (c.get("uid") or c["idCard"]) not in mark]
-    print("[backfill] 本地 %d 条，已传 %d，待查 %d" % (len(creds), len(mark), len(new)))
+    # 一次拉全量映射（一个请求，不随凭证数量变慢）
+    cmap = center_instances()
+    print("[backfill] 本地 %d 条，已传 %d，中心已登记实例号 %d 个"
+          % (len(creds), len(mark), len(cmap)))
 
+    # ① 实例号回填：本地有、中心缺或不一致的，只补这一列
+    need = []
+    seen = set()
+    for c in creds:
+        uid = c.get("uid") or c["idCard"]
+        ins = local_instance(c)
+        if ins and uid not in seen and cmap.get(uid) != ins:
+            need.append(c)
+            seen.add(uid)
+    if need:
+        ok = 0
+        for c in need:
+            if push(c, cmap, only_ins=True):
+                ok += 1
+        print("[backfill] 实例号回填：%d 个差异，成功 %d，耗时 %.1fs"
+              % (len(need), ok, time.time() - t0))
+
+    # ② 新增凭证正常上传（带实例号）
+    new = [c for c in creds if (c.get("uid") or c["idCard"]) not in mark]
     if not new:
-        print("[backfill] 没有新增，跳过（耗时 %.1fs）" % (time.time() - t0))
+        print("[backfill] 没有新增凭证，跳过（总耗时 %.1fs）" % (time.time() - t0))
         return
 
     ok = fail = 0
     for c in new:
-        if push(c):
+        if push(c, cmap):
             mark.add(c.get("uid") or c["idCard"])
             ok += 1
         else:
             fail += 1
 
     save_mark(mark)
-    print("[backfill] 完成：成功 %d 失败 %d，耗时 %.1fs" % (ok, fail, time.time() - t0))
+    print("[backfill] 完成：新增成功 %d 失败 %d，总耗时 %.1fs"
+          % (ok, fail, time.time() - t0))
 
 
 if __name__ == "__main__":
