@@ -459,6 +459,30 @@ function wsParseServerFrames(buf) {
 //   LIGHTVELA_SMS_USER         API 账号（h5.haozhuma.com「API-配置」里复制）
 //   LIGHTVELA_SMS_PASS         API 密码
 //   LIGHTVELA_SMS_PROJECT_ID   项目编号（默认 21986 = 腾讯云 / 腾讯云短信）
+
+// ★ 2026-11-09：豪猪「释放 / 拉黑」返回码解析。
+//   旧代码是 await fetch(...) 就完事，平台回 code=-1（失败）也当成功，日志还无条件打「已拉黑」。
+//   现统一返回 {ok, code, msg, raw}，交给 disposePhone 打真实结果。
+//   成功判定按官方文档：code=0 或 200 为成功；其余一律失败。
+async function haozhumaAck(url) {
+  let text = '';
+  try {
+    const r = await fetch(url);
+    text = await r.text();
+  } catch (e) {
+    return { ok: false, code: null, msg: '请求异常: ' + (e && e.message ? e.message : String(e)), raw: '' };
+  }
+  let j;
+  try { j = JSON.parse(text); }
+  catch (_) { return { ok: false, code: null, msg: '返回不是 JSON', raw: String(text).slice(0, 160) }; }
+  if (!j || typeof j !== 'object') {
+    return { ok: false, code: null, msg: '返回格式异常', raw: String(text).slice(0, 160) };
+  }
+  const c = Number(j.code);
+  const ok = (c === 0 || c === 200);
+  return { ok, code: j.code, msg: String(j.msg == null ? '' : j.msg), raw: String(text).slice(0, 160) };
+}
+
 const SMS_HAOZHUMA = {
   apiBase:   process.env.LIGHTVELA_SMS_API_BASE || 'https://api.haozhuma.com',
   apiUser:   process.env.LIGHTVELA_SMS_USER     || 'f632fc95683bd65352623febb154ffcae6550a33178a18c65921060810d0571c',
@@ -495,8 +519,16 @@ const SMS_HAOZHUMA = {
     }
     throw new Error('豪猪取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
   },
-  async release(phone) { const t = await this.login(); await fetch(`${this.apiBase}/sms/?api=cancelRecv&token=${t}&sid=${this.projectId}&phone=${phone}`); },
-  async blacklist(phone) { const t = await this.login(); await fetch(`${this.apiBase}/sms/?api=addBlacklist&token=${t}&sid=${this.projectId}&phone=${phone}`); },
+  // ★ 2026-11-09：释放/拉黑改成「解析平台返回码」，不再发完请求就当成功。
+  //   豪猪文档：释放 code=0 或 200 成功、-1 失败；拉黑 code=0 成功、其他失败。
+  async release(phone) {
+    const t = await this.login();
+    return await haozhumaAck(`${this.apiBase}/sms/?api=cancelRecv&token=${t}&sid=${this.projectId}&phone=${phone}`);
+  },
+  async blacklist(phone) {
+    const t = await this.login();
+    return await haozhumaAck(`${this.apiBase}/sms/?api=addBlacklist&token=${t}&sid=${this.projectId}&phone=${phone}`);
+  },
   async balance() { const t = await this.login(); const j = await (await fetch(`${this.apiBase}/sms/?api=getSummary&token=${t}`)).json(); return j.money; },
 };
 
@@ -828,6 +860,49 @@ const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU
           : SMS_PROVIDER === 'jcsms' ? SMS_JCSMS
           : SMS_HAOZHUMA;
 
+// ★ 2026-11-09：号码弃用处理，两类号严格分开（老大定）：
+//   ① 没收到验证码的号 → 先「释放」解冻额度，再「拉黑」防止下次又取到它。
+//      不释放的话，接码平台会冻结我账号/这个号的额度。
+//      ※ 释放成功后号码已从卡台列表移除，拉黑接口必然回「没有任务」——这是预期内，
+//        日志只做说明、不报故障；只有释放没成功时，拉黑失败才当真异常报警。
+//   ② 成功收到验证码的号 → 平台已直接扣积分（正常消费），只「拉黑」，不做释放。
+//   每一步都解析平台真实返回码，不再无条件假报成功。
+
+// 公共拉黑部分：解析返回码 + 打真实结果
+// ★ 2026-11-09：去掉 releasedOk 参数——不再有"释放"这个前置动作，拉黑就是唯一动作。
+//   拉黑成功 = 号不再分配给我，且已从卡台移除。失败就明确报警，不再降级成"预期内"。
+async function _blacklistWithAck(phone, reason) {
+  let blk = null;
+  try { blk = await SMS.blacklist(phone); }
+  catch (e) { blk = { ok: false, msg: '抛异常: ' + (e && e.message ? e.message : String(e)) }; }
+  if (blk && blk.ok === true) {
+    console.log('  ⛔ 已拉黑号码（' + reason + '）:', phone, blk.msg ? '| ' + blk.msg : '');
+  } else if (blk && blk.ok === false) {
+    console.log('  ⚠ 拉黑失败（' + reason + '）:', phone, '| code=' + blk.code, '|', blk.msg || blk.raw || '');
+  } else {
+    console.log('  · 拉黑请求已发出（当前平台未返回可判定的结果）:', phone);
+  }
+}
+
+// ① 没收到验证码：只拉黑
+// ★ 2026-11-09 老大定案（实测支撑）：
+//   豪猪的「冻结」指的是号码被占用，不是余额减少（取号前后余额一模一样，169.336 没变）。
+//   扣钱发生在「收到验证码」那一刻（0.55/条）。
+//   拉黑本身就会把号从卡台移除（实测：拉黑后再调释放返回 code=-1「释放失败」，说明号已经没了），
+//   且拉黑后不会再分配给我。所以「释放」这一步纯属多余，而且必然失败。
+//   结论：无论收没收到验证码，都只做一个动作——拉黑。
+async function disposePhone(phone, reason) {
+  if (!phone) return;
+  await _blacklistWithAck(phone, reason);
+}
+
+// ② 成功收到验证码：平台已扣积分，无需释放，直接拉黑
+async function blacklistUsedPhone(phone, reason) {
+  if (!phone) return;
+  console.log('  · 已成功收码（平台已扣积分，正常消费）→ 跳过释放，直接拉黑:', phone);
+  await _blacklistWithAck(phone, reason);
+}
+
 // 账号清单从独立文件加载（单一数据源，批量调度器也 require 它）
 // 支持环境变量 LIGHTVELA_ACCOUNTS_FILE 覆盖（UI 传入临时账号列表时用，避免改默认 accounts.js 干扰后台批量）
 const ACCOUNTS = require(process.env.LIGHTVELA_ACCOUNTS_FILE || './accounts.js');
@@ -1099,9 +1174,8 @@ async function domesticLogin(acc, idx) {
         phone = await SMS.rentNumber();
         console.log(`  手机号(取号#${attempt}${rr > 0 ? '-重取' + rr : ''}):`, phone);
         if (isMainlandPhone(phone)) break;
-        try { await SMS.release(phone); } catch (_) {}
-        try { await SMS.blacklist(phone); } catch (_) {}
-        console.log(`  ⛔ 已拉黑非大陆号码（${String(phone).length} 位）：${phone}，重新取号…`);
+        await disposePhone(phone, `非大陆号码（${String(phone).length} 位）`);
+        console.log(`  ↻ 重新取号…`);
         phone = null;
       }
       if (!phone) throw new Error('连续 ' + MAX_REGION_RETRY + ' 次取到非大陆号码（平台号源异常），放弃本账号');
@@ -1128,7 +1202,7 @@ async function domesticLogin(acc, idx) {
               //   （lv-proxy.js: keepAlive + maxSockets:1 + 缓存 TLS socket），重发多少次都是同一个脏IP，
               //   硬重试只会白等 60s×N、白烧号码。下次重跑 = 新进程 = 新连接 = 新出口IP，自然就好了。
               console.log(`  ⛔ 限流类型=IP脏(${rlType})：出口IP被官方限频，直接判定失败（不重试/不换号），稍后重跑会自动换新出口IP`);
-              if (phone) { try { await SMS.release(phone); } catch (_) {} try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（IP脏放弃，号源一次性）:', phone); } catch (_) {} }
+              if (phone) await disposePhone(phone, 'IP脏放弃，号源一次性');
               throw new Error('IP脏限频：出口IP被官方限频，已放弃本次尝试（不重试/不换号）。稍后重跑会自动换新出口IP');
             } else {
               // 其他限流：非IP问题，保持原等待后重发即可
@@ -1146,15 +1220,14 @@ async function domesticLogin(acc, idx) {
       if (!sentOk) {
         // ★ 限频拉黑：同一号码重试上限仍被限频 → 拉黑该号（不再分配，防止二手号回收复用），换号重试
         lastErr = new Error('验证码发送过于频繁，已用同一号码重试 ' + RESEND_MAX + ' 次仍被限频: ' + JSON.stringify(lastRateJson).slice(0, 200));
-        if (phone) { try { await SMS.release(phone); } catch (_) {} try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（限频重试耗尽）:', phone); } catch (_) {} }
+        if (phone) await disposePhone(phone, '限频重试耗尽');
         console.log('  ⚠️ 该号限频重试耗尽，换号重试…');
         continue;   // 走 attempt++ 换号（至多 MAX_RENT 个号）
       }
       const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
       console.log('  验证码:', code);
       // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
-      try { await SMS.release(phone); } catch (_) {}
-      try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（已成功取码，号源即用即弃）:', phone); } catch (_) {}
+      await blacklistUsedPhone(phone, '已成功取码，号源即用即弃');
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
       const token = v.json && v.json.session && v.json.session.sessionToken;
       if (!token) {
@@ -1167,22 +1240,54 @@ async function domesticLogin(acc, idx) {
       CFG.bearer = token;
       const uid = (v.json.session.user || {}).id;
       console.log('  ✅ 登录成功 | uid=', uid);
-      const rn = await httpsReq('POST', '/auth/realname/faceid/attempts', {
-        body: { name: acc.name, idCard: acc.idCard, consent: true },
-      });
-      if (rn.json && rn.json.state === 'succeeded') {
-        console.log('  ✅ 实名成功 | attemptId=', rn.json.attemptId);
-        return { token, uid, phone, realname: { name: acc.name, idCard: acc.idCard } };
+      // ★ 2026-11-09：登录成功立刻落盘 token（哪怕后面实名还没过）
+      //   原因：以前只有全流程跑完才写凭证，实名一失败 token 就丢了，
+      //   而接码号是"用即弃"（已拉黑），等于这个号彻底废掉、没法第二天补救。
+      //   现在登录成功就存，实名失败的号第二天配额重置后可直接用 token 重试实名，不用重新接码。
+      try {
+        saveDomesticToken({
+          name: acc.name, idCard: acc.idCard, phone, uid, bearer: token,
+          instanceId: null, deployOk: false, deployAttempts: 0,
+          stage: 'login_only', savedAt: new Date().toISOString(),
+        });
+      } catch (e) { console.warn('  ⚠️ token 落盘失败（不影响继续）:', e.message); }
+      // ★ 2026-11-09：实名加自动重试（实测：HTTP 500 重试就能过；shadow_pending 重发可能过）
+      //   succeeded                        → 成功
+      //   realname_mismatch                → 走补救流程
+      //   429 配额超限                      → 立即放弃（今天这号实名次数已用完，重试无用）
+      //   500 / shadow_pending / 空响应     → 等 3 秒重试，最多 RN_MAX_TRY 次
+      const RN_MAX_TRY = Number(process.env.LIGHTVELA_REALNAME_TRY || 3);
+      let rn = null, rnMismatch = false;
+      for (let k = 1; k <= RN_MAX_TRY; k++) {
+        rn = await httpsReq('POST', '/auth/realname/faceid/attempts', {
+          body: { name: acc.name, idCard: acc.idCard, consent: true },
+        });
+        if (rn.json && rn.json.state === 'succeeded') {
+          console.log('  ✅ 实名成功 | attemptId=', rn.json.attemptId,
+                      k > 1 ? ('（第' + k + '次尝试才过）') : '');
+          return { token, uid, phone, realname: { name: acc.name, idCard: acc.idCard } };
+        }
+        if (rn.json && rn.json.code === 'realname_mismatch') {
+          rnMismatch = true;
+          break;
+        }
+        if (rn.status === 429) {
+          throw new Error('实名失败: HTTP 429 配额超限（今日实名次数已用完，重试无用）');
+        }
+        const why = 'HTTP ' + rn.status + ' ' +
+                    (rn.json ? JSON.stringify(rn.json).slice(0, 90) : '(空响应体)');
+        console.log('  ⚠️ 实名第 ' + k + '/' + RN_MAX_TRY + ' 次异常（' + why + '）' +
+                    (k < RN_MAX_TRY ? '，3 秒后重试…' : ''));
+        if (k < RN_MAX_TRY) await new Promise(r => setTimeout(r, 3000));
       }
-      // ★ 实名没过：区分「身份不匹配」和「其他错误」
-      if (rn.json && rn.json.code === 'realname_mismatch') {
-        // 原身份 姓名/身份证 不匹配（已接码登录成功，仅实名信息错）→ 从号码库取排队身份补救
+      if (rnMismatch) {
         console.log('  ⚠️ 原身份实名不匹配（', (rn.json.message || ''), '），进入补救流程…');
         const recovered = await recoverRealname(idx);   // 内部无可用身份会抛错终止本次注册
         return { token, uid, phone, realname: recovered };
       }
-      // 其他实名错误（网络/风控/未知）→ 维持原行为抛出
-      throw new Error('实名失败: ' + JSON.stringify(rn.json).slice(0, 240));
+      // 重试用尽仍失败：把真实状态码 + 原始响应体打出来（以前只打 json，500/429 全被压成 null）
+      throw new Error('实名失败（重试 ' + RN_MAX_TRY + ' 次仍失败）: HTTP ' + rn.status +
+                      ' | ' + String(rn.text || '').slice(0, 200));
     } catch (e) {
       lastErr = e;
       // ★ 可重试的「号源类」失败（不归实名/验码/网络错误）：
@@ -1192,8 +1297,7 @@ async function domesticLogin(acc, idx) {
       const isRentFail    = /豪猪取号失败|没有取到号码/.test(e.message || '');
       if (isCodeTimeout && phone) {
         // 取到号但没收到验证码 → 拉黑这个号（避免下次再分到它），然后换号重试
-        try { await SMS.release(phone); } catch (_) {}
-        try { await SMS.blacklist(phone); console.log('  ⛔ 已拉黑号码（超时未收到验证码）:', phone); } catch (_) {}
+        await disposePhone(phone, '超时未收到验证码');
       }
       if (!isCodeTimeout && !isRentFail) {
         // 验码/实名/网络等非号源问题，换号没用，直接抛出
