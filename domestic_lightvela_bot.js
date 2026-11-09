@@ -391,7 +391,22 @@ function createWSConn({ host, port, path, useTls, proxy }, handlers) {
         attach(raw, null);
         writeHandshake();     // 裸 socket 经代理后已连通，直接发 WS 握手
       }
-    }).catch((e) => handlers.onError && handlers.onError(e));
+    }).catch((e) => {
+      // ★ 2026-11-09：代理连 TAT 中继失败时直连兜底
+      //   实测：轮换代理连 ap-shanghai.forward.tat-tc.tencent.cn 有约 30% 概率 rep=5（连接被拒），
+      //   且成功时也要 5~8 秒；直连只要 0.2 秒且稳定。
+      //   TAT 是腾讯云官方终端通道，不参与 LightVela 风控判定，直连不影响账号隔离。
+      //   不加兜底会出现「建 bot 成功、设模型成功、连中继超时」→ 整号判死。
+      console.log('[WS] 代理连接失败（' + ((e && e.message) || e) + '）→ 改用直连兜底 ' + host + ':' + port);
+      if (destroyed) return;
+      try {
+        const s2 = useTls ? tls.connect(port, host, { rejectUnauthorized: false })
+                          : net.connect(port, host);
+        attach(s2, useTls ? 'secureConnect' : 'connect');
+      } catch (e2) {
+        handlers.onError && handlers.onError(e2);
+      }
+    });
   } else {
     const s = useTls ? tls.connect(port, host, { rejectUnauthorized: false }) : net.connect(port, host);
     attach(s, useTls ? 'secureConnect' : 'connect');
