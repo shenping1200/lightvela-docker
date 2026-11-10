@@ -96,7 +96,7 @@ function httpConnect(proxy, targetHost, targetPort) {
 }
 
 // ---------- SOCKS5：握手 + 认证 + 连接请求 ----------
-function socks5Connect(proxy, targetHost, targetPort) {
+function socks5ConnectOnce(proxy, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(proxy.port, proxy.host);
     let stage = 0;                 // 0=问候 1=认证 2=连接
@@ -158,6 +158,29 @@ function socks5Connect(proxy, targetHost, targetPort) {
     sock.on('data', onData);
     sock.on('error', fail);
   });
+}
+
+/**
+ * SOCKS5 连接（带重试）。
+ * ★ 2026-11-10：轮换代理每建一条新 TCP 连接就换一个出口 IP，
+ *   实测经常出现 rep=5（目标拒绝连接）——就是这一次分到的出口 IP 被目标拒了。
+ *   以前一次被拒就判死，导致账号明明拿到号却死在代理上。
+ *   现在：rep=1/3/4/5 或网络类错误 → 换新连接重试（最多 3 次）；
+ *        认证失败/版本不符这类重试没用，直接抛。
+ */
+function socks5Connect(proxy, targetHost, targetPort) {
+  const TRIES = Math.max(1, parseInt(process.env.LIGHTVELA_PROXY_TRIES || '3', 10));
+  const attempt = (n) => socks5ConnectOnce(proxy, targetHost, targetPort).catch((e) => {
+    const msg = String((e && e.message) || e);
+    const retriable = /rep=([1345])/.test(msg)
+      || /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|EHOSTUNREACH|ENETUNREACH/.test(msg);
+    if (n < TRIES && retriable) {
+      console.log('  [代理] ' + msg + ' → 换新连接重试（第 ' + (n + 1) + '/' + TRIES + ' 次）');
+      return attempt(n + 1);
+    }
+    throw e;
+  });
+  return attempt(1);
 }
 
 /**

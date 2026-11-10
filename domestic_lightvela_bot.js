@@ -556,6 +556,31 @@ const SMS_HAOZHUMA = {
 //   释放：/cancelRecv?token=&order_id=      加黑：/addBlackList?token=&order_id=
 //   余额：/userInfo?token= -> data.money
 //   通用返回：{code:200, msg:"OK", data:{...}}
+// ★ 2026-11-10：飞狐返回码解析 + 本地已用号码黑名单
+//   飞狐统一返回 {code:200, msg:"OK", data:{...}}，只有 code=200 才算成功。
+function feihuAck(j) {
+  if (!j || typeof j !== 'object') return { ok: false, code: null, msg: '返回格式异常' };
+  const c = Number(j.code);
+  return { ok: (c === 200), code: j.code, msg: String(j.msg == null ? '' : j.msg) };
+}
+
+// 已用号码黑名单：飞狐只能按 order_id 拉黑，同一个号码下次还会被分配。
+// 本地记一份「取过的号码」，取号时命中就释放重取，从源头挡住重复号。
+const USED_PHONES_FILE = process.env.LIGHTVELA_USED_PHONES || (__dirname + '/used-phones.ndjson');
+function loadUsedPhones() {
+  // 每行一个号码（ndjson）。多进程只追加不重写，8 并发下不会互相覆盖。
+  try {
+    const s = require('fs').readFileSync(USED_PHONES_FILE, 'utf8');
+    return new Set(s.split('\n').map(x => x.trim()).filter(Boolean));
+  } catch (e) { return new Set(); }
+}
+function markUsedPhone(phone) {
+  // O_APPEND 原子追加，多个子进程同时写也不会丢
+  try {
+    require('fs').appendFileSync(USED_PHONES_FILE, phone + '\n');
+  } catch (e) { console.warn('  [飞狐] 记已用号码失败:', e.message); }
+}
+
 const SMS_FEIHU = {
   // 备用域名数组：主域连不上自动换下一个（只换一次，避免对"已发出未超时"的请求重复取号）
   apiBases: (process.env.LIGHTVELA_FEIHU_API_BASE || 'http://api.feihu2026.com/api/sms')
@@ -593,16 +618,38 @@ const SMS_FEIHU = {
     if (!this._token) throw new Error('飞狐登录返回无 token: ' + JSON.stringify(j));
     return this._token;
   },
-  async rentNumber() {
+  async rentNumber(maxTry) {
+    // ★ 2026-11-10 修复：飞狐的「拉黑」是按订单（order_id）生效，同一号码下次还会被分配，
+    //   导致用过的号被重复取到 → 同手机号 + 同身份证被平台当成老账号 → 新身份覆盖了老账号。
+    //   这里加一层本地号码黑名单：取到已用过的号 → 立即释放（cancelRecv）→ 重取。
     const token = await this.login();
     if (!this.projectId) throw new Error('飞狐未配置项目 ID（pid）');
-    const j = await this._get('/getPhone?token=' + encodeURIComponent(token) + '&pid=' + encodeURIComponent(this.projectId));
-    if (Number(j.code) !== 200) throw new Error('飞狐取号失败: ' + JSON.stringify(j));
-    const phone = j.data && j.data.phone;
-    const order = j.data && j.data.order_id;
-    if (!phone) throw new Error('飞狐取号返回无手机号: ' + JSON.stringify(j));
-    this._orderByPhone[phone] = order;   // 记下订单号，释放/拉黑要用
-    return phone;
+    const tries = Math.max(1, parseInt(maxTry || process.env.LIGHTVELA_FEIHU_RENT_TRY || '10', 10));
+    const used = loadUsedPhones();
+    for (let attempt = 1; attempt <= tries; attempt++) {
+      const j = await this._get('/getPhone?token=' + encodeURIComponent(token) + '&pid=' + encodeURIComponent(this.projectId));
+      if (Number(j.code) !== 200) throw new Error('飞狐取号失败: ' + JSON.stringify(j));
+      const phone = j.data && j.data.phone;
+      const order = j.data && j.data.order_id;
+      if (!phone) throw new Error('飞狐取号返回无手机号: ' + JSON.stringify(j));
+      this._orderByPhone[phone] = order;   // 记下订单号，释放/拉黑要用
+      if (used.has(phone)) {
+        // ★★ 2026-11-10 实测修正：命中黑名单必须【拉黑】，不能【释放】。
+        //   飞狐的号池是"一次只给一个号，拉黑后才换下一个"（实测：拉黑前 6/6 都是同一个号，
+        //   拉黑后 8/8 全换成新号）。释放只会把号码放回池子 → 下次还给你 → 死循环。
+        console.log('  [飞狐] ⚠ 取到已用过的号码 ' + phone + '，拉黑并换号（第 ' + attempt + '/' + tries + ' 次）');
+        try {
+          const jb = await this._get('/addBlackList?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+          const ab = feihuAck(jb);
+          if (!ab.ok) console.log('  [飞狐] ⚠ 拉黑历史号失败 code=' + ab.code + ' ' + ab.msg);
+        } catch (e) { /* 拉黑失败也继续重取，不能卡住 */ }
+        continue;
+      }
+      used.add(phone);
+      markUsedPhone(phone);
+      return phone;
+    }
+    throw new Error('飞狐连续 ' + tries + ' 次都取到已用过的号码，放弃本次取号');
   },
   async getCode(phone, { timeoutMs = 180000, intervalMs = 15000 } = {}) {
     const token = await this.login();
@@ -629,16 +676,28 @@ const SMS_FEIHU = {
     throw new Error('飞狐取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
   },
   async release(phone) {
+    // ★ 2026-11-10 修复：原来没有 return，调用方永远拿不到结果（一直打"未返回可判定的结果"）
     const token = await this.login();
     const order = this._orderByPhone[phone];
-    if (!order) return;
-    await this._get('/cancelRecv?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+    if (!order) return { ok: false, code: 'NO_ORDER', msg: '没有该号的订单号（进程重启或非本次取号）' };
+    try {
+      const j = await this._get('/cancelRecv?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+      return feihuAck(j);
+    } catch (e) {
+      return { ok: false, code: null, msg: '请求异常: ' + (e && e.message ? e.message : String(e)) };
+    }
   },
   async blacklist(phone) {
+    // ★ 2026-11-10 修复：同上，补上 return + 返回码解析，让调用方能判真假
     const token = await this.login();
     const order = this._orderByPhone[phone];
-    if (!order) return;
-    await this._get('/addBlackList?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+    if (!order) return { ok: false, code: 'NO_ORDER', msg: '没有该号的订单号（进程重启或非本次取号）' };
+    try {
+      const j = await this._get('/addBlackList?token=' + encodeURIComponent(token) + '&order_id=' + encodeURIComponent(order));
+      return feihuAck(j);
+    } catch (e) {
+      return { ok: false, code: null, msg: '请求异常: ' + (e && e.message ? e.message : String(e)) };
+    }
   },
   async balance() {
     const token = await this.login();
