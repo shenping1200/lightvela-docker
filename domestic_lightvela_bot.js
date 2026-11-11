@@ -1319,11 +1319,22 @@ async function domesticLogin(acc, idx) {
       //   而接码号是"用即弃"（已拉黑），等于这个号彻底废掉、没法第二天补救。
       //   现在登录成功就存，实名失败的号第二天配额重置后可直接用 token 重试实名，不用重新接码。
       try {
-        saveDomesticToken({
+        const earlyCred = {
           name: acc.name, idCard: acc.idCard, phone, uid, bearer: token,
           instanceId: null, deployOk: false, deployAttempts: 0,
           stage: 'login_only', savedAt: new Date().toISOString(),
-        });
+        };
+        saveDomesticToken(earlyCred);
+        // ★ 2026-11-11 修：登录成功就先上报数据中心，别等实名成功。
+        //   旧逻辑只有第 2589 行（实名成功之后）才打印 DOMESTIC_CRED_JSON，
+        //   实名一失败程序直接抛异常退出，这行永远不打印 → 外层 Python 拿不到凭证 →
+        //   不上传数据中心。结果是「本地有凭证、中心没有」，跨机也复用不了，
+        //   接码钱白花。现在登录成功立刻推一条只有令牌的记录；
+        //   实名通过后第 2589 行会再推一次（带实例号），按 account_key upsert 更新同一条，不会重复。
+        console.log('DOMESTIC_CRED_JSON=' + JSON.stringify({
+          name: earlyCred.name, idCard: earlyCred.idCard, phone: earlyCred.phone,
+          uid: earlyCred.uid, bearer: earlyCred.bearer,
+        }));
       } catch (e) { console.warn('  ⚠️ token 落盘失败（不影响继续）:', e.message); }
       // ★ 2026-11-09：实名加自动重试（实测：HTTP 500 重试就能过；shadow_pending 重发可能过）
       //   succeeded                        → 成功

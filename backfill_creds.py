@@ -37,7 +37,31 @@ CANDIDATES = [
     "/root/lightvela-docker/data/domestic-tokens.ndjson",
     "/home/ubuntu/lightvela-docker/data/domestic-tokens.ndjson",
 ]
-DATA = next((p for p in CANDIDATES if os.path.isfile(p)), None)
+
+
+def _count_lines(p):
+    """数一个文件有多少行；读不了返回 -1。"""
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    except Exception:
+        return -1
+
+
+# ★ 2026-11-11 修：**不能按顺序取第一个命中的**。
+#   实测 9 台机器上，脚本同目录都残留着一个 11-09 的旧文件 domestic-tokens.ndjson（只有 28 条），
+#   它排在候选第一位 → 回填任务一直在同步这 28 条，真正在 data/ 下那 800~1200 条从来没被回填过，
+#   结果就是「本地有凭证、数据中心没有」。改成：把存在的候选全数一遍，取**条数最多**的那个。
+_exist = [(p, _count_lines(p)) for p in CANDIDATES if os.path.isfile(p)]
+if _exist:
+    DATA = max(_exist, key=lambda x: x[1])[0]
+    if len(_exist) > 1:
+        print("[backfill] 发现 %d 个候选文件，选中条数最多的：%s"
+              % (len(_exist), DATA))
+        for p, n in _exist:
+            print("           %-58s %d 条" % (p, n))
+else:
+    DATA = None
 if not DATA:
     print("[backfill] 找不到 domestic-tokens.ndjson，退出")
     sys.exit(0)
