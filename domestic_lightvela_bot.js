@@ -498,10 +498,55 @@ async function haozhumaAck(url) {
   return { ok, code: j.code, msg: String(j.msg == null ? '' : j.msg), raw: String(text).slice(0, 160) };
 }
 
+// ★ 2026-11-15：获取豪猪网站令牌（环境变量 > 数据中心 > 内置兜底）
+//   本机定时把浏览器令牌上传数据中心，各机器都从这里取。
+async function getHzWebToken() {
+  if (process.env.LIGHTVELA_HZ_WEB_TOKEN) return process.env.LIGHTVELA_HZ_WEB_TOKEN;
+  try {
+    const r = await fetch('http://43.167.192.48:18090/hz_token',
+      { headers: { 'X-Auth-Token': 'lvc-9f3a7d2e6b1c4a85' } });
+    const j = await r.json();
+    if (j && j.ok && j.token) return j.token;
+  } catch (e) { /* 数据中心不可达就用兜底 */ }
+  return '283ccb48-a592-414c-8ae6-6487f1b05827';
+}
+
+// ★ 2026-11-15：网站后台兜底取码（只在接口取码超时时调用一次，成功号完全不碰）
+//   背景：豪猪接口取码经常超时，但网站后台其实已经收到短信（实测延迟仅几秒）。
+async function fetchCodeFromWeb(phone) {
+  const tok = await getHzWebToken();
+  if (!tok || !phone) return '';
+  try {
+    const today = new Date().toISOString().slice(0, 10);   // 网站按 UTC 日期
+    const u = 'https://api.zsnixp.cn/v1/ledger/sms-expenses?date=' + today + '&size=100';
+    const r = await fetch(u, {
+      headers: {
+        'Authorization': 'Bearer ' + tok,
+        'Accept': 'application/json',
+        'Origin': 'https://h5.haozhuma.com',
+        'Referer': 'https://h5.haozhuma.com/',
+      },
+    });
+    // ★ 令牌失效检测：401 = 网站令牌过期，兜底不可用，明确告警（否则会静默失效）
+    if (r.status === 401) {
+      console.log('  ⚠️ 网站后台令牌已过期（401），兜底取码暂不可用，请更新令牌');
+      return '';
+    }
+    const j = await r.json();
+    const list = (j.data || {}).list || [];
+    const hit = list.find((x) => String(x.phone) === String(phone));
+    if (!hit) return '';
+    const m = String(hit.smsContent || '').match(/(\d{4,8})/);
+    return m ? m[1] : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 const SMS_HAOZHUMA = {
   apiBase:   process.env.LIGHTVELA_SMS_API_BASE || 'https://api.haozhuma.com',
-  apiUser:   process.env.LIGHTVELA_SMS_USER     || 'f632fc95683bd65352623febb154ffcae6550a33178a18c65921060810d0571c',
-  apiPass:   process.env.LIGHTVELA_SMS_PASS     || '284d033beb03583ba15948792383e03683e36a6c90cf0c63a1ca767a2d70c2f6',
+  apiUser:   process.env.LIGHTVELA_SMS_USER     || 'f632fc95683bd653a4208929d88e2d5e5a88434e76d480a5be6bbfb4a2fa007a',
+  apiPass:   process.env.LIGHTVELA_SMS_PASS     || '3c6c4c4ffecba00627d8cf9f4ac644c2b9149a2afee8456c03aba28fb28ffc7cdd5329cba0e908c786711378fad2a03f',
   projectId: parseInt(process.env.LIGHTVELA_SMS_PROJECT_ID || '21986', 10),
   _token: null,
   async login() {
@@ -524,13 +569,18 @@ const SMS_HAOZHUMA = {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const j = await (await fetch(url)).json();
-      // ★ 只在拿到合法验证码（4~8 位纯数字）时才返回；0 / 空 / 非数字一律视为「还没收到」，继续轮询。
-      //   修复：豪猪返回 code=0/yzm=0 这类「未收到」信号曾被误当成验证码（徐彦如案例拿到「验证码: 0」，
-      //        拿 0 去 verify 白跑、且把号拉黑废掉）；现改为只认真码，收不到就超时走换号重试。
-      const yzm = (j.yzm != null && String(j.yzm)) ||
-                  (j.sms && (j.sms.match(/(\d{4,8})/) || [])[1]) || '';
-      if (/^\d{4,8}$/.test(yzm)) return yzm;
+      // ★ 2026-11-15：直接从短信原文(sms)抠「连续 6 位数字」——验证码格式固定 6 位。
+      //   不再依赖豪猪的 yzm：它认不出来会回 0，旧逻辑把 0 当"没收到"，漏掉原文里的真码，白等到超时。
+      //   只认独立的 6 位（前后不能紧挨数字），避免从更长的数字串里截一段。
+      const mm = String(j.sms || '').match(/(?<!\d)\d{6}(?!\d)/);
+      if (mm) return mm[0];
       await sleep(intervalMs);
+    }
+    // ★ 网站兜底：接口取码超时后，按手机号去网站后台查一次（有码就返回，后面验码/实名照常走）
+    const webCode = await fetchCodeFromWeb(phone);
+    if (webCode) {
+      console.log('  🔁 接口取码超时，网站后台捞到验证码（兜底生效）:', webCode);
+      return webCode;
     }
     throw new Error('豪猪取码超时（' + (timeoutMs / 1000) + 's 内无验证码）');
   },

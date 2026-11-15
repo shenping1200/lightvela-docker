@@ -49,6 +49,12 @@ _fail_lock = threading.Lock()
 app = FastAPI(title="LightVela Web", docs_url=None, redoc_url=None, openapi_url=None)
 API = core.Api()          # ← 复用现有 Api（内部含 Job 编排与 Node 引擎桥）
 
+# ★ 2026-11-15：启动豪猪网站令牌同步线程（本机独有，启动读一次 + 每6小时一次）
+try:
+    dcore.ensure_hz_token_sync()
+except Exception as _e:
+    print("[令牌同步] 启动失败:", _e)
+
 
 # ---------------- 会话票据（HMAC 签名，无状态） ----------------
 def make_session():

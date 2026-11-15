@@ -66,8 +66,8 @@ DEFAULT_DOMESTIC_CONFIG = {
     "sms": {
         "provider": "haozhuma",   # 接码平台选择器：haozhuma（默认）| feihu；选哪套哪套生效，两套并存
         "apiBase": "https://api.haozhuma.com",
-        "apiUser": "f632fc95683bd65352623febb154ffcae6550a33178a18c65921060810d0571c",
-        "apiPass": "284d033beb03583ba15948792383e03683e36a6c90cf0c63a1ca767a2d70c2f6",
+        "apiUser": "f632fc95683bd653a4208929d88e2d5e5a88434e76d480a5be6bbfb4a2fa007a",
+        "apiPass": "3c6c4c4ffecba00627d8cf9f4ac644c2b9149a2afee8456c03aba28fb28ffc7cdd5329cba0e908c786711378fad2a03f",
         "projectId": 21986,
         # 飞狐接码（与豪猪并存；provider=feihu 时生效）
         "feihu": {
@@ -2239,3 +2239,91 @@ def domestic_monitor_status():
         return base
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+
+
+# ===================== 豪猪网站令牌同步（本机独有，2026-11-15） =====================
+#   本机程序启动时读一次浏览器令牌并上传数据中心，之后每 6 小时一次。
+#   VPS 那套不加这段（VPS 只从数据中心拿）。
+_HZ_TOKEN_INTERVAL = int(os.environ.get("LIGHTVELA_HZ_TOKEN_SYNC_SEC") or 6 * 3600)
+_hz_tok_started = False
+_hz_tok_lock = threading.Lock()
+
+
+def _read_hz_web_token():
+    """从本机浏览器（Tabbit）读豪猪网站令牌；读不到返回 (None, 原因)。"""
+    cli = os.environ.get("LIGHTVELA_TABBIT_CLI") or r"C:/Users/Administrator/AppData/Local/Tabbit/LocalAgent/bin/tabbit-cli.exe"
+    if not os.path.isfile(cli):
+        return None, "本机没有 tabbit-cli"
+    try:
+        p = subprocess.run([cli, "tabs", "--task", "hz"], capture_output=True, timeout=60)
+        tab = None
+        for line in p.stdout.decode("utf-8", "ignore").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
+            for t in j.get("tabs") or []:
+                if "豪猪" in (t.get("title") or "") or "haozhuma" in (t.get("url") or ""):
+                    tab = str(t.get("tabId"))
+                    break
+            if tab:
+                break
+        if not tab:
+            return None, "没找到豪猪标签页"
+        rid = "r" + str(int(time.time() * 1000))
+        js = "return await page.evaluate(() => localStorage.getItem('qs_web_token') || '')"
+        p2 = subprocess.run([cli, "nodejs", "--task", "hz", "--request-id", rid, "--tab", tab],
+                            input=js.encode("utf-8"), capture_output=True, timeout=60)
+        for line in p2.stdout.decode("utf-8", "ignore").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    v = (json.loads(line).get("result") or {}).get("value")
+                    if v:
+                        return v, ""
+                except Exception:
+                    pass
+        return None, "浏览器里没读到令牌"
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _hz_token_sync_once():
+    tok, err = _read_hz_web_token()
+    if not tok:
+        print("[令牌同步] 读取失败: %s" % err, flush=True)
+        return
+    try:
+        import urllib.request
+        data = json.dumps({"token": tok}).encode("utf-8")
+        req = urllib.request.Request(CENTER_BASE + "/hz_token", data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Auth-Token", CENTER_TOKEN)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read().decode("utf-8", "ignore")
+        print("[令牌同步] 已上传数据中心: %s" % body[:120], flush=True)
+    except Exception as e:
+        print("[令牌同步] 上传失败: %s: %s" % (type(e).__name__, e), flush=True)
+
+
+def _hz_token_sync_loop():
+    while True:
+        try:
+            _hz_token_sync_once()
+        except Exception as e:
+            print("[令牌同步] 循环异常: %r" % (e,), flush=True)
+        time.sleep(_HZ_TOKEN_INTERVAL)
+
+
+def ensure_hz_token_sync():
+    """启动令牌同步线程（只启动一次）。"""
+    global _hz_tok_started
+    with _hz_tok_lock:
+        if _hz_tok_started:
+            return
+        _hz_tok_started = True
+        threading.Thread(target=_hz_token_sync_loop, daemon=True, name="hz-token-sync").start()
+        print("[令牌同步] 后台线程已启动，每 %d 秒一次" % _HZ_TOKEN_INTERVAL, flush=True)
