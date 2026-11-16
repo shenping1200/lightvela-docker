@@ -371,6 +371,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
                副本不带 id，用 data-mirror 指向原按钮 / data-mirror-text 指向原统计，
                点击、禁用状态、统计文字全部由 bindMirror() 自动跟随，原逻辑一行没改。
                左栏只有 434px，放不下会自动折行。 -->
+          <label style="min-width:auto" title="开启后：取号先查号码库，用过的号直接拉黑换号，不发短信"><input type="checkbox" class="phone-check-box" id="domPhoneCheck" checked> 号码查重</label>
           <button class="btn primary sm" data-mirror="domBtnStart">▶ 开始</button>
           <button class="btn danger sm" data-mirror="domBtnStop">■ 停止</button>
           <button class="btn sm" data-mirror="domBtnExportSuccess">导出成功</button>
@@ -408,6 +409,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           </select>
         </div>
         <div class="bar" style="margin-top:8px">
+          <label style="min-width:auto" title="开启后：取号先查号码库，用过的号直接拉黑换号，不发短信"><input type="checkbox" class="phone-check-box" id="domPhoneCheck2" checked> 号码查重</label>
           <button class="btn primary" id="domBtnStart">▶ 开始</button>
           <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
           <button class="btn sm" id="domBtnExportSuccess" disabled>导出成功</button>
@@ -1298,6 +1300,22 @@ function boot() {
   $('domBtnExportSuccess').onclick = domExportSuccess;
   $('domBtnExportFailed').onclick = domExportFailed;
   $('domBtnImportFailed').onclick = domImportFailed;
+  // ★ 2026-11-16：号码查重开关（状态存服务端；点「开始」那一刻固化到本批，中途改不影响本批）
+  (function initPhoneCheck() {
+    const boxes = Array.from(document.querySelectorAll('.phone-check-box'));
+    if (!boxes.length) return;
+    const apply = (v) => boxes.forEach((b) => { b.checked = !!v; });
+    API.phone_check_get().then((r) => { if (r && r.ok) apply(r.enabled); }).catch(() => {});
+    boxes.forEach((b) => {
+      b.onchange = async () => {
+        const want = b.checked;
+        apply(want);   // 两处立刻同步
+        const r = await API.phone_check_set(want);
+        if (r && r.ok) appendDomLog(['[号码查重] 已' + (r.enabled ? '开启' : '关闭') + '（下一批生效）']);
+        else appendDomLog(['[号码查重] 保存失败：' + ((r && r.error) || '未知')]);
+      };
+    });
+  })();
   $('domBtnTkInfo').onclick = domTkInfo;
   $('domBtnTkExport').onclick = domTkExport;
   $('domBtnTkDel').onclick = domTkDel;

@@ -351,6 +351,9 @@ HANDLERS = {
     "domestic_tg_set_enabled":    lambda a: dcore.dom_tg_set_enabled(
         _truthy(a[0]) if a else True),
     "domestic_tg_status":         lambda a: dcore.dom_tg_config(),
+    # ★ 2026-11-16：号码查重开关（存服务端配置文件，点开始时固化到本批）
+    "phone_check_get":            lambda a: dcore.phone_check_get(),
+    "phone_check_set":            lambda a: dcore.phone_check_set(_truthy(a[0]) if a else True),
 }
 
 

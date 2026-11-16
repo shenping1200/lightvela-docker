@@ -995,6 +995,191 @@ const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU
 // 公共拉黑部分：解析返回码 + 打真实结果
 // ★ 2026-11-09：去掉 releasedOk 参数——不再有"释放"这个前置动作，拉黑就是唯一动作。
 //   拉黑成功 = 号不再分配给我，且已从卡台移除。失败就明确报警，不再降级成"预期内"。
+// ★ 2026-11-16 老大定的号码库自查（方案见当日讨论）
+//   目标：只对「没接收过验证码」的号码发码，避免重复付费。
+//   开关：环境变量 LIGHTVELA_PHONE_CHECK=1 开 / 0 关（面板按批次传）
+//   数据：数据中心为权威，本地留一份；数据中心挂了降级用本地。
+const PHONE_LEDGER = {
+  center: process.env.LIGHTVELA_CENTER || 'http://43.167.192.48:18090',
+  auth: process.env.LIGHTVELA_CENTER_TOKEN || 'lvc-9f3a7d2e6b1c4a85',
+  dir: process.env.LIGHTVELA_PHONE_LEDGER_DIR || '/data',
+  TIMEOUT_MS: Number(process.env.LIGHTVELA_PHONE_TIMEOUT_MS || 60000),   // 老大定：慢就等，60 秒
+  DOWN_AFTER: 3,          // 连续失败几次判定数据中心不可用
+  DOWN_COOLDOWN: 300,     // 不可用持续多少秒
+
+  set: new Set(),
+  seen: {},               // 号码 -> first_seen（只用于日志显示）
+  cursor: 0,              // 上次同步到的服务器时间
+  loaded: false,
+  loading: null,
+  dcFail: 0,
+  dcDownUntil: 0,
+
+  get localFile() { return this.dir + '/phone_used.txt'; },
+  get cursorFile() { return this.dir + '/phone_cursor.txt'; },
+
+  enabled() { return String(process.env.LIGHTVELA_PHONE_CHECK || '1') === '1'; },
+
+  norm(p) {
+    let s = String(p == null ? '' : p).trim().replace(/[\s-]/g, '');
+    if (s.startsWith('+86')) s = s.slice(3);
+    else if (s.startsWith('86') && s.length === 13) s = s.slice(2);
+    return s;
+  },
+
+  _fmt(ts) {
+    if (!ts) return '';
+    const d = new Date(Number(ts) * 1000);
+    const p2 = (n) => (n < 10 ? '0' + n : '' + n);
+    return (d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  },
+
+  async _req(path, params, method) {
+    const qs = Object.keys(params || {})
+      .map((k) => k + '=' + encodeURIComponent(params[k])).join('&');
+    const url = this.center + path + (qs ? (path.indexOf('?') >= 0 ? '&' : '?') + qs : '');
+    const ac = new AbortController();
+    const tm = setTimeout(() => ac.abort(), this.TIMEOUT_MS);
+    try {
+      const opt = { headers: { 'X-Auth-Token': this.auth }, signal: ac.signal };
+      if (method === 'POST') {
+        opt.method = 'POST';
+        opt.headers['Content-Type'] = 'application/json';
+        opt.body = JSON.stringify(params || {});
+      }
+      const r = await fetch(url, opt);
+      return await r.json();
+    } finally { clearTimeout(tm); }
+  },
+
+  _readLocal() {
+    const fs = require('fs');
+    try { this.cursor = parseInt(fs.readFileSync(this.cursorFile, 'utf8').trim(), 10) || 0; } catch (e) {}
+    let exists = false;
+    try {
+      if (fs.existsSync(this.localFile)) {
+        const lines = fs.readFileSync(this.localFile, 'utf8').split('\n');
+        for (const ln of lines) { const p = this.norm(ln); if (p) this.set.add(p); }
+        exists = true;
+      }
+    } catch (e) { console.log('  · 号码库：本地读取失败 ' + e.message); }
+    return exists;
+  },
+
+  _saveAll() {
+    const fs = require('fs');
+    try { fs.writeFileSync(this.localFile, Array.from(this.set).join('\n') + '\n'); } catch (e) {}
+    this._saveCursor();
+  },
+
+  _appendLocal(ps) {
+    const fs = require('fs');
+    try { fs.appendFileSync(this.localFile, ps.join('\n') + '\n'); } catch (e) {}
+  },
+
+  _saveCursor() {
+    const fs = require('fs');
+    try { fs.writeFileSync(this.cursorFile, String(this.cursor)); } catch (e) {}
+  },
+
+  // 第一次启动 = 本地号码文件不存在。程序/容器/服务器重启都不算。
+  async load() {
+    if (this.loaded) return this.set;
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      const hasLocal = this._readLocal();
+      if (hasLocal) {
+        console.log('  · 号码库：本地载入 ' + this.set.size + ' 个（游标 ' + this.cursor + '）');
+        this.loaded = true;
+        return this.set;
+      }
+      console.log('  · 号码库：本地为空 → 判定为第一次启动，从数据中心拉全量…');
+      try {
+        const j = await this._req('/phone_used/all', {});
+        if (j && j.ok && Array.isArray(j.phones)) {
+          for (const p of j.phones) { const q = this.norm(p); if (q) this.set.add(q); }
+          this.cursor = j.server_ts || 0;
+          this._saveAll();
+          console.log('  · 号码库：全量拉取成功 ' + j.count + ' 个');
+        } else {
+          console.log('  ⚠️ 号码库：全量拉取返回异常');
+        }
+      } catch (e) {
+        console.log('  ⚠️ 号码库：全量拉取失败（' + e.message + '）→ 本地为空');
+      }
+      this.loaded = true;
+      return this.set;
+    })();
+    return this.loading;
+  },
+
+  // 返回 true = 这个号以前收过码（要拉黑换号）
+  async check(phone) {
+    const p = this.norm(phone);
+    if (!p) return false;
+    if (Date.now() < this.dcDownUntil) return this._local(p, true);
+
+    try {
+      const j = await this._req('/phone_used/check', { phone: p, since: this.cursor });
+      this.dcFail = 0;
+      if (!j || !j.ok) return this._local(p, false);
+
+      if (Array.isArray(j.new) && j.new.length) {
+        const fresh = [];
+        for (const x of j.new) {
+          const q = this.norm(x);
+          if (q && !this.set.has(q)) { this.set.add(q); fresh.push(q); }
+        }
+        if (fresh.length) {
+          this._appendLocal(fresh);
+          console.log('  · 号码库：同步新增 ' + fresh.length + ' 个（累计 ' + this.set.size + '）');
+        }
+      }
+      if (j.server_ts) { this.cursor = j.server_ts; this._saveCursor(); }
+      if (j.first_seen) this.seen[p] = j.first_seen;
+      return !!j.used;
+    } catch (e) {
+      this.dcFail++;
+      if (this.dcFail >= this.DOWN_AFTER) {
+        this.dcDownUntil = Date.now() + this.DOWN_COOLDOWN * 1000;
+        console.log('  ⚠️ 数据中心连续 ' + this.dcFail + ' 次连不上 → 接下来 5 分钟改用本地号码库比对（本地 ' + this.set.size + ' 个）');
+      } else {
+        console.log('  ⚠️ 数据中心比对失败（' + e.message + '）→ 本次改用本地号码库（' + this.set.size + ' 个）');
+      }
+      return this._local(p, true);
+    }
+  },
+
+  _local(p, showLog) {
+    if (!this.set.size) {
+      if (showLog) console.log('  ⚠️ 本地号码库为空，本次跳过查重，直接发码');
+      return false;
+    }
+    if (showLog) console.log('  ⚠️ 数据中心连不上 → 改用本地号码库比对（本地 ' + this.set.size + ' 个）');
+    return this.set.has(p);
+  },
+
+  async add(phone) {
+    const p = this.norm(phone);
+    if (!p) return;
+    const isNew = !this.set.has(p);
+    this.set.add(p);
+    if (!isNew) return;
+    this._appendLocal([p]);
+    try {
+      await this._req('/phone_used', { phones: [p], source: 'code_received' }, 'POST');
+      console.log('  · 号码 ' + p + ' 已记入号码库（累计 ' + this.set.size + ' 个）');
+    } catch (e) {
+      console.log('  · 号码 ' + p + ' 已记本地（上报数据中心失败：' + e.message + '）');
+    }
+  },
+
+  firstSeenText(phone) {
+    const ts = this.seen[this.norm(phone)];
+    return ts ? this._fmt(ts) : '';
+  },
+};
+
 async function _blacklistWithAck(phone, reason) {
   let blk = null;
   try { blk = await SMS.blacklist(phone); }
@@ -1278,6 +1463,12 @@ function normalizeMainlandPhone(phone) {
 
 async function domesticLogin(acc, idx) {
   console.log(`\n===== 账号: ${acc.name} (${acc.idCard}) =====`);
+  // ★ 2026-11-16：先载入号码库（第一次启动才拉全量，之后只取增量）
+  if (PHONE_LEDGER.enabled()) {
+    try { await PHONE_LEDGER.load(); } catch (e) { console.log('  · 号码库载入异常（不影响继续）:', e.message); }
+  } else {
+    console.log('  · 号码查重已关闭（跳过号码库比对）');
+  }
   const MAX_RENT = Number(process.env.LIGHTVELA_SMS_MAX_RENT || 3);          // 最多换几个号
   const MAX_REGION_RETRY = Number(process.env.LIGHTVELA_SMS_MAX_REGION_RETRY || 5); // 连续取到非大陆号的重取上限（平台号源异常时放弃本账号）
   const CODE_TIMEOUT_MS = Number(process.env.LIGHTVELA_SMS_CODE_TIMEOUT_MS || 180000); // 官方：超三分钟未收到验证码即拉黑重取
@@ -1294,15 +1485,28 @@ async function domesticLogin(acc, idx) {
       // ★ 2026-10-23：取到非大陆号（香港/澳门）→ 拉黑并重取，直到拿到 11 位大陆号为止。
       //   独立计数（MAX_REGION_RETRY）不占用 MAX_RENT 换号配额——取错地区是平台缺陷，不是号源质量问题。
       //   飞狐拉黑按订单走（addBlackList 同时释放进行中的订单），豪猪按手机号走，SMS.blacklist 已各自封装。
+      const CHECK_PHONE = PHONE_LEDGER.enabled();
       for (let rr = 0; rr < MAX_REGION_RETRY; rr++) {
         phone = await SMS.rentNumber();
         console.log(`  手机号(取号#${attempt}${rr > 0 ? '-重取' + rr : ''}):`, phone);
-        if (isMainlandPhone(phone)) break;
-        await disposePhone(phone, `非大陆号码（${String(phone).length} 位）`);
-        console.log(`  ↻ 重新取号…`);
-        phone = null;
+        if (!isMainlandPhone(phone)) {
+          await disposePhone(phone, `非大陆号码（${String(phone).length} 位）`);
+          console.log(`  ↻ 重新取号…`);
+          phone = null;
+          continue;
+        }
+        // ★ 2026-11-16：这个号我们以前收过码吗？收过 → 拉黑换号，不发短信、不花钱
+        if (CHECK_PHONE && await PHONE_LEDGER.check(phone)) {
+          const when = PHONE_LEDGER.firstSeenText(phone);
+          console.log(`  ⛔ 号码复用：${phone} 之前收过验证码${when ? '（' + when + ' 入库）' : ''} → 已拉黑，重新取号`);
+          await disposePhone(phone, '号码复用：历史收过码');
+          phone = null;
+          continue;
+        }
+        if (CHECK_PHONE) console.log(`  ✓ 号码 ${phone} 未用过 → 发码`);
+        break;
       }
-      if (!phone) throw new Error('连续 ' + MAX_REGION_RETRY + ' 次取到非大陆号码（平台号源异常），放弃本账号');
+      if (!phone) throw new Error('连续 ' + MAX_REGION_RETRY + ' 次没拿到可用号码（非大陆号或号码复用，平台号源异常），放弃本账号');
       // —— 发码错峰门控 + 限频同号重发 ——
       // 门控：并发账号之间发短信请求至少间隔 SEND_GAP_MS（默认30s），避免被官方限频
       // 限频：若返回“发送过于频繁”，等 RESEND_WAIT_MS（默认60s）后用同一号码重发，最多 RESEND_MAX 次
@@ -1350,6 +1554,8 @@ async function domesticLogin(acc, idx) {
       }
       const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
       console.log('  验证码:', code);
+      // ★ 2026-11-16：成功收到验证码 → 立刻记入号码库（本地 + 数据中心），以后这个号再发来就能认出来
+      await PHONE_LEDGER.add(phone);
       // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
       await blacklistUsedPhone(phone, '已成功取码，号源即用即弃');
       const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });

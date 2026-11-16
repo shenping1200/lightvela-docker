@@ -63,6 +63,8 @@ CRED_RE = re.compile(r"DOMESTIC_CRED_JSON=(\{.*\})")
 
 # ===================== 国内版配置（接码平台账号/密码 + 代理 + 部署指令）=====================
 DEFAULT_DOMESTIC_CONFIG = {
+    # ★ 2026-11-16：号码查重开关（取号后先查号码库，用过的号直接拉黑换号，不发短信）
+    "phoneCheck": True,
     "sms": {
         "provider": "haozhuma",   # 接码平台选择器：haozhuma（默认）| feihu；选哪套哪套生效，两套并存
         "apiBase": "https://api.haozhuma.com",
@@ -134,6 +136,9 @@ def _read_config():
                 for k in ("sms", "proxy", "deploy"):
                     if isinstance(cfg.get(k), dict):
                         out[k].update(cfg[k])
+                # ★ 2026-11-16：号码查重开关（老配置文件没有这个键，默认开）
+                if "phoneCheck" in cfg:
+                    out["phoneCheck"] = bool(cfg["phoneCheck"])
         except Exception:
             pass
     return out
@@ -167,6 +172,20 @@ def get_config():
     except Exception:
         pass
     return {"ok": True, "config": cfg}
+
+
+def phone_check_get():
+    """号码查重开关：当前状态"""
+    cfg = _read_config()
+    return {"ok": True, "enabled": bool(cfg.get("phoneCheck", True))}
+
+
+def phone_check_set(enabled):
+    """号码查重开关：保存到服务端配置文件（/data/domestic-config.json）"""
+    cfg = _read_config()
+    cfg["phoneCheck"] = bool(enabled)
+    _write_config(cfg)
+    return {"ok": True, "enabled": cfg["phoneCheck"]}
 
 
 def set_sms_config(apiBase, apiUser, apiPass, projectId):
@@ -637,6 +656,8 @@ def _env_from_config(cfg):
         env["LIGHTVELA_SMS_CODE_TIMEOUT_MS"] = str(int(dep["smsTimeoutSec"]) * 1000)
     if dep.get("smsMaxRent"):
         env["LIGHTVELA_SMS_MAX_RENT"] = str(int(dep["smsMaxRent"]))
+    # ★ 2026-11-16：号码查重开关（点「开始」那一刻固化到本批，批次中途改不影响）
+    env["LIGHTVELA_PHONE_CHECK"] = "1" if (cfg or {}).get("phoneCheck", True) else "0"
     return env
 
 
