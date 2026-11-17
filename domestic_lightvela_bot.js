@@ -518,26 +518,36 @@ async function fetchCodeFromWeb(phone) {
   if (!tok || !phone) return '';
   try {
     const today = new Date().toISOString().slice(0, 10);   // 网站按 UTC 日期
-    const u = 'https://api.zsnixp.cn/v1/ledger/sms-expenses?date=' + today + '&size=100';
-    const r = await fetch(u, {
-      headers: {
-        'Authorization': 'Bearer ' + tok,
-        'Accept': 'application/json',
-        'Origin': 'https://h5.haozhuma.com',
-        'Referer': 'https://h5.haozhuma.com/',
-      },
-    });
-    // ★ 令牌失效检测：401 = 网站令牌过期，兜底不可用，明确告警（否则会静默失效）
-    if (r.status === 401) {
-      console.log('  ⚠️ 网站后台令牌已过期（401），兜底取码暂不可用，请更新令牌');
-      return '';
+    const headers = {
+      'Authorization': 'Bearer ' + tok,
+      'Accept': 'application/json',
+      'Origin': 'https://h5.haozhuma.com',
+      'Referer': 'https://h5.haozhuma.com/',
+    };
+    // ★ 2026-11-18：补翻页。当天接码可能上千条，只查前 100 条会漏掉
+    //   正好在等码那会儿的号。游标翻页直到找到该号或翻完为止（最多 15 页防死循环）。
+    let cursor = '';
+    for (let page = 0; page < 15; page++) {
+      const u = 'https://api.zsnixp.cn/v1/ledger/sms-expenses?date=' + today + '&size=100' +
+                (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+      const r = await fetch(u, { headers });
+      // ★ 令牌失效检测：401 = 网站令牌过期，兜底不可用，明确告警（否则会静默失效）
+      if (r.status === 401) {
+        console.log('  ⚠️ 网站后台令牌已过期（401），兜底取码暂不可用，请更新令牌');
+        return '';
+      }
+      const j = await r.json();
+      const d = j.data || {};
+      const list = d.list || [];
+      const hit = list.find((x) => String(x.phone) === String(phone));
+      if (hit) {
+        const m = String(hit.smsContent || '').match(/(\d{4,8})/);
+        return m ? m[1] : '';
+      }
+      cursor = d.nextCursor || '';
+      if (!cursor || !list.length) break;
     }
-    const j = await r.json();
-    const list = (j.data || {}).list || [];
-    const hit = list.find((x) => String(x.phone) === String(phone));
-    if (!hit) return '';
-    const m = String(hit.smsContent || '').match(/(\d{4,8})/);
-    return m ? m[1] : '';
+    return '';
   } catch (e) {
     return '';
   }
@@ -1558,14 +1568,26 @@ async function domesticLogin(acc, idx) {
       await PHONE_LEDGER.add(phone);
       // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
       await blacklistUsedPhone(phone, '已成功取码，号源即用即弃');
-      const v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
-      const token = v.json && v.json.session && v.json.session.sessionToken;
-      if (!token) {
-        // ★ 诊断增强：把 HTTP 状态码与原始响应体也打出来，下次一眼看出是 502/403/还是正常 JSON 但缺 session
+      // ★ 2026-11-18：验码失败重试 2 次（首次 + 2 = 最多 3 次），间隔 5 秒。
+      //   网络抖动/接口 5xx 时，重发同一个验证码即可（验证码 5 分钟内有效）。
+      //   只有"确定拿不到 token"或"验码接口报错"才重试；重试耗尽才抛错。
+      const VERIFY_TRY = Number(process.env.LIGHTVELA_VERIFY_TRY || 3);
+      const VERIFY_GAP_MS = Number(process.env.LIGHTVELA_VERIFY_GAP_MS || 5000);
+      let v = null, token = null, vErr = null;
+      for (let vt = 1; vt <= VERIFY_TRY; vt++) {
+        v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
+        token = v.json && v.json.session && v.json.session.sessionToken;
+        if (token) { vErr = null; break; }
         const raw = (v.json && typeof v.json === 'object')
           ? JSON.stringify(v.json).slice(0, 240)
           : (typeof v.text === 'string' ? v.text.slice(0, 240) : '(无响应体)');
-        throw new Error('登录失败（拿不到 sessionToken）: HTTP ' + v.status + ' | ' + raw);
+        vErr = 'HTTP ' + v.status + ' | ' + raw;
+        console.log('  ⚠️ 验码第 ' + vt + '/' + VERIFY_TRY + ' 次未拿到凭证（' + vErr + '）' +
+                    (vt < VERIFY_TRY ? '，' + (VERIFY_GAP_MS / 1000) + ' 秒后重试…' : ''));
+        if (vt < VERIFY_TRY) await new Promise(r => setTimeout(r, VERIFY_GAP_MS));
+      }
+      if (!token) {
+        throw new Error('登录失败（验码重试 ' + VERIFY_TRY + ' 次仍拿不到 sessionToken）: ' + vErr);
       }
       CFG.bearer = token;
       const uid = (v.json.session.user || {}).id;
@@ -1618,8 +1640,8 @@ async function domesticLogin(acc, idx) {
         const why = 'HTTP ' + rn.status + ' ' +
                     (rn.json ? JSON.stringify(rn.json).slice(0, 90) : '(空响应体)');
         console.log('  ⚠️ 实名第 ' + k + '/' + RN_MAX_TRY + ' 次异常（' + why + '）' +
-                    (k < RN_MAX_TRY ? '，3 秒后重试…' : ''));
-        if (k < RN_MAX_TRY) await new Promise(r => setTimeout(r, 3000));
+                    (k < RN_MAX_TRY ? '，5 秒后重试…' : ''));
+        if (k < RN_MAX_TRY) await new Promise(r => setTimeout(r, 5000));
       }
       if (rnMismatch) {
         console.log('  ⚠️ 原身份实名不匹配（', (rn.json.message || ''), '），进入补救流程…');
