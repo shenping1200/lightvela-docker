@@ -1290,39 +1290,66 @@ function parseVerifyResult(text) {
 //   ② 取号本身失败（豪猪「没有取到号码」= 项目临时无号源/限流，纯瞬时）→ 退避后重新取号。
 //   只有验码/实名/网络等非号源错误才直接抛出（换号没用）。
 
-// ★ 并发发码错峰门控：多账号同时跑时，两次发短信请求之间至少间隔 SEND_GAP_MS（默认 30s），
+// ★ 并发发码错峰门控：多账号同时跑时，两次发短信请求之间至少间隔 SEND_GAP_MS（默认 20s），
 //   避免一起打平台触发「发送过于频繁」。基于 /data 下的原子锁 + 时间戳文件（各账号子进程跨进程共享）。
+//   ★ 2026-11-18 改为「预约制」（老大定）：
+//     老设计是「拿锁 → 持锁睡满间隔 → 发码 → 放锁」，锁被占用整个 30s，N 个账号被串成 N×30s 长队，
+//     并发一高就撞 300s 上限 → 门控超时；进程崩了锁还会残留卡 3 分钟。
+//     新设计是「拿锁 → 算自己的发码时刻 → 写进时间戳占位 → 立刻放锁 → 各自在锁外睡到点 → 发码」，
+//     锁只在读/写时间戳的毫秒间持有，谁都不卡谁。
 const SMS_GATE_DIR = process.env.LIGHTVELA_SMS_GATE_DIR || '/data';
 const SMS_GATE_LOCK = SMS_GATE_DIR + '/.domestic_sms_gate.lock';
 const SMS_GATE_TS = SMS_GATE_DIR + '/.domestic_sms_gate.ts';
+const SMS_GATE_MAX_MS = Number(process.env.LIGHTVELA_SMS_GATE_MAX_MS || 450000);    // 排队上限 450s（原 300s，老大 2026-11-18 定）
+const SMS_GATE_POLL_MS = Number(process.env.LIGHTVELA_SMS_GATE_POLL_MS || 500);      // 抢锁重试间隔 0.5s（原 0.2s 太密）
+const SMS_GATE_STALE_MS = Number(process.env.LIGHTVELA_SMS_GATE_STALE_MS || 180000); // 残留锁清理阈值 3min
 function _smsGateCleanStale() {
   try {
     const st = fs.statSync(SMS_GATE_LOCK);
-    if (Date.now() - st.mtimeMs > 180000) { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }  // 清理残留锁（>3min）
+    if (Date.now() - st.mtimeMs > SMS_GATE_STALE_MS) { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }
   } catch (e) {}
 }
 async function smsSendGate(gapMs) {
   try { fs.mkdirSync(SMS_GATE_DIR, { recursive: true }); } catch (e) {}  // 确保门控目录存在
-  for (let i = 0; i < 1500; i++) {          // 最多等 1500*0.2s = 300s
+  const deadline = Date.now() + SMS_GATE_MAX_MS;
+  while (Date.now() < deadline) {
     try {
       _smsGateCleanStale();
-      fs.mkdirSync(SMS_GATE_LOCK);          // 原子拿锁
+      fs.mkdirSync(SMS_GATE_LOCK);          // 原子拿锁（只持有毫秒级）
       let last = 0;
       try { last = JSON.parse(fs.readFileSync(SMS_GATE_TS, 'utf8')).t || 0; } catch (e) {}
-      const wait = last + gapMs - Date.now();
+      // ★ 预约时间槽：我的发码时刻 = max(现在, 上次预约 + 间隔)
+      const mySlot = Math.max(Date.now(), last + gapMs);
+      if (mySlot > deadline) {              // 排队已超过上限：放锁走人，不占位，直接判超时
+        try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {}
+        break;
+      }
+      try { fs.writeFileSync(SMS_GATE_TS, JSON.stringify({ t: mySlot })); } catch (e) {}
+      try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {}   // ★ 立即放锁（不再持锁睡）
+      const wait = mySlot - Date.now();
       if (wait > 0) {
-        console.log(`  ⏳ 发码错峰等待 ${Math.ceil(wait / 1000)}s（距上次发码不足间隔，避免被官方限频）…`);
-        await sleep(wait);      // 距上次发码不足 gap 则补齐间隔
+        console.log(`  ⏳ 发码错峰等待 ${Math.ceil(wait / 1000)}s（已预约时间槽，不占用锁）…`);
+        await sleep(wait);      // 在锁外睡到预约时刻
       }
       return;
     } catch (e) {
-      await sleep(200);
+      await sleep(SMS_GATE_POLL_MS);   // 抢不到锁，0.5s 后重试
     }
   }
   throw new Error('发码错峰门控获取超时');
 }
-function smsSendGateRelease() { try { fs.rmdirSync(SMS_GATE_LOCK); } catch (e) {} }
-function smsSendGateTouch() { try { fs.writeFileSync(SMS_GATE_TS, JSON.stringify({ t: Date.now() })); } catch (e) {} }
+// ★ 预约制下锁已在 smsSendGate 内释放，release 改空操作（避免误删别人刚拿到的锁）
+function smsSendGateRelease() { /* no-op：预约制已在 smsSendGate 内部放锁 */ }
+// ★ 发码后校准：仅当实际时间已超过时间戳时才前推（让下一号从真实发码时刻算起）；
+//   绝不回退——回退会覆盖别人已预约的时间槽，导致两号撞车。
+function smsSendGateTouch() {
+  try {
+    let cur = 0;
+    try { cur = JSON.parse(fs.readFileSync(SMS_GATE_TS, 'utf8')).t || 0; } catch (e) {}
+    const now = Date.now();
+    if (now > cur) fs.writeFileSync(SMS_GATE_TS, JSON.stringify({ t: now }));
+  } catch (e) {}
+}
 // 返回限流类型代码（字符串），非限流返回 null。
 //   'verification_provider_rate_limited' —— 出口IP被官方（腾讯云短信）限频（脏IP），重发换IP可解
 //   其他（发送过于频繁 / rate_limit / too many 等）—— 非IP类限流，等满手机号冷却后通常可恢复
@@ -1484,6 +1511,7 @@ async function domesticLogin(acc, idx) {
   const CODE_TIMEOUT_MS = Number(process.env.LIGHTVELA_SMS_CODE_TIMEOUT_MS || 180000); // 官方：超三分钟未收到验证码即拉黑重取
   const RESEND_WAIT_MS = Number(process.env.LIGHTVELA_SMS_RESEND_WAIT_MS || 60000);  // 发码限频后等 60s 同号重发
   const RESEND_MAX = Number(process.env.LIGHTVELA_SMS_RESEND_MAX || 5);             // 同号重发上限
+  // ★ 2026-11-18 11:00 老大定：改回 30s。20s 太密（并发10时失败率飙到26%），30s 时只有3-8%。
   const SEND_GAP_MS = Number(process.env.LIGHTVELA_SMS_SEND_GAP_MS || 30000);       // 并发账号发码间隔 30s
   // 仅当并发>1 时才需要错峰；单账号（并发=1）无需等待，否则首账号会莫名其妙等最多30s
   const _domConc = Number(process.env.LIGHTVELA_DOMESTIC_CONCURRENCY || 1);
@@ -1527,7 +1555,7 @@ async function domesticLogin(acc, idx) {
           console.log(`  ⏳ 限频重发等待 ${RESEND_WAIT_MS / 1000}s（同一号码 ${phone}）…`);
           await sleep(RESEND_WAIT_MS);
         }
-        await smsSendGate(EFF_GAP_MS);          // 拿锁并等够错峰间隔（仅并发>1 时生效）
+        await smsSendGate(EFF_GAP_MS);          // 预约发码时间槽并等到点（仅并发>1 时生效）
         try {
           const sr = await httpsReq('POST', '/auth/sms/send', { body: { phone } });
           smsSendGateTouch();                     // 记录本次发码时间（成功/限频都记），供并发账号错峰
@@ -1552,7 +1580,7 @@ async function domesticLogin(acc, idx) {
           sentOk = true;
           break;
         } finally {
-          smsSendGateRelease();                   // 无论成功/失败都释放门控，避免死锁
+          smsSendGateRelease();                   // 预约制下为空操作（锁已在 smsSendGate 内释放）
         }
       }
       if (!sentOk) {
