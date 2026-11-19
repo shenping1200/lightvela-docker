@@ -42,6 +42,7 @@ PROVIDER_LABEL = {
     "feihu": "飞狐",
     "lubansms": "鲁班",
     "jcsms": "疾驰",
+    "newsfang": "新四方",
 }
 
 _lock = threading.Lock()
@@ -94,6 +95,13 @@ DEFAULT_DOMESTIC_CONFIG = {
             "fcToken": "",
             "projectId": "",
             "engine": "",       # 留空=官方引擎；填 b=引擎B
+        },
+        # 新四方接码（固定号池，无取号接口；provider=newsfang 时生效）
+        #   apiUrl  = 号商粘贴的完整地址（末尾含32位token）
+        #   numbers = 号商粘贴的号码清单原文（COM1 165... 每行一个）
+        "newsfang": {
+            "apiUrl": "",
+            "numbers": "",
         },
     },
     "proxy": {
@@ -163,7 +171,7 @@ def get_config():
         sms = cfg.get("sms")
         if not isinstance(sms, dict):
             sms = {}
-        for k in ("feihu", "luban", "jcsms"):
+        for k in ("feihu", "luban", "jcsms", "newsfang"):
             if not isinstance(sms.get(k), dict):
                 sms[k] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"][k]))
         if "provider" not in sms:
@@ -211,13 +219,15 @@ def set_sms_provider(provider):
     cfg = _read_config()
     sms = cfg.get("sms") or {}
     p = str(provider).strip().lower()
-    sms["provider"] = p if p in ("feihu", "lubansms", "jcsms") else "haozhuma"
+    sms["provider"] = p if p in ("feihu", "lubansms", "jcsms", "newsfang") else "haozhuma"
     if "feihu" not in sms or not isinstance(sms.get("feihu"), dict):
         sms["feihu"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["feihu"]))
     if "luban" not in sms or not isinstance(sms.get("luban"), dict):
         sms["luban"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["luban"]))
     if "jcsms" not in sms or not isinstance(sms.get("jcsms"), dict):
         sms["jcsms"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["jcsms"]))
+    if "newsfang" not in sms or not isinstance(sms.get("newsfang"), dict):
+        sms["newsfang"] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"]["newsfang"]))
     cfg["sms"] = sms
     _write_config(cfg)
     return {"ok": True, "provider": sms["provider"]}
@@ -282,6 +292,65 @@ def set_jcsms_config(apiBase, fcToken, projectId, engine=""):
     return {"ok": True}
 
 
+def set_newsfang_config(apiUrl, numbers):
+    """保存新四方接码配置（apiUrl=号商接口地址，numbers=COM号码清单原文）。
+    纯追加：只写 sms.newsfang 段，不碰其他平台字段。"""
+    cfg = _read_config()
+    sms = cfg.get("sms") or {}
+    nf = sms.get("newsfang") or {}
+    nf["apiUrl"] = (apiUrl or "").strip()
+    nf["numbers"] = (numbers or "").strip()
+    sms["newsfang"] = nf
+    # 保留其他平台段，避免覆盖（老配置缺段时补齐）
+    if "provider" not in sms:
+        sms["provider"] = "haozhuma"
+    for f in ("feihu", "luban", "jcsms"):
+        if f not in sms or not isinstance(sms.get(f), dict):
+            sms[f] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"][f]))
+    cfg["sms"] = sms
+    _write_config(cfg)
+    return {"ok": True}
+
+
+def sf_com_for_phone(phone):
+    """★ 2026-11-19 V3：从四方号码清单反查 COM 口标签，供结果表与导出用。只读。"""
+    if not phone:
+        return ""
+    try:
+        nf = (_read_config().get("sms") or {}).get("newsfang") or {}
+        text = str(nf.get("numbers") or "").replace("\\n", "\n").replace("\\r", "\n")
+        for line in re.split(r"[\r\n;；]+", text):
+            m = re.match(r"^\s*COM\s*(\d+)\s*[:：\s,]*(\d{11})", line.strip(), re.I)
+            if m and m.group(2) == str(phone):
+                return "COM" + m.group(1)
+    except Exception:
+        pass
+    return ""
+
+
+def sf_used_phones():
+    """★ 2026-11-19 V3：永久台账里出现过的手机号集合（成功失败都算已用）。
+    只读，供面板「导入未使用号码」过滤；台账路径与 bot.js sfLedgerPath 对齐。"""
+    used = set()
+    p = os.environ.get("LIGHTVELA_SF_LEDGER") or os.path.join(
+        os.environ.get("LIGHTVELA_SF_LEDGER_DIR") or BASE, "sf_ledger.jsonl")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ph = str((json.loads(line) or {}).get("phone") or "").strip()
+                    if re.fullmatch(r"1\d{10}", ph):
+                        used.add(ph)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return {"ok": True, "phones": sorted(used), "count": len(used)}
+
+
 def _claims_path():
     """接码平台认领表（跨轮保留）：记录每个账号成功用过的平台，防重跑时另一家重复取号。"""
     return os.path.join(_data_dir(), "domestic-sms-claims.json")
@@ -316,7 +385,7 @@ def set_sms_platforms(enabled, concurrency):
     """设置启用的接码平台列表 + 每平台并发数（多平台并行）。"""
     cfg = _read_config()
     sms = cfg.get("sms") or {}
-    valid = ("haozhuma", "feihu", "lubansms", "jcsms")
+    valid = ("haozhuma", "feihu", "lubansms", "jcsms", "newsfang")
     en = [str(x).strip().lower() for x in (enabled or []) if str(x).strip().lower() in valid]
     if not en:
         en = ["haozhuma"]
@@ -327,7 +396,7 @@ def set_sms_platforms(enabled, concurrency):
         cc[p] = max(1, min(int(n), 20))
     sms["concurrency"] = cc
     sms["provider"] = en[0]   # 兼容旧 provider 字段：首个启用平台作为当前 provider
-    for f in ("feihu", "luban", "jcsms"):
+    for f in ("feihu", "luban", "jcsms", "newsfang"):
         if f not in sms or not isinstance(sms.get(f), dict):
             sms[f] = json.loads(json.dumps(DEFAULT_DOMESTIC_CONFIG["sms"].get(f, {})))
     cfg["sms"] = sms
@@ -380,6 +449,15 @@ def test_sms(provider=None):
         return test_luban()
     if provider == "jcsms":
         return test_jcsms()
+    if provider == "newsfang":
+        nf = cfg.get("newsfang") or {}
+        if not nf.get("apiUrl"):
+            return {"ok": False, "error": "未填写新四方接口地址"}
+        if not nf.get("numbers"):
+            return {"ok": False, "error": "未填写新四方号码清单"}
+        import re as _re
+        _nums = _re.findall(r"\d{11}", str(nf["numbers"]))
+        return {"ok": True, "balance": "新四方固定号池（无余额），已配 %d 个号" % len(set(_nums))}
     # —— 豪猪 ——
     if not cfg.get("apiUser") or not cfg.get("apiPass"):
         return {"ok": False, "error": "未填写接码平台账号/密码"}
@@ -643,6 +721,12 @@ def _env_from_config(cfg):
         env["LIGHTVELA_JCSMS_PROJECT_ID"] = str(jc["projectId"])
     if jc.get("engine"):
         env["LIGHTVELA_JCSMS_ENGINE"] = str(jc["engine"])
+    # 新四方凭证（无条件透传；bot.js 仅在 provider=newsfang 时使用，其余平台天然隔离）
+    nf = sms.get("newsfang") or {}
+    if nf.get("apiUrl"):
+        env["LIGHTVELA_SF_API_URL"] = str(nf["apiUrl"])
+    if nf.get("numbers"):
+        env["LIGHTVELA_SF_NUMBERS"] = str(nf["numbers"])
     px = (cfg or {}).get("proxy")
     if px:
         env["LIGHTVELA_EGRESS_PROXY"] = _normalize_proxy_cfg(px)
@@ -1149,7 +1233,7 @@ def _hard_kill(proc):
         pass
 
 
-def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat_label=""):
+def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat_label="", assigned_phone=None):
     """单账号子进程：spawn node bot.js --account-idx idx [--login-only]，实时读日志。
     ★ 多平台并行：provider 指定本账号用哪套接码平台（写入 env LIGHTVELA_SMS_PROVIDER，
       bot.js 据此选平台）；plat_label 是日志前缀（如 [飞狐]），用于面板区分平台。"""
@@ -1173,6 +1257,9 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
     # ★ 多平台并行：本账号指定接码平台，注入 env 让 bot.js 选对应平台（豪猪/飞狐/鲁班/疾驰）
     if provider:
         env["LIGHTVELA_SMS_PROVIDER"] = str(provider).lower()
+    # ★ 新四方：后端分配的单号（冷却/换号由后端调度，bot 只跑这一个号）
+    if assigned_phone:
+        env["LIGHTVELA_SF_ASSIGNED_PHONE"] = str(assigned_phone)
     # ★ 部署命令文件路径对齐：面板把部署命令存到数据盘 domestic-deploy-msg.txt，
     #   必须显式告诉 bot.js（否则它默认去脚本目录找 deploy_cmd.txt，容器里没有 → 部署阶段报"文件不存在"）
     env["LIGHTVELA_DEPLOY_FILE"] = _dom_deploy_msg_path()
@@ -1212,6 +1299,7 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
     in_deploy = False
     last_output = [time.time()]          # 静默看门狗：记录最近一次收到子进程输出的时间
     fail_reason = [None]                 # 捕获 bot.js 打印的「❌ 账号失败: ...」原因
+    need_cooldown = [False]              # ★ 新四方：bot 打印 SF_NEED_COOLDOWN=1 → 本组3次失败，交后端冷却
     log_done = threading.Event()
 
     def _reader():
@@ -1222,6 +1310,8 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
                 s = line.rstrip("\n")
                 if "❌ 账号失败:" in s:
                     fail_reason[0] = s.split("❌ 账号失败:", 1)[1].strip()
+                if "SF_NEED_COOLDOWN=1" in s:
+                    need_cooldown[0] = True
                 if in_deploy:
                     # 部署过程中：只放行最终判定行，其余（安装输出/部署报告/检测明细）全丢
                     if s.startswith("RESULT=OK"):
@@ -1319,17 +1409,22 @@ def _run_one(idx, acc, mode, accounts_file, use_saved=False, provider=None, plat
             err_msg = "用户手动停止"
         else:
             err_msg = "执行失败（详见日志）"
+        # ★ 2026-11-19 V3：不管成功失败，都把「分配给这个身份的号 + COM 口」写进结果，
+        #   否则登录失败时 phone 为空，面板「导出失败」会是一片空白。只影响四方分配过的账号。
+        _sf_phone = cred.get("phone") or (str(assigned_phone) if assigned_phone else None)
         res = {
             "idx": idx,
             "name": acc["name"],
             "idCard": acc["idCard"],
             "ok": ok,
-            "phone": cred.get("phone"),
+            "phone": _sf_phone,
+            "com": sf_com_for_phone(_sf_phone) if assigned_phone else "",
             "uid": cred.get("uid"),
             "bearer": cred.get("bearer"),
             "instanceId": None,
             "deployOk": (ok if mode == "full" else None),
             "error": err_msg,
+            "need_cooldown": bool(need_cooldown[0]),
             "log": os.path.basename(log_file),
         }
         # ★ 2026-10-29（合并自远端）：凭证上传数据中心。之前国内版只有「读」，登录/实名拿到的
@@ -1378,7 +1473,7 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
         total = len(accounts)
         cfg = _read_config()
         sms = cfg.get("sms") or {}
-        valid = ("haozhuma", "feihu", "lubansms", "jcsms")
+        valid = ("haozhuma", "feihu", "lubansms", "jcsms", "newsfang")
         enabled = [p for p in (sms.get("enabled") or [sms.get("provider") or "haozhuma"]) if p in valid]
         if not enabled:
             enabled = ["haozhuma"]
@@ -1420,6 +1515,49 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
             q.put(i)
         in_flight = set()
         in_flight_lock = threading.Lock()
+        # ★ 新四方：全局号池（一手机号一身份）。sf_phone_owner[号索引]=占用它的idx；
+        #   sf_state[idx]={phone_index, cooldown_round}。冷却保持同号，换号释放旧号领新号。
+        sf_state = {}
+        sf_phone_owner = {}
+        sf_state_lock = threading.Lock()
+        sf_numbers = []
+        try:
+            _nf = (_read_config().get("sms") or {}).get("newsfang") or {}
+            import re as _re_sf
+            sf_numbers = _re_sf.findall(r"\d{11}", str(_nf.get("numbers") or ""))
+        except Exception:
+            sf_numbers = []
+        def _sf_release_phone(idx2):
+            st2 = sf_state.get(idx2) or {}
+            pi2 = st2.get("phone_index")
+            if pi2 is not None and sf_phone_owner.get(pi2) == idx2:
+                del sf_phone_owner[pi2]
+        def _sf_assign_phone(idx2):
+            """返回 (phone_index, phone) 或 (None, None)。冷却中保持同号；否则领一个「未放弃」的空闲号。"""
+            with sf_state_lock:
+                st = sf_state.setdefault(idx2, {"phone_index": None, "cooldown_round": 0, "abandoned": set()})
+                pi = st.get("phone_index")
+                if pi is not None and 0 <= pi < len(sf_numbers) and sf_phone_owner.get(pi) == idx2:
+                    return pi, sf_numbers[pi]
+                abandoned = st.get("abandoned") or set()
+                for cand in range(len(sf_numbers)):
+                    if cand not in sf_phone_owner and cand not in abandoned:
+                        sf_phone_owner[cand] = idx2
+                        st["phone_index"] = cand
+                        return cand, sf_numbers[cand]
+                return None, None
+        def _sf_cooldown_requeue(idx2, wait_sec):
+            """冷却定时器：到点把账号放回队列（不占 worker）。"""
+            def _fire():
+                if not _state["running"]:
+                    return
+                with in_flight_lock:
+                    in_flight.discard(idx2)
+                q.put(idx2)
+                _append_log("[新四方] 冷却 %ds 结束，账号 %02d 重新入队" % (wait_sec, idx2))
+            t = threading.Timer(max(1, int(wait_sec)), _fire)
+            t.daemon = True
+            t.start()
         tried = {}          # idx -> set(已试过的平台)
         tried_lock = threading.Lock()
         def _worker(p, pconc):
@@ -1458,14 +1596,63 @@ def _run_thread(accounts, mode, prelude=None, use_saved=False):
                             in_flight.discard(idx)
                         q.put(idx)
                         continue
+                # ★ 新四方：从全局号池领号（一手机号一身份，各账号拿不同号）
+                sf_assign_phone = None
+                if use_p == "newsfang":
+                    _pi, sf_assign_phone = _sf_assign_phone(idx)
+                    if sf_assign_phone is None:
+                        _append_log("[新四方] 账号 %02d 号池已无空闲号（%d 个号已被占用），判失败" % (idx, len(sf_numbers)), "[%s] " % label)
+                        claims[str(idx)] = {"provider": use_p, "name": acc["name"], "idCard": acc["idCard"], "ok": False, "tried": ["newsfang_pool_exhausted"]}
+                        _save_claims(claims)
+                        with in_flight_lock:
+                            in_flight.discard(idx)
+                        continue
                 _append_log("领取账号 %02d %s" % (idx, acc["name"]), "[%s] " % label)
-                res = _run_one(idx, acc, mode, tmp, use_saved, provider=use_p, plat_label=label)
+                res = _run_one(idx, acc, mode, tmp, use_saved, provider=use_p, plat_label=label, assigned_phone=sf_assign_phone)
                 if res and res.get("ok"):
                     claims[str(idx)] = {"provider": use_p, "name": acc["name"], "idCard": acc["idCard"], "ok": True}
                     _save_claims(claims)
+                    # ★ 一手机号一身份：成功后号【不释放】，永久归这个身份（本轮内不再分给别人）
+                    with sf_state_lock:
+                        sf_state.pop(idx, None)
                     with in_flight_lock:
                         in_flight.discard(idx)
                     continue
+                # ★ 新四方：本组3次失败 → 冷却(不占worker) / 换号 / 放弃
+                if use_p == "newsfang" and res and res.get("need_cooldown"):
+                    with sf_state_lock:
+                        st = sf_state.setdefault(idx, {"phone_index": None, "cooldown_round": 0})
+                        rnd = int(st.get("cooldown_round") or 0)
+                        max_cd = int(os.environ.get("LIGHTVELA_SF_COOLDOWN_MAX") or 1)
+                        wait_sec = int(os.environ.get("LIGHTVELA_SF_COOLDOWN_SEC") or 300)
+                        if rnd < max_cd:
+                            st["cooldown_round"] = rnd + 1
+                            _append_log("[新四方] 账号 %02d 号 %s 本组3次失败，冷却 %ds 后重试（第 %d/%d 次冷却）" % (idx, sf_assign_phone, wait_sec, rnd + 1, max_cd), "[%s] " % label)
+                            _sf_cooldown_requeue(idx, wait_sec)
+                            continue
+                        # 冷却已满 → 放弃当前号（号仍锁死，不还给池子），换下一个未分配的号
+                        _old_pi = st.get("phone_index")
+                        if _old_pi is not None:
+                            _ab = st.get("abandoned") or set()
+                            _ab.add(_old_pi)
+                            st["abandoned"] = _ab
+                        st["phone_index"] = None
+                        st["cooldown_round"] = 0
+                        # 看看还有没有「从未分配给任何身份」的号可换
+                        _free = [c for c in range(len(sf_numbers)) if c not in sf_phone_owner and c not in (st.get("abandoned") or set())]
+                        if not _free:
+                            _append_log("[新四方] 账号 %02d 所有号已试完且无空闲号，判失败" % idx, "[%s] " % label)
+                            claims[str(idx)] = {"provider": use_p, "name": acc["name"], "idCard": acc["idCard"], "ok": False, "tried": ["newsfang_all_phones"]}
+                            _save_claims(claims)
+                            sf_state.pop(idx, None)
+                            with in_flight_lock:
+                                in_flight.discard(idx)
+                            continue
+                        _append_log("[新四方] 账号 %02d 放弃号 %s，换下一个空闲号重新入队" % (idx, sf_assign_phone), "[%s] " % label)
+                        with in_flight_lock:
+                            in_flight.discard(idx)
+                        q.put(idx)
+                        continue
                 # 失败：标记本平台试过，若还有未试平台则放回重试，否则标记最终失败
                 with tried_lock:
                     tset = tried.setdefault(idx, set())

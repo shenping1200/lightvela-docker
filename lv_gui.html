@@ -376,7 +376,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <button class="btn danger sm" data-mirror="domBtnStop">■ 停止</button>
           <button class="btn sm" data-mirror="domBtnExportSuccess">导出成功</button>
           <button class="btn sm" data-mirror="domBtnExportFailed">导出失败</button>
-          <button class="btn sm" data-mirror="domBtnImportFailed">导入失败到账号区</button>
+          <button class="btn sm" data-mirror="domBtnImportFailed">剔除成功账号</button>
           <span class="stat" data-mirror-text="domRunStat" style="margin-top:0"></span>
         </div>
       </div>
@@ -414,7 +414,7 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           <button class="btn danger" id="domBtnStop" disabled>■ 停止</button>
           <button class="btn sm" id="domBtnExportSuccess" disabled>导出成功</button>
           <button class="btn sm" id="domBtnExportFailed" disabled>导出失败</button>
-          <button class="btn sm" id="domBtnImportFailed" disabled>导入失败到账号区</button>
+          <button class="btn sm" id="domBtnImportFailed" disabled>剔除成功账号</button>
           <span id="domRunStat" class="stat"></span>
         </div>
         <div class="hint">每个账号独立子进程（socks5 代理出口同 IP）。模式②判定：机器人回复含「部署完成，探针服务运行正常」或等效关键词组合；判失败还会主动验证探针进程、并自动免费重试（开关见「部署策略」卡）。</div>
@@ -504,6 +504,9 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
             <input type="checkbox" id="domJcEn">
             <span>疾驰短信</span>
             <input type="number" id="domJcConc" value="2" min="1" max="20" style="width:72px">
+            <input type="checkbox" id="domNfEn">
+            <span>新四方（固定号池）</span>
+            <input type="number" id="domNfConc" value="2" min="1" max="20" style="width:72px">
           </div>
         </div>
         <div class="hint">勾选多家即「多平台并行」：所有平台<b>共用同一批账号</b>，某账号被任一平台成功取号即打标记、其余平台不再取它；某平台取号失败会自动换另一家有空位的平台重试。各平台并发数独立设置。</div>
@@ -584,6 +587,36 @@ puzzler_34chord@icloud.com----b3bKu0BbHk----nicholsbrandon1855----422UIIUH2YWTYN
           疾驰免登录，每个请求 Header 带 <b>fcToken</b>；验证码在返回的 <b>msg</b> 字段里。<br>
           平台限制：<b>同一手机号每 5 秒最多查一次</b>，程序已自动按 5 秒以上间隔轮询。<br>
           <b>疾驰没有余额接口</b>，所以「测试连接」验证的是 Token 是否有效、项目 ID 是否存在，查不到余额。
+        </div>
+      </div>
+
+      <!-- 新四方面板（固定号池；粘贴接口地址 + COM号码清单，每批可改） -->
+      <div id="domNfPanel">
+        <div class="row">
+          <label>接口地址</label>
+          <input type="text" id="domNfUrl" spellcheck="false" style="width:520px" placeholder="粘贴号商地址，如 http://sms.newszfang.vip:3000/732049339ae477a447545db48f8a9c60">
+        </div>
+        <div class="row" style="align-items:start">
+          <label>号码清单</label>
+          <textarea id="domNfNumbers" spellcheck="false" rows="7" style="width:520px;font-family:monospace" placeholder="直接粘贴号商给的原文，每行一个：
+COM1 16544044290
+COM2 16544044391
+COM3 16544043493
+..."></textarea>
+        </div>
+        <!-- ★ 2026-11-19 V3：跟身份信息区同款的号码管理按钮（导入/导出都不生成文件，直接打到右侧日志区） -->
+        <div class="bar" style="margin-top:6px;flex-wrap:wrap">
+          <button class="btn sm" id="domNfBtnImportUnused">导入未使用号码</button>
+          <button class="btn sm" id="domNfBtnExportSuccess">导出成功</button>
+          <button class="btn sm" id="domNfBtnExportFailed">导出失败</button>
+          <button class="btn sm" id="domNfBtnImportFailed">剔除成功号码</button>
+          <input type="file" id="fileNfTxt" style="display:none">
+          <span id="domNfNumStat" class="stat" style="margin-top:0"></span>
+        </div>
+        <div class="hint" style="margin-top:6px">
+          新四方<b>不用取号</b>：号商直接给固定号和接口地址，程序按顺序发号、轮询该地址收验证码。<br>
+          <b>每批号码的接口地址不一样</b>，换批次时把上面两项都换成新的即可。号码支持换行/分号分隔。<br>
+          不用取号、不拉黑；号与身份一一绑定，本轮内不重复分配。取短信<b>默认直连</b>，失败自动换固定节点、最后才回退代理。
         </div>
       </div>
 
@@ -1321,6 +1354,11 @@ function boot() {
   $('domBtnTkDel').onclick = domTkDel;
   $('domBtnSmsSave').onclick = domSmsSave;
   $('domBtnSmsTest').onclick = domSmsTest;
+  // ★ 2026-11-19 V3：新四方号码清单的导入/导出
+  $('domNfBtnImportUnused').onclick = domNfImportUnused;
+  $('domNfBtnExportSuccess').onclick = domNfExportSuccess;
+  $('domNfBtnExportFailed').onclick = domNfExportFailed;
+  $('domNfBtnImportFailed').onclick = domNfImportFailed;
   $('domBtnProxySave').onclick = domProxySave;
   $('domBtnProxyTest').onclick = domProxyTest;
   $('domBtnStratSave').onclick = domStrategySave;
@@ -1406,6 +1444,8 @@ function _domTotalConc() {
   if ($('domFhEn').checked)  s += Math.max(1, parseInt($('domFhConc').value, 10) || 1);
   if ($('domLbEn').checked)  s += Math.max(1, parseInt($('domLbConc').value, 10) || 1);
   if ($('domJcEn').checked)  s += Math.max(1, parseInt($('domJcConc').value, 10) || 1);
+  // ★ 2026-11-19 V3：原来漏算新四方，日志里才会显示「总并发=0」
+  if ($('domNfEn').checked)  s += Math.max(1, parseInt($('domNfConc').value, 10) || 1);
   return s;
 }
 
@@ -1429,6 +1469,7 @@ async function domStart() {
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
   domRunning = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportSuccess').disabled = true; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
+  $('domNfBtnImportUnused').disabled = true; $('domNfBtnImportFailed').disabled = true;   // ★ V3：跑任务时不让改号码清单
   switchTab('domestic');
   const bundleLabel = mode === 'login' ? '（登录模式不下单）'
                     : (bundleStrategy === 'launch_ai' ? '只订4500'
@@ -1558,16 +1599,158 @@ async function domExportFailed() {
 }
 
 async function domImportFailed() {
-  // ★ 把本次运行失败的账号自动导入到账号区：先清空账号区，再填入失败账号（每行 姓名 身份证）
+  // ★ 2026-11-20 老大定：不再「清空重填失败账号」，改成「剔除成功的」——
+  //   账号区逐行看，身份证号在本轮成功名单里的删掉，其余原样保留。
+  //   剔完剩下的自然就是「失败的 + 本轮没跑到的（未使用）」。
+  //   好处：顺序不乱、格式（姓名----身份证）不变、手动加的内容不会被清掉。
   const s = lastDomStatus;
-  if (!s || !s.results) { appendDomLog(['[导入失败] 还没有运行记录']); return; }
-  const failed = (s.results || []).filter(r => r && r.ok === false);
-  if (!failed.length) { appendDomLog(['[导入失败] 没有失败账号 ✓']); return; }
-  const text = failed.map(r => (r.name || '') + ' ' + (r.idCard || '')).join('\n');
-  $('domAcc').value = '';                              // 先清空账号区
-  $('domAcc').value = text;                            // 填入失败账号
-  $('domAcc').dispatchEvent(new Event('input'));       // 触发解析刷新账号数 + 草稿落盘
-  appendDomLog(['[导入失败] 已清空账号区并填入 ' + failed.length + ' 个失败账号（可直接点开始重跑）']);
+  if (!s || !s.results) { appendDomLog(['[剔除成功] 还没有运行记录']); return; }
+  const okList = (s.results || []).filter(r => r && r.ok === true);
+  if (!okList.length) { appendDomLog(['[剔除成功] 本轮没有成功账号，账号区原样保留']); return; }
+  // 成功名单：身份证优先（唯一），姓名只作兜底
+  const okIds = new Set(), okNames = new Set();
+  okList.forEach(function (r) {
+    const id = String(r.idCard || '').trim().toUpperCase();
+    const nm = String(r.name || '').trim();
+    if (id) okIds.add(id);
+    if (nm) okNames.add(nm);
+  });
+  const src = String($('domAcc').value || '');
+  const kept = [], removed = [];
+  let byNameOnly = 0;
+  src.split(/\r?\n/).forEach(function (line) {
+    const t = line.trim();
+    if (!t) return;                                        // 空行直接丢掉
+    const m = t.match(/\d{17}[\dXx]|\d{15}/);              // 身份证：18 位（末位可为 X）或 15 位
+    const id = m ? m[0].toUpperCase() : '';
+    const nm = t.split(/----|\s+/)[0].trim();
+    let hit = false;
+    if (id) hit = okIds.has(id);
+    else if (nm) { hit = okNames.has(nm); if (hit) byNameOnly++; }   // 没身份证才按姓名兜底
+    if (hit) removed.push(t); else kept.push(line);        // 保留原行（含缩进/分隔符）
+  });
+  if (!removed.length) { appendDomLog(['[剔除成功] 账号区里没找到本轮成功的账号（可能已经剔过了），原样保留']); return; }
+  $('domAcc').value = kept.join('\n');
+  $('domAcc').dispatchEvent(new Event('input'));            // 触发解析刷新账号数 + 草稿落盘
+  // 号码清单区同步剔除成功号
+  const nr = domNfPruneSuccess({ silent: true });
+  let extra = '';
+  if (nr && nr.removed) extra = '；号码清单区同步剔除 ' + nr.removed + ' 个成功号，剩 ' + nr.kept + ' 个';
+  appendDomLog(['[剔除成功] 账号区剔除 ' + removed.length + ' 个成功账号，剩 ' + kept.length +
+                ' 个（失败的 + 未跑到的）' +
+                (byNameOnly ? '（其中 ' + byNameOnly + ' 个没身份证号，按姓名匹配）' : '') + extra]);
+}
+
+/* ---------- ★ 2026-11-19 V3 新四方号码清单：导入 / 导出 ----------
+   照身份信息区同款：导出打到右侧日志区、鼠标直接拖选复制，不生成文件；
+   导入选文本文件读进清单框。导出带 COM 口，方便直接粘回清单区重跑。 */
+function domNfComMap() {
+  const map = {};
+  String($('domNfNumbers').value || '').replace(/\\n/g, '\n').split(/[\r\n;；]+/).forEach(function (line) {
+    const m = line.trim().match(/^(?:COM\s*(\d+)\s*[:：\s,]*)?(\d{11})\b/i);
+    if (m && m[1]) map[m[2]] = 'COM' + parseInt(m[1], 10);
+  });
+  return map;
+}
+function domNfStat(text) {
+  const n = String(text || '').split(/[\r\n;；]+/).filter(function (l) { return /\d{11}/.test(l); }).length;
+  $('domNfNumStat').textContent = n ? '共 ' + n + ' 个号' : '';
+}
+async function domNfImportUnused() {
+  const text = await pickFile($('fileNfTxt'));
+  if (text == null) return;
+  const r = await API.domestic_sf_used_phones();      // 后端只读永久台账
+  if (!r || !r.ok) { appendDomLog(['[导入未使用] ✗ 读台账失败：' + ((r && r.error) || '未知')]); return; }
+  const used = new Set(r.phones || []);
+  const seen = new Set(), kept = [];
+  let removed = 0;
+  String(text).replace(/\\r/g, '\n').replace(/\\n/g, '\n').split(/[\r\n;；]+/).forEach(function (l) {
+    const line = l.trim();
+    if (!line) return;
+    const m = line.match(/^(?:COM\s*(\d+)\s*[:：\s,]*)?(\d{11})\b/i);
+    if (!m) return;
+    if (seen.has(m[2])) return;
+    seen.add(m[2]);
+    if (used.has(m[2])) { removed++; return; }
+    kept.push((m[1] ? 'COM' + parseInt(m[1], 10) + ' ' : '') + m[2]);
+  });
+  $('domNfNumbers').value = kept.join('\n');
+  domNfStat($('domNfNumbers').value);
+  appendDomLog(['[导入未使用] 导入 ' + kept.length + ' 个未使用号码，剔除台账里已用的 ' + removed + ' 个（记得点「保存配置」）']);
+}
+function domNfRows(which) {
+  const s = lastDomStatus;
+  if (!s || !s.results) return null;
+  const map = domNfComMap();
+  return (s.results || [])
+    .filter(function (r) { return r && (which === 'ok' ? r.ok === true : r.ok === false); })
+    .map(function (r) {
+      const phone = String(r.phone || '').trim();
+      if (!phone) return '';
+      const com = String(r.com || map[phone] || '').trim();
+      return (com ? com + ' ' : '') + phone;
+    })
+    .filter(Boolean);
+}
+async function domNfExportSuccess() {
+  const lines = domNfRows('ok');
+  if (lines === null) { appendDomLog(['[导出成功] 还没有运行记录']); return; }
+  if (!lines.length) { appendDomLog(['[导出成功] 没有成功号码 ✓']); return; }
+  appendDomLog(['=== 成功号码（COM口 手机号，可直接复制回清单区）===']);
+  appendDomLog(lines);
+  appendDomLog(['[导出成功] 共 ' + lines.length + ' 个（已显示在上方，未生成文件）']);
+}
+async function domNfExportFailed() {
+  const lines = domNfRows('fail');
+  if (lines === null) { appendDomLog(['[导出失败] 还没有运行记录']); return; }
+  if (!lines.length) { appendDomLog(['[导出失败] 没有失败号码 ✓']); return; }
+  appendDomLog(['=== 失败号码（COM口 手机号，可直接复制回清单区）===']);
+  appendDomLog(lines);
+  appendDomLog(['[导出失败] 共 ' + lines.length + ' 个（已显示在上方，未生成文件）']);
+}
+function domNfImportFailed() {
+  // ★ 2026-11-20 老大定：这个按钮同样改成「剔除成功的」——
+  //   清单区逐行看，手机号在本轮成功名单里的删掉，其余原样保留（含 COM 口标签和顺序）。
+  //   剔完剩下的就是「失败的号 + 本轮没轮到的号」。
+  domNfPruneSuccess({ silent: false });
+}
+
+/* ★ 2026-11-20 「剔除成功」的核心：从号码清单区删掉本轮成功的号。
+   为什么这样比"重填失败号"好：
+     · 顺序、COM 口标签、格式全部原样保留
+     · 本轮没轮到的号（并发没排上的）天然留在清单里，不用另外算
+     · 手动加的号不会被清掉
+   opt.silent=true 时只改内容不打日志（供账号区按钮顺带调用）。
+   返回 { removed, kept }，没有运行记录/没有成功号时返回 null。 */
+function domNfPruneSuccess(opt) {
+  const silent = !!(opt && opt.silent);
+  const s = lastDomStatus;
+  if (!s || !s.results) { if (!silent) appendDomLog(['[剔除成功] 还没有运行记录']); return null; }
+  const okPhones = new Set((s.results || [])
+    .filter(r => r && r.ok === true)
+    .map(r => String(r.phone || '').trim())
+    .filter(Boolean));
+  if (!okPhones.size) { if (!silent) appendDomLog(['[剔除成功] 本轮没有成功号码，清单区原样保留']); return null; }
+  const src = String($('domNfNumbers').value || '');
+  const kept = [], removed = [];
+  src.split(/\r?\n/).forEach(function (line) {
+    const t = line.trim();
+    if (!t) return;                                        // 空行丢掉
+    const m = t.match(/^(?:COM\s*(\d+)\s*[:：\s,]*)?(\d{11})\b/i);
+    if (!m) { kept.push(line); return; }                   // 认不出的格式原样保留，绝不误删
+    if (okPhones.has(m[2])) removed.push(t); else kept.push(line);
+  });
+  if (!removed.length) {
+    if (!silent) appendDomLog(['[剔除成功] 清单区里没找到本轮成功的号（可能已经剔过了），原样保留']);
+    return { removed: 0, kept: kept.length };
+  }
+  $('domNfNumbers').value = kept.join('\n');
+  domNfStat($('domNfNumbers').value);
+  if (!silent) {
+    appendDomLog(['[剔除成功] 号码清单区剔除 ' + removed.length + ' 个成功号，剩 ' + kept.length +
+                  ' 个（失败的 + 未轮到的），记得点「保存配置」后重跑']);
+  }
+  return { removed: removed.length, kept: kept.length };
 }
 
 function renderDomRows(s) {
@@ -1622,6 +1805,7 @@ async function domPoll() {
   if (!s.running) {
     domRunning = false;
     $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportSuccess').disabled = false; $('domBtnExportFailed').disabled = false; $('domBtnImportFailed').disabled = false;
+    $('domNfBtnImportUnused').disabled = false; $('domNfBtnImportFailed').disabled = false;
     appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
     doTkInfo();
   }
@@ -1650,7 +1834,7 @@ async function domTkDel() {
 
 /* ---------- 国内版配置（接码平台 / 代理 / 部署指令）---------- */
 function smsProviderName(p) {
-  return ({ haozhuma: '豪猪', feihu: '飞狐', lubansms: '鲁班', jcsms: '疾驰' })[p] || '豪猪';
+  return ({ haozhuma: '豪猪', feihu: '飞狐', lubansms: '鲁班', jcsms: '疾驰', newsfang: '新四方' })[p] || '豪猪';
 }
 
 async function loadDomConfig() {
@@ -1664,10 +1848,12 @@ async function loadDomConfig() {
   $('domFhEn').checked   = en.includes('feihu');
   $('domLbEn').checked   = en.includes('lubansms');
   $('domJcEn').checked   = en.includes('jcsms');
+  $('domNfEn').checked   = en.includes('newsfang');
   $('domHzConc').value = cc.haozhuma || 2;
   $('domFhConc').value = cc.feihu    || 2;
   $('domLbConc').value = cc.lubansms || 2;
   $('domJcConc').value = cc.jcsms    || 2;
+  $('domNfConc').value = cc.newsfang  || 2;
   // 豪猪
   $('domSmsBase').value = s.apiBase || 'https://api.haozhuma.com';
   $('domSmsUser').value = s.apiUser || '';
@@ -1690,6 +1876,11 @@ async function loadDomConfig() {
   $('domJcToken').value = jc.fcToken || '';
   $('domJcSid').value = jc.projectId || '';
   $('domJcEngine').value = jc.engine || '';
+  // 新四方
+  const nf = s.newsfang || {};
+  $('domNfUrl').value = nf.apiUrl || '';
+  $('domNfNumbers').value = nf.numbers || '';
+  domNfStat($('domNfNumbers').value);
   // 状态栏：显示启用平台 + 总并发
   const labels = en.map(p => smsProviderName(p));
   const totalConc = en.reduce((sum, p) => sum + (parseInt(cc[p] || 2, 10) || 2), 0);
@@ -1711,6 +1902,7 @@ async function domSmsSave() {
   if ($('domFhEn').checked) { enabled.push('feihu');    conc.feihu    = parseInt($('domFhConc').value, 10) || 2; }
   if ($('domLbEn').checked) { enabled.push('lubansms'); conc.lubansms = parseInt($('domLbConc').value, 10) || 2; }
   if ($('domJcEn').checked) { enabled.push('jcsms');    conc.jcsms    = parseInt($('domJcConc').value, 10) || 2; }
+  if ($('domNfEn').checked) { enabled.push('newsfang'); conc.newsfang = parseInt($('domNfConc').value, 10) || 2; }
   if (!enabled.length) enabled.push('haozhuma');  // 至少启用一家，防全空
   const r0 = await API.domestic_sms_platforms_set(enabled, conc);
   const r2 = await API.domestic_sms_set(
@@ -1736,7 +1928,11 @@ async function domSmsSave() {
     $('domJcSid').value.trim(),
     $('domJcEngine').value
   );
-  if (!((r0 && r0.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok) && (r5 && r5.ok))) {
+  const r6 = await API.domestic_newsfang_set(
+    $('domNfUrl').value.trim(),
+    $('domNfNumbers').value.trim()
+  );
+  if (!((r0 && r0.ok) && (r2 && r2.ok) && (r3 && r3.ok) && (r4 && r4.ok) && (r5 && r5.ok) && (r6 && r6.ok))) {
     $('domSmsHint').innerHTML = '<span style="color:var(--red)">保存失败</span>'; return;
   }
   const labels = enabled.map(p => smsProviderName(p));
@@ -1757,6 +1953,7 @@ async function domSmsTest() {
   if ($('domFhEn').checked) enabled.push('feihu');
   if ($('domLbEn').checked) enabled.push('lubansms');
   if ($('domJcEn').checked) enabled.push('jcsms');
+  if ($('domNfEn').checked) enabled.push('newsfang');
   if (!enabled.length) enabled.push('haozhuma');
   const parts = [];
   for (const p of enabled) {
@@ -1764,7 +1961,7 @@ async function domSmsTest() {
     const label = smsProviderName(p);
     if (!r || !r.ok) { parts.push('✗ ' + label + '：' + (r && r.error || '失败')); continue; }
     // 疾驰没有余额接口：返回的是说明文字（项目单价），不能当钱显示
-    if (p === 'jcsms') {
+    if (p === 'jcsms' || p === 'newsfang') {
       parts.push('✓ ' + label + '连通：' + String(r.summary || r.balance || '已连通'));
     } else {
       parts.push('✓ ' + label + '余额 ' + String(r.balance) + ' 元');

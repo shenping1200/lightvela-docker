@@ -987,9 +987,559 @@ const SMS_JCSMS = {
   },
 };
 
+// >>> NEWSIFANG_BEGIN
+// ===== 新四方接码平台（固定号池，无取号接口；2026-11-19 新增）=====
+// 接入约定与豪猪/飞狐/鲁班/疾驰一致：rentNumber / getCode / release / blacklist / balance。
+// 配置（环境变量，面板每批可改）：
+//   LIGHTVELA_SF_API_URL   号商粘贴的完整地址，如 http://sms.newszfang.vip:3000/732049339ae477a447545db48f8a9c60
+//   LIGHTVELA_SF_NUMBERS   号商粘贴的号码清单，支持换行 / 字面\n / 逗号 / 分号；每行 "COM1 16544044290" 或纯号码
+//   LIGHTVELA_SF_TIMEOUT_MS 单次取码轮询总时长（默认 180000）
+//   LIGHTVELA_SF_RETRIES    HTTP 请求重试次数（轮换代理每次出口不同，默认 5）
+const SF_DEFAULT_TIMEOUT = Number(process.env.LIGHTVELA_SF_TIMEOUT_MS || 180000);
+const SF_RETRIES = Math.max(1, parseInt(process.env.LIGHTVELA_SF_RETRIES || '5', 10));
+// ★ 2026-11-19 V3（老大选 A）：取短信默认直连，三级回退「直连域名 → 固定节点IP → 代理」。
+//   实测：本机关掉 TUN 后直连 5/5 通、走代理 3 次里 2 次被 302 挡；
+//   18 台干活 VPS 有 4 台解析不了域名，但换固定节点 IP 直连 12/12 通。
+//   只改四方这一条取短信的路，LightVela 官网发码/登录/实名照旧走代理。
+const SF_KEYWORD = String(process.env.LIGHTVELA_SF_KEYWORD || '腾讯云');
+const SF_DIRECT = String(process.env.LIGHTVELA_SF_DIRECT || '1') !== '0';
+const SF_LOCAL_IP = String(process.env.LIGHTVELA_SF_LOCAL_IP || '').trim();
+const SF_NODES = String(process.env.LIGHTVELA_SF_NODES ||
+  '47.83.229.172,47.239.192.230,112.213.108.175,192.252.179.237,192.253.235.158,192.253.235.205')
+  .split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+const SF_MAX_NODES = Math.max(0, parseInt(process.env.LIGHTVELA_SF_MAX_NODES || '3', 10));
+// ★ 2026-11-19 V4：发码时刻容差由 30s 收到 5s（本机与号商时钟实测只差几秒，30s 会把旧码放进来）
+const SF_SINCE_TOLERANCE_MS = Math.max(0, parseInt(process.env.LIGHTVELA_SF_SINCE_TOLERANCE_MS || '5000', 10));
+// ★ V4：取到码后再等 2.5s 拉一次，号商几秒内密集上报同一号多条码时换用更新那条
+const SF_SETTLE_MS = Math.max(0, parseInt(process.env.LIGHTVELA_SF_SETTLE_MS || '2500', 10));
+// ★ 2026-11-20 滑动窗口：窗口长度（毫秒），默认 120 秒。
+//   作用：每轮轮询重算左端 = max(发码时刻-容差, 现在-窗口长度)。
+//   窗口内只认发码之后的短信（防旧码）；超窗后只看最近这一段（防老数据堆在接口里被反复扫）。
+//   设 0 = 关掉滑动，退回老的「固定起点」。可用 LIGHTVELA_SF_WINDOW_MS 调。
+const SF_WINDOW_MS = Math.max(0, parseInt(process.env.LIGHTVELA_SF_WINDOW_MS || '120000', 10));
+
+// 归一化号码：去 +86 / 空格 / 横线，只留数字
+function sfNormPhone(p) {
+  let s = String(p == null ? '' : p).trim().replace(/[\s\-()]/g, '');
+  if (s.startsWith('+86')) s = s.slice(3);
+  else if (s.startsWith('86') && /^86\d{11}$/.test(s)) s = s.slice(2);
+  return s;
+}
+
+// 解析粘贴的号码清单 -> [{com, phone}]。com 保留号商原始标签（COM1/1/…）。
+function sfParseNumbers(raw) {
+  const text = String(raw == null ? '' : raw)
+    .replace(/\\r/g, '\n').replace(/\\n/g, '\n').replace(/\\/g, '\n');
+  const out = [];
+  const seen = Object.create(null);
+  for (const line0 of text.split(/[\n;；]+/)) {
+    const line = line0.trim();
+    if (!line) continue;
+    // 匹配 "COM1 16544044290" / "COM1:165..." / "1 165..." / "165..."
+    const m = line.match(/^(?:COM\s*(\d+)\s*[:：\s]*)?(\d{11})\b/i);
+    if (!m) continue;
+    const phone = m[2];
+    if (seen[phone]) continue;
+    seen[phone] = 1;
+    out.push({ com: m[1] ? String(parseInt(m[1], 10)) : '', phone: phone });
+  }
+  return out;
+}
+
+// 解析粘贴的接口地址 -> {host, port, token}。
+// 兼容三种粘法：① 页面地址 .../32位ID  ② 已带 /api/smslist?token=xxx  ③ 只给域名
+function sfParseApiUrl(raw) {
+  let s = String(raw == null ? '' : raw).trim();
+  if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+  const u = new URL(s);
+  const host = u.hostname;
+  const port = parseInt(u.port || '80', 10);
+  let token = u.searchParams.get('token') || '';
+  if (!token) {
+    const segs = u.pathname.split('/').filter(Boolean);
+    for (let i = segs.length - 1; i >= 0; i--) {
+      if (/^(api|smslist)$/i.test(segs[i])) continue;
+      if (/^[0-9a-f]{16,}$/i.test(segs[i]) || segs[i].length >= 16) { token = segs[i]; break; }
+    }
+  }
+  return { host: host, port: port, token: token };
+}
+
+// 构造取短信的 URL path
+function sfApiPath(token) { return '/api/smslist?token=' + encodeURIComponent(token); }
+
+// 从短信正文抠验证码：优先「验证/校验/动态/确认」等关键词附近的 6 位；
+// ★ 2026-11-19 V3 兜底按号商写法取「第一段 4~6 位连续数字」，兼容 4/5 位码。
+//   长网关号（1068…）前后还有数字，正则 (?<!\d)(\d{4,6})(?!\d) 不会误命中。
+function sfExtractCode(content) {
+  const s = String(content == null ? '' : content);
+  const KW = /(?:验证码|校验码|动态码|确认码|code|verification)/gi;
+  let m;
+  KW.lastIndex = 0;
+  while ((m = KW.exec(s)) !== null) {
+    const tail = s.slice(m.index + m[0].length, m.index + m[0].length + 16);
+    const h = tail.match(/(?<!\d)(\d{6})(?!\d)/);
+    if (h) return h[1];
+    const head = s.slice(Math.max(0, m.index - 16), m.index);
+    const hs = head.match(/(?<!\d)(\d{6})(?!\d)/g);
+    if (hs && hs.length) return hs[hs.length - 1].replace(/\D/g, '');
+  }
+  const first = s.match(/(?<!\d)(\d{4,6})(?!\d)/);
+  if (first) return first[1];
+  const any = s.match(/(?<!\d)(\d{6})(?!\d)/);
+  return any ? any[1] : '';
+}
+
+// 判断一条短信记录是否属于目标号码 phone
+// ★ 2026-11-19 修复：接口真实数据 {"com":"16","simnum":"16*****1468","number":"1068..."}
+//   com=COM口编号(和清单 COM16 对应,最可靠)；simnum=脱敏接收号(前2位*****后4位)；number=发送方网关(不能用)。
+//   旧逻辑 parseInt(com)-1 当数组下标(16-1=15,数组只有10个) → 永远匹配失败 → 全走兜底取最新 → 并发拿错码。
+function sfBuildComMap(numbers) {
+  const m = Object.create(null);
+  for (const n of (numbers || [])) {
+    const com = n && n.com != null ? String(n.com).replace(/^COM/i, '').trim() : '';
+    if (com) m[com] = sfNormPhone(n.phone);
+  }
+  return m;
+}
+function sfRecordMatches(rec, phone, numbers, comMap) {
+  const p = sfNormPhone(phone);
+  if (!p) return false;
+  const map = comMap || sfBuildComMap(numbers);
+  // ① COM 口精确匹配（最可靠）：有 com 且映射表里有，直接判定
+  const com = rec && rec.com != null ? String(rec.com).replace(/^COM/i, '').trim() : '';
+  if (com && map[com]) return map[com] === p;
+  // ② simnum 脱敏号：末尾连续4位与手机号后4位比
+  const simnum = String((rec && rec.simnum) || '');
+  const tm = simnum.match(/(\d{4})\D*$/);
+  if (tm && p.slice(-4) === tm[1]) return true;
+  return false;
+}
+// 把 "2026-11-19 21:01:47" 解析成本地时间戳(ms)；解析不了返回 0
+function sfParseTime(x) {
+  const m = String(x || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return 0;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+}
+
+// ★ 2026-11-20 滑动窗口左端：每轮轮询都重算，而不是发码时算一次就不动。
+//   左端 = max(发码时刻, 现在 - 窗口长度)
+//     · 发码后 windowMs 内 → 左端就是发码时刻，不会把发码前的旧码捞进来
+//     · 超过 windowMs 后  → 左端跟着当前时间往前推，真正滑起来
+//   windowMs<=0 表示不滑动，直接用发码时刻（老的固定起点行为）。
+function sfWindowStart(sinceTs, windowMs, now) {
+  const s = Number(sinceTs) || 0;
+  const w = Math.max(0, Number(windowMs) || 0);
+  if (!w) return s;
+  const t = (now == null ? Date.now() : now) - w;
+  return s > 0 ? Math.max(s, t) : t;
+}
+// 时间戳(ms) -> HH:MM:SS，日志用
+function sfClock(ms) {
+  const d = new Date(ms);
+  const p = function (n) { return n < 10 ? '0' + n : '' + n; };
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// 从短信列表里挑出属于 phone 的验证码。
+// ★ 2026-11-19 V3：① 只认含项目名「腾讯云」且不在第 1 个字符的短信（号商 InStr>1 规则）；
+//   ② 本号已经用过的旧码不再复用（防接口里堆积的旧短信被反复取到）；
+//   ③ 认号仍用 COM 主键（实测 com:16/22/28 与清单精确对应，最可靠，不撤）；
+//   ④ 匹配不到返回空，让上层继续轮询；绝不兜底取别人的码。
+//   stats 回填「总数/含关键词数/对上号数/旧短信跳过数/旧码跳过数」，供日志排查。
+function sfPickCode(records, phone, numbers, sinceTs, keyword, stats, excludeCodes) {
+  const st = stats || {};
+  st.total = 0; st.keyword = 0; st.matched = 0; st.timeSkipped = 0; st.oldSkipped = 0; st.pickedTime = '';
+  if (!Array.isArray(records)) return '';
+  const kw = (keyword == null || keyword === '') ? SF_KEYWORD : String(keyword);
+  const map = sfBuildComMap(numbers);
+  const used = excludeCodes instanceof Set ? excludeCodes : new Set(excludeCodes || []);
+  const sorted = records.slice().sort(function (a, b) {
+    return String((b && b.time) || '').localeCompare(String((a && a.time) || ''));
+  });
+  st.total = sorted.length;
+  for (const rec of sorted) {
+    if (sinceTs) {
+      const t = sfParseTime(rec && rec.time);
+      if (t && t < sinceTs) { st.timeSkipped++; continue; }   // 早于发码时刻的旧短信
+    }
+    const content = String((rec && rec.content) || '');
+    if (kw && content.indexOf(kw) <= 0) continue;             // 项目名过滤
+    st.keyword++;
+    const code = sfExtractCode(content);
+    if (!code) continue;
+    if (used.has(code)) { st.oldSkipped++; continue; }        // 本号已用过的旧码
+    if (sfRecordMatches(rec, phone, numbers, map)) {
+      st.matched++; st.pickedTime = String((rec && rec.time) || ''); return code;
+    }
+  }
+  return '';
+}
+
+// ★ 2026-11-19 V4 稳定确认：号商可能在几秒内把同一号的多条码密集上报，
+//   第一次抓到的可能是过期那条。等一小会儿再拉一次，若出现时间更晚的码就换掉。
+function sfSettlePick(firstCode, firstTime, laterRecords, phone, numbers, sinceTs, keyword, excludeCodes) {
+  if (!firstCode) return '';
+  const st = {};
+  const newer = sfPickCode(laterRecords, phone, numbers, sinceTs, keyword, st, excludeCodes);
+  if (newer && st.pickedTime && String(st.pickedTime) > String(firstTime || '')) return newer;
+  return firstCode;
+}
+
+// 解析原始 HTTP 响应字节（含 chunked）-> body 字符串
+function sfDecodeHttp(buf) {
+  const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf || ''), 'binary');
+  const cut = b.indexOf('\r\n\r\n');
+  if (cut === -1) return '';
+  const head = b.slice(0, cut).toString('utf8');
+  let body = b.slice(cut + 4);
+  if (/\bchunked\b/i.test(head)) {
+    let out = Buffer.alloc(0);
+    let pos = 0;
+    while (pos < body.length) {
+      const eol = body.indexOf('\r\n', pos);
+      if (eol === -1) break;
+      const size = parseInt(body.slice(pos, eol).toString('utf8').split(';')[0], 16);
+      pos = eol + 2;
+      if (!size || isNaN(size)) break;
+      if (pos + size > body.length) break;
+      out = Buffer.concat([out, body.slice(pos, pos + size)]);
+      pos += size + 2;
+    }
+    body = out;
+  }
+  return body.toString('utf8');
+}
+
+// 经隧道发一次明文 HTTP GET，返回 body 字符串
+function sfHttpRequest(opt) {
+  const tunnel = opt.tunnel || (typeof connectTunnel === 'function' ? connectTunnel : null);
+  if (!tunnel) return Promise.reject(new Error('无隧道函数（connectTunnel 缺失）'));
+  return tunnel({ proxy: opt.proxy, targetHost: opt.host, targetPort: opt.port }).then(function (sock) {
+    return new Promise(function (resolve, reject) {
+      let done = false;
+      const timer = setTimeout(function () { finish(new Error('新四方请求超时')); }, opt.timeoutMs || 20000);
+      function finish(err, val) {
+        if (done) return; done = true;
+        clearTimeout(timer);
+        try { sock.destroy(); } catch (_) {}
+        if (err) reject(err); else resolve(val);
+      }
+      const chunks = [];
+      sock.on('data', function (c) { chunks.push(Buffer.from(c)); });
+      sock.on('end', function () { finish(null, sfDecodeHttp(Buffer.concat(chunks))); });
+      sock.on('close', function () { finish(null, sfDecodeHttp(Buffer.concat(chunks))); });
+      sock.on('error', function (e) { finish(e); });
+      const req = 'GET ' + opt.path + ' HTTP/1.1\r\n' +
+                  'Host: ' + opt.host + ':' + opt.port + '\r\n' +
+                  'User-Agent: Mozilla/5.0\r\n' +
+                  'Accept: application/json\r\n' +
+                  'Connection: close\r\n\r\n';
+      try { sock.write(req); } catch (e) { finish(e); }
+    });
+  });
+}
+
+// ★ 2026-11-19 V3：直连取短信（不走代理）。用 Node 内置 http 发明文 GET。
+//   host 可以是域名，也可以是固定节点 IP；Host 头始终用原域名，号商靠它认服务。
+function sfHttpDirect(opt) {
+  const httpMod = opt.httpMod || require('http');
+  return new Promise(function (resolve, reject) {
+    let done = false;
+    function finish(err, val) { if (done) return; done = true; if (err) reject(err); else resolve(val); }
+    let req;
+    try {
+      req = httpMod.request({
+        host: opt.host, port: opt.port, path: opt.path, method: 'GET',
+        localAddress: opt.localAddress || undefined,
+        headers: {
+          Host: opt.hostHeader || (opt.host + ':' + opt.port),
+          Accept: 'application/json', 'User-Agent': 'Mozilla/5.0', Connection: 'close',
+        },
+      }, function (res) {
+        const chunks = [];
+        res.on('data', function (c) { chunks.push(Buffer.from(c)); });
+        res.on('end', function () {
+          if (res.statusCode !== 200) return finish(new Error('直连 HTTP ' + res.statusCode));
+          const text = Buffer.concat(chunks).toString('utf8');
+          try { finish(null, JSON.parse(text)); }
+          catch (e) { finish(new Error('直连返回不是合法 JSON: ' + text.slice(0, 80))); }
+        });
+      });
+    } catch (e) { return finish(e); }
+    req.on('error', function (e) { finish(e); });
+    req.setTimeout(opt.timeoutMs || 15000, function () { req.destroy(new Error('直连超时')); });
+    try { req.end(); } catch (e) { finish(e); }
+  });
+}
+
+// ★ 三级回退路线表：直连域名 → 固定节点 IP → 代理（总开关 direct=false 时只走代理）
+function sfBuildRoutes(opt) {
+  const host = opt.host, port = opt.port;
+  const routes = [];
+  if (opt.direct !== false) {
+    routes.push({ name: '直连域名', kind: 'direct', host: host, hostHeader: host + ':' + port });
+    const nodes = opt.fixedNodes || SF_NODES;
+    const max = Math.min(nodes.length, opt.maxNodes == null ? SF_MAX_NODES : opt.maxNodes);
+    for (let i = 0; i < max; i++) {
+      routes.push({ name: '固定节点' + nodes[i], kind: 'direct', host: nodes[i], hostHeader: host + ':' + port });
+    }
+  }
+  routes.push({ name: '代理', kind: 'proxy', host: host, hostHeader: host + ':' + port });
+  return routes;
+}
+function sfFetchRoute(r, opt) {
+  if (r.kind === 'proxy') {
+    return sfHttpRequest({ host: opt.host, port: opt.port, path: opt.path,
+      proxy: opt.proxy, tunnel: opt.tunnel, timeoutMs: opt.timeoutMs });
+  }
+  return sfHttpDirect({ host: r.host, port: opt.port, path: opt.path,
+    hostHeader: r.hostHeader, localAddress: opt.localAddress,
+    timeoutMs: opt.timeoutMs, httpMod: opt.httpMod });
+}
+
+// 带重试地查询短信列表 -> 记录数组。★ 每条路线成功/失败都打日志，绝不静默。
+async function sfQuerySms(opt) {
+  const log = opt.log || function () {};
+  const routes = sfBuildRoutes(opt);
+  const retries = opt.retries || SF_RETRIES;
+  let lastErr = null;
+  for (let i = 1; i <= retries; i++) {
+    for (const r of routes) {
+      try {
+        const body = opt.getter ? await opt.getter(r) : await sfFetchRoute(r, opt);
+        const j = Array.isArray(body) ? body : JSON.parse(body);
+        if (!Array.isArray(j)) throw new Error('新四方返回非数组: ' + String(body).slice(0, 120));
+        log('  [新四方] ' + r.name + ' 成功，拉回 ' + j.length + ' 条短信');
+        return j;
+      } catch (e) {
+        lastErr = e;
+        log('  [新四方] ' + r.name + ' 失败：' + (e && e.message ? e.message : e));
+      }
+    }
+    log('  [新四方] 第 ' + i + '/' + retries + ' 轮全部路线失败，稍后重试');
+  }
+  throw lastErr || new Error('新四方请求失败');
+}
+
+const SMS_NEWSIFANG = {
+  _ready: false,
+  _api: null,
+  _numbers: [],
+  _proxy: null,
+  _tunnel: null,
+  _init(env, tunnel) {
+    const e = env || process.env;
+    this._env = e;
+    const apiRaw = e.LIGHTVELA_SF_API_URL || '';
+    const numbersRaw = e.LIGHTVELA_SF_NUMBERS || '';
+    if (!apiRaw) throw new Error('新四方未配置 LIGHTVELA_SF_API_URL（粘贴号商接口地址）');
+    this._api = sfParseApiUrl(apiRaw);
+    if (!this._api.token) throw new Error('新四方接口地址里没找到 token（那串32位ID）');
+    this._numbers = sfParseNumbers(numbersRaw);
+    if (!this._numbers.length) throw new Error('新四方未配置号码（粘贴 COM1 165... 清单）');
+    // 代理：优先 LIGHTVELA_EGRESS_PROXY，否则内置 socks5 轮换代理
+    let rawProxy = { type: 'socks5', host: 'a.rr2.kdns.fr', port: 10800, username: '6582443', password: '6582443' };
+    if (e.LIGHTVELA_EGRESS_PROXY) {
+      try { rawProxy = JSON.parse(e.LIGHTVELA_EGRESS_PROXY); } catch (_) {}
+    }
+    this._proxy = (typeof normalizeProxy === 'function' ? normalizeProxy(rawProxy) : rawProxy);
+    this._tunnel = tunnel || null;
+    // ★ 2026-11-19 V3：取短信默认直连，代理配置保留但只作最后兜底
+    this._keyword = String(e.LIGHTVELA_SF_KEYWORD || SF_KEYWORD);
+    this._direct = (e.LIGHTVELA_SF_DIRECT == null) ? SF_DIRECT : (String(e.LIGHTVELA_SF_DIRECT) !== '0');
+    this._localIp = String(e.LIGHTVELA_SF_LOCAL_IP || SF_LOCAL_IP).trim();
+    this._nodes = String(e.LIGHTVELA_SF_NODES || '').trim()
+      ? String(e.LIGHTVELA_SF_NODES).split(',').map(function (s) { return s.trim(); }).filter(Boolean)
+      : SF_NODES;
+    this._cursor = 0;
+    this._ready = true;
+  },
+  _ensure() { if (!this._ready) this._init(); },
+  async rentNumber() {
+    this._ensure();
+    // ★ 后端分配号：设了 LIGHTVELA_SF_ASSIGNED_PHONE 就只发这一个（冷却/重试由后端调度）
+    const assigned = String(process.env.LIGHTVELA_SF_ASSIGNED_PHONE || '').trim();
+    if (assigned && !this._assignedUsed) {
+      this._assignedUsed = true;
+      console.log('  [新四方] 后端指定号：' + assigned);
+      return assigned;
+    }
+    if (assigned && this._assignedUsed) {
+      throw new Error('新四方后端指定号 ' + assigned + ' 已用过（单号模式，冷却由后端调度）');
+    }
+    if (this._cursor >= this._numbers.length) {
+      throw new Error('新四方本批 ' + this._numbers.length + ' 个号已全部用完，请粘贴新一批号码（LIGHTVELA_SF_NUMBERS）');
+    }
+    const item = this._numbers[this._cursor++];
+    if (item.com) console.log('  [新四方] 发号 ' + this._cursor + '/' + this._numbers.length + '：' + item.com + ' → ' + item.phone);
+    else console.log('  [新四方] 发号 ' + this._cursor + '/' + this._numbers.length + '：' + item.phone);
+    return item.phone;
+  },
+  async getCode(phone, opt) {
+    this._ensure();
+    opt = opt || {};
+    const timeoutMs = opt.timeoutMs || SF_DEFAULT_TIMEOUT;
+    const intervalMs = opt.intervalMs || 10000;
+    const path = sfApiPath(this._api.token);
+    const log = opt.log || console.log;
+    const sleep = opt.sleep || function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+    const settleMs = opt.settleMs == null ? SF_SETTLE_MS : Math.max(0, Number(opt.settleMs));
+    const qopt = {
+      host: this._api.host, port: this._api.port, path: path,
+      proxy: this._proxy, tunnel: this._tunnel,
+      direct: this._direct, fixedNodes: this._nodes, localAddress: this._localIp,
+      log: log,
+    };
+    const start = Date.now();
+    // ★ 2026-11-20 滑动窗口长度：调用方没指定就用全局 SF_WINDOW_MS（默认 120s）
+    const winMs = opt.windowMs == null ? SF_WINDOW_MS : Math.max(0, Number(opt.windowMs));
+    let winLogged = false;                    // 窗口开始滑动只提示一次，避免刷屏
+    while (Date.now() - start < timeoutMs) {
+      let records = [];
+      try {
+        records = await sfQuerySms(qopt);
+      } catch (e) {
+        // 单次整轮请求失败不立即判死，等下个轮询点重试
+        log('  [新四方] 本轮查询失败，稍后重试: ' + (e && e.message ? e.message : e));
+      }
+      // ★ 滑动窗口：每轮都重算左端，不是发码时算一次就不动
+      const winStart = sfWindowStart(opt.sinceTs, winMs, Date.now());
+      if (!winLogged && winMs > 0 && opt.sinceTs && winStart > opt.sinceTs + 1000) {
+        log('  [新四方] 窗口开始滑动：只看最近 ' + Math.round(winMs / 1000) + 's（当前起点 ' + sfClock(winStart) + '）');
+        winLogged = true;
+      }
+      const stats = {};
+      let code = sfPickCode(records, phone, this._numbers, winStart,
+                            this._keyword, stats, opt.excludeCodes);
+      if (code && settleMs > 0) {
+        // ★ V4：等一小会儿再拉一次，号商密集上报时换用更新的码（确认阶段不打日志，避免刷屏）
+        await sleep(settleMs);
+        let again = [];
+        try { again = await sfQuerySms(Object.assign({}, qopt, { log: function () {} })); }
+        catch (e) { /* 确认失败就保留原码，不阻断 */ }
+        // ★ 滑动窗口：确认阶段同样按「此刻」重算左端，两边标准一致
+        const winStart2 = sfWindowStart(opt.sinceTs, winMs, Date.now());
+        const newer = sfSettlePick(code, stats.pickedTime, again, phone, this._numbers,
+                                   winStart2, this._keyword, opt.excludeCodes);
+        if (newer !== code) log('  [新四方] 稳定确认：' + code + ' → ' + newer + '（改用更新的码）');
+        code = newer;
+      }
+      if (code) return code;
+      // ★ V3：把「连没连上 / 拉回几条 / 含关键词几条 / 旧码跳过几条」打出来，一眼定位
+      // ★ 2026-11-20：末尾加「窗口起点」，能直接看出窗口在不在往前推
+      log('  [新四方] 本轮 ' + stats.total + ' 条 / 含「' + this._keyword + '」' + stats.keyword +
+          ' 条 / 旧短信跳过 ' + stats.timeSkipped + ' 条 / 旧码跳过 ' + stats.oldSkipped +
+          ' 条 / 对上 ' + stats.matched + ' 条 / 窗口起点 ' + (winStart ? sfClock(winStart) : '不限') +
+          '，没取到 ' + phone + ' 的新码，继续等…');
+      const left = timeoutMs - (Date.now() - start);
+      if (left > 0) await sleep(Math.min(intervalMs, left));
+    }
+    throw new Error('新四方取码超时（' + (timeoutMs / 1000) + 's 内未收到 ' + phone + ' 的验证码）');
+  },
+  async release(phone) { return { ok: true, msg: '新四方固定号池，无需释放' }; },
+  async blacklist(phone) { return { ok: true, msg: '新四方固定号池，无需拉黑（靠号码库查重防复用）' }; },
+  async balance() { return '新四方固定号池（按批次提供，无余额接口）'; },
+};
+// <<< NEWSIFANG_END
+
+// >>> SF_RESEND_BEGIN
+// ===== 新四方：重发新码状态机 + 永久台账（2026-11-19 老大定案）=====
+// 规则：验码失败就「重新发码拿新码」再验，不再死磕旧码。
+//   对同一个号：第1组最多3次(发码→取码→验码)，全失败→冷却300s(不占队列)→第2组最多3次，全失败→放弃这个号。
+//   放弃号后身份继续用下一个号；所有号用完身份才失败。
+// 永久台账：sf_ledger.jsonl 记 {phone,name,idCard,code,ts}，永不清空（新四方无后台，用于事后核实）。
+const SF_LEDGER_DEFAULT_NAME = 'sf_ledger.jsonl';
+function sfLedgerPath(env, pathMod, dirname) {
+  if (env && env.LIGHTVELA_SF_LEDGER) return env.LIGHTVELA_SF_LEDGER;
+  const d = (env && env.LIGHTVELA_SF_LEDGER_DIR) || dirname || '.';
+  return pathMod ? pathMod.join(d, SF_LEDGER_DEFAULT_NAME) : (d + '/' + SF_LEDGER_DEFAULT_NAME);
+}
+// 永久台账写入：手机号+身份+验证码。失败静默。
+function sfLedgerAdd(env, rec, opt) {
+  opt = opt || {};
+  try {
+    const fsm = opt.fs || require('fs');
+    const p = sfLedgerPath(env, opt.path, opt.dirname);
+    const line = JSON.stringify({ phone: String(rec && rec.phone || ''), name: String(rec && rec.name || ''),
+      idCard: String(rec && rec.idCard || ''), code: String(rec && rec.code || ''), ts: rec.ts || Date.now() }) + '\n';
+    fsm.appendFileSync(p, line, 'utf8');
+    if (opt.log) opt.log('  [台账] 记录 手机号' + rec.phone + ' / ' + (rec.name || '') + ' / 身份证' + (rec.idCard || '') + ' / 验证码' + rec.code);
+    return true;
+  } catch (e) { if (opt.log) opt.log('  [台账] 写入失败（忽略）: ' + (e && e.message || e)); return false; }
+}
+
+// ★ 2026-11-19 V4：从永久台账里取出「这个手机号」已经用过的所有验证码。
+//   台账是永久落盘的，冷却 300s 后后端重起子进程也不会丢，旧码不会再次被拿去验。
+function sfLedgerCodesFromText(text, phone) {
+  const out = new Set();
+  for (const line of String(text || '').split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const r = JSON.parse(line);
+      if (String((r && r.phone) || '') === String(phone) && r && r.code) out.add(String(r.code));
+    } catch (e) { /* 坏行跳过 */ }
+  }
+  return out;
+}
+function sfLedgerUsedCodes(env, phone, opt) {
+  opt = opt || {};
+  const used = new Set();
+  try {
+    const fsm = opt.fs || require('fs');
+    const p = sfLedgerPath(env, opt.path, opt.dirname);
+    if (fsm.existsSync && !fsm.existsSync(p)) return used;
+    for (const c of sfLedgerCodesFromText(fsm.readFileSync(p, 'utf8'), phone)) used.add(c);
+  } catch (e) { /* 台账不存在 / 读失败 → 空集合，绝不阻断发码 */ }
+  return used;
+}
+
+// 重发状态机：对当前号，做一组最多 maxTry 次「发码→取码→验码」。
+// 外部能力全部注入：sendCode() 发码、getCode() 取新码、verify(code) 验证(返回true/false)、sleep、log、onLedger。
+// 返回 { ok:true, code, attempts } 或 { ok:false, reason:'group_exhausted', attempts }。
+// 注意：本函数只跑「一组」；冷却及第二组由外层(后端调度)控制，保证冷却不占并发。
+async function sfResendGroup(opt) {
+  const o = opt || {};
+  const log = o.log || console.log;
+  const maxTry = Math.max(1, parseInt(o.maxTry || 3, 10));
+  const sendGapMs = Math.max(0, parseInt(o.sendGapMs || 1000, 10));
+  const phone = o.phone || '';
+  // ★ 2026-11-19 V3：本号已用过的旧码集合，防止接口里堆积的旧短信被反复取到
+  const usedCodes = o.usedCodes || (o.usedCodes = new Set());
+  for (let i = 1; i <= maxTry; i++) {
+    log('  [新四方] 第 ' + i + '/' + maxTry + ' 次发码→取码→验证（' + phone + '）');
+    try {
+      // ★ 2026-11-19 V4：sendCode() 内部先等 30~64s 错峰（遇冷却还会等更久），
+      //   发码时刻必须由它「真正发完码」后返回；在外层提前取会让时间窗口早 1~3 分钟，旧码被当新码。
+      const sent = await o.sendCode();         // POST /auth/sms/send
+      const sendTs = Number(sent) || Date.now();
+      if (sendGapMs && o.sleep) await o.sleep(sendGapMs);
+      const code = await o.getCode(sendTs, usedCodes);   // 传旧码集合，取码阶段直接排除
+      if (!code) { log('  [新四方] 本轮没取到验证码，继续'); continue; }
+      if (usedCodes.has(code)) { log('  ⚠️ 取到本号已用过的旧码 ' + code + '，跳过，重新发码'); continue; }
+      usedCodes.add(code);
+      if (o.onLedger) o.onLedger(code);        // 永久台账记录 手机号+身份+码
+      const ok = await o.verify(code);          // POST /auth/sms/verify（单次，不重试老码）
+      if (ok) { log('  ✅ 验证成功（第 ' + i + ' 次，新码 ' + code + '）'); return { ok: true, code: code, attempts: i }; }
+      log('  ⚠️ 验证码不正确（新码 ' + code + '），重新发码…');
+    } catch (e) {
+      log('  ⚠️ 本轮异常（' + (e && e.message || e) + '），继续重发…');
+    }
+  }
+  return { ok: false, reason: 'group_exhausted', attempts: maxTry };
+}
+
+// 判断一个身份的所有号是否用完：cursor >= numbers.length
+function sfAllPhonesExhausted(cursor, numbersLen) { return cursor >= numbersLen; }
+// <<< SF_RESEND_END
+
+
+
+
 // ★ 平台选择器：LIGHTVELA_SMS_PROVIDER=haozhuma(默认) | feihu | lubansms | jcsms，选哪套哪套生效；四套实现并存、互不干扰
 const SMS_PROVIDER = (process.env.LIGHTVELA_SMS_PROVIDER || 'haozhuma').toLowerCase();
-const SMS = SMS_PROVIDER === 'feihu' ? SMS_FEIHU
+const SMS = SMS_PROVIDER === 'newsfang' ? SMS_NEWSIFANG
+          : SMS_PROVIDER === 'feihu' ? SMS_FEIHU
           : SMS_PROVIDER === 'lubansms' ? SMS_LUBAN
           : SMS_PROVIDER === 'jcsms' ? SMS_JCSMS
           : SMS_HAOZHUMA;
@@ -1523,7 +2073,10 @@ async function domesticLogin(acc, idx) {
       // ★ 2026-10-23：取到非大陆号（香港/澳门）→ 拉黑并重取，直到拿到 11 位大陆号为止。
       //   独立计数（MAX_REGION_RETRY）不占用 MAX_RENT 换号配额——取错地区是平台缺陷，不是号源质量问题。
       //   飞狐拉黑按订单走（addBlackList 同时释放进行中的订单），豪猪按手机号走，SMS.blacklist 已各自封装。
-      const CHECK_PHONE = PHONE_LEDGER.enabled();
+      // ★ 固定号池（新四方）跳过永久号码库查重：号本来就固定复用，按历史收码拉黑会把 7 个号全跳光；改用本轮临时小本本+接口取码核实。其他平台不受影响。
+      const IS_FIXED_POOL = (String(process.env.LIGHTVELA_SMS_PROVIDER || '').toLowerCase() === 'newsfang');
+      const CHECK_PHONE = PHONE_LEDGER.enabled() && !IS_FIXED_POOL;
+      if (IS_FIXED_POOL) console.log('  · 固定号池模式：跳过永久号码库查重（号商直供固定号，按 COM 口认号 + 发码时刻过滤取新码）');
       for (let rr = 0; rr < MAX_REGION_RETRY; rr++) {
         phone = await SMS.rentNumber();
         console.log(`  手机号(取号#${attempt}${rr > 0 ? '-重取' + rr : ''}):`, phone);
@@ -1545,6 +2098,63 @@ async function domesticLogin(acc, idx) {
         break;
       }
       if (!phone) throw new Error('连续 ' + MAX_REGION_RETRY + ' 次没拿到可用号码（非大陆号或号码复用，平台号源异常），放弃本账号');
+      let v = null, token = null, vErr = null, code = null;
+      // ===== 新四方（固定号池）：一组最多3次「发码→取码→验码」，失败交后端冷却 =====
+      if (IS_FIXED_POOL) {
+        const grp = await sfResendGroup({
+          phone: phone,
+          // ★ V4：旧码从永久台账读，冷却 300s 后重起子进程也不会把验过的旧码再拿去验
+          usedCodes: sfLedgerUsedCodes(process.env, phone, { dirname: __dirname }),
+          maxTry: Number(process.env.LIGHTVELA_SF_GROUP_TRY || 3),
+          sendGapMs: 0,
+          sleep: (ms) => new Promise(function (r) { setTimeout(r, ms); }),
+          log: (s) => console.log(s),
+          sendCode: async function () {
+            // ★ 2026-11-19：遇到 sms_cooldown 按 retryAfterSeconds 等够了再发，不再立刻撞墙白耗次数
+            for (let sc = 0; sc < 3; sc++) {
+              await smsSendGate(EFF_GAP_MS);
+              let sr;
+              try { sr = await httpsReq('POST', '/auth/sms/send', { body: { phone } }); }
+              finally { smsSendGateRelease(); }
+              smsSendGateTouch();
+              const j = (sr && sr.json) || {};
+              if (String(j.code) === 'sms_cooldown') {
+                const wait = Math.min(180, Number(j.retryAfterSeconds || 60) + 2) * 1000;
+                console.log('  ⏳ 发码冷却中，等 ' + Math.round(wait / 1000) + 's 后重发（第 ' + (sc + 1) + '/3 次）…');
+                await new Promise(function (r) { setTimeout(r, wait); });
+                continue;
+              }
+              const rlType = getSendRateLimitType(sr && sr.json);
+              if (rlType) throw new Error('发码限流: ' + JSON.stringify(sr && sr.json).slice(0, 120));
+              console.log('  已发验证码:', JSON.stringify(sr && sr.json).slice(0, 120));
+              return Date.now();        // ★ V4：把「真正发完码」的时刻交给取码当时间起点
+            }
+            throw new Error('发码多次冷却仍未成功');
+          },
+          getCode: async function (sinceTs, excludeCodes) {
+            return await SMS.getCode(phone, {
+              timeoutMs: CODE_TIMEOUT_MS,
+              sinceTs: sinceTs ? (sinceTs - SF_SINCE_TOLERANCE_MS) : 0,
+              excludeCodes: excludeCodes,
+              log: console.log,
+            });
+          },
+          verify: async function (c) {
+            const r = await httpsReq('POST', '/auth/sms/verify', { body: { phone: phone, code: c } });
+            const t = r && r.json && r.json.session && r.json.session.sessionToken;
+            if (t) { v = r; token = t; return true; }
+            return false;
+          },
+          onLedger: function (c) {
+            sfLedgerAdd(process.env, { phone: phone, name: acc.name, idCard: acc.idCard, code: c }, { dirname: __dirname, log: console.log });
+          },
+        });
+        if (!grp.ok) {
+          console.log('SF_NEED_COOLDOWN=1');
+          throw new Error('新四方本组' + (grp.attempts || 3) + '次验证失败，交后端冷却重试');
+        }
+        CFG.bearer = token;
+      } else {
       // —— 发码错峰门控 + 限频同号重发 ——
       // 门控：并发账号之间发短信请求至少间隔 SEND_GAP_MS（默认30s），避免被官方限频
       // 限频：若返回“发送过于频繁”，等 RESEND_WAIT_MS（默认60s）后用同一号码重发，最多 RESEND_MAX 次
@@ -1590,34 +2200,42 @@ async function domesticLogin(acc, idx) {
         console.log('  ⚠️ 该号限频重试耗尽，换号重试…');
         continue;   // 走 attempt++ 换号（至多 MAX_RENT 个号）
       }
-      const code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS });
+      code = await SMS.getCode(phone, { timeoutMs: CODE_TIMEOUT_MS, account: (acc && (acc.name || acc.idCard)) || '' });
       console.log('  验证码:', code);
       // ★ 2026-11-16：成功收到验证码 → 立刻记入号码库（本地 + 数据中心），以后这个号再发来就能认出来
       await PHONE_LEDGER.add(phone);
       // ★ 取码成功也拉黑：号源即用即弃，防止被平台回收后再分给我们（二手号复用 = 风控）
       await blacklistUsedPhone(phone, '已成功取码，号源即用即弃');
-      // ★ 2026-11-18：验码失败重试 2 次（首次 + 2 = 最多 3 次），间隔 5 秒。
-      //   网络抖动/接口 5xx 时，重发同一个验证码即可（验证码 5 分钟内有效）。
-      //   只有"确定拿不到 token"或"验码接口报错"才重试；重试耗尽才抛错。
-      const VERIFY_TRY = Number(process.env.LIGHTVELA_VERIFY_TRY || 3);
-      const VERIFY_GAP_MS = Number(process.env.LIGHTVELA_VERIFY_GAP_MS || 5000);
-      let v = null, token = null, vErr = null;
-      for (let vt = 1; vt <= VERIFY_TRY; vt++) {
-        v = await httpsReq('POST', '/auth/sms/verify', { body: { phone, code } });
-        token = v.json && v.json.session && v.json.session.sessionToken;
-        if (token) { vErr = null; break; }
-        const raw = (v.json && typeof v.json === 'object')
-          ? JSON.stringify(v.json).slice(0, 240)
-          : (typeof v.text === 'string' ? v.text.slice(0, 240) : '(无响应体)');
-        vErr = 'HTTP ' + v.status + ' | ' + raw;
-        console.log('  ⚠️ 验码第 ' + vt + '/' + VERIFY_TRY + ' 次未拿到凭证（' + vErr + '）' +
-                    (vt < VERIFY_TRY ? '，' + (VERIFY_GAP_MS / 1000) + ' 秒后重试…' : ''));
-        if (vt < VERIFY_TRY) await new Promise(r => setTimeout(r, VERIFY_GAP_MS));
+      // ★ 2026-11-19：验码增强重试
+      //   递增间隔 10,10,15,15,20,20,25,25… 覆盖满验证码5分钟窗口（270s 硬闸留缓冲）；
+      //   每次重试前查本地凭证做幂等；识别「码已用/已注册」停止空转；总开关 LIGHTVELA_VERIFY_ENHANCED=0 退回老逻辑。
+      //   逻辑本体 verifyWithRetry() 内联在本文件（标记 VERIFY_RETRY_BEGIN/END 之间，已单测全绿）。
+      const vr = await verifyWithRetry({
+        phone: phone, code: code, label: (acc && (acc.name || acc.idCard)) || '',
+        request: (body) => httpsReq('POST', '/auth/sms/verify', { body: body }),
+        checkCred: () => (typeof readDomesticToken === 'function' ? readDomesticToken(acc && acc.name, acc && acc.idCard) : null),
+        sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+        now: () => Date.now(),
+        log: (s) => console.log(s),
+        env: process.env,
+      });
+      v = vr.lastResponse; token = vr.token; vErr = vr.err;
+      if (vr.cred && vr.cred.bearer) {
+        // 幂等命中：直接用已存凭证/uid，不再依赖本次 v.json
+        CFG.bearer = vr.cred.bearer;
+        const uidHit = vr.cred.uid || ((acc && acc.uid) || '');
+        console.log('  ✅ 登录成功（幂等复用凭证）| uid=', uidHit);
+        // 让下方「登录成功立刻落盘」段落仍能拿到 token；用已存凭证构造等效对象
+        v = { status: 200, json: { session: { sessionToken: vr.cred.bearer, user: { id: uidHit } } } };
+        token = vr.cred.bearer;
+      } else if (!token) {
+        const extra = vr.suspicious ? ' [疑似码已用/已注册，待对账确认]' : '';
+        throw new Error('登录失败（验码重试耗尽：' + vr.reason + '，' + vr.attempts + '次/' +
+                        Math.round((vr.elapsedMs || 0) / 1000) + 's）: ' + vErr + extra);
+      } else {
+        CFG.bearer = token;
       }
-      if (!token) {
-        throw new Error('登录失败（验码重试 ' + VERIFY_TRY + ' 次仍拿不到 sessionToken）: ' + vErr);
       }
-      CFG.bearer = token;
       const uid = (v.json.session.user || {}).id;
       console.log('  ✅ 登录成功 | uid=', uid);
       // ★ 2026-11-09：登录成功立刻落盘 token（哪怕后面实名还没过）
@@ -2797,6 +3415,90 @@ async function runChat(message) {
 }
 
 // ===================== 入口：国内版全流程 =====================
+// >>> VERIFY_RETRY_BEGIN （2026-11-19 验码增强重试；测试脚本按此标记抠出本段做隔离单测）
+// 说明：所有外部能力（发请求/查凭证/计时/睡眠/日志）由参数注入，本段不直接依赖脚本其它全局，
+//       因此可被测试脚本原样抽取并在沙箱里喂假数据跑。总开关 LIGHTVELA_VERIFY_ENHANCED=0 退回老逻辑。
+const VR_DEFAULT_GAPS = [10, 10, 15, 15, 20, 20, 25, 25, 30, 30, 35, 35, 40, 40, 45, 45, 50, 50];
+function vrEnvStr(env, key, def) { const v = env && env[key]; return (v === undefined || v === null || v === '') ? def : String(v); }
+function vrEnhancedEnabled(env) { const v = vrEnvStr(env, 'LIGHTVELA_VERIFY_ENHANCED', '1').trim().toLowerCase(); return !(v === '0' || v === 'false' || v === 'off' || v === 'no'); }
+function vrParseGaps(env) {
+  const s = env && env.LIGHTVELA_VERIFY_GAPS;
+  if (s) { const arr = String(s).split(',').map(function (x) { return Number(String(x).trim()); }).filter(function (x) { return Number.isFinite(x) && x > 0; }); if (arr.length) return arr; }
+  return VR_DEFAULT_GAPS.slice();
+}
+function vrWindowMs(env) { const n = Number(vrEnvStr(env, 'LIGHTVELA_VERIFY_WINDOW_MS', 270000)); return Number.isFinite(n) && n > 0 ? n : 270000; }
+function vrMaxTry(env, gapsLen) { const n = Number(vrEnvStr(env, 'LIGHTVELA_VERIFY_MAX_TRY', gapsLen + 1)); return Number.isFinite(n) && n > 0 ? Math.floor(n) : gapsLen + 1; }
+function vrExtractToken(resp) { return (resp && resp.json && resp.json.session && resp.json.session.sessionToken) || null; }
+function vrErrText(resp) {
+  let raw = '';
+  try { if (resp && resp.json && typeof resp.json === 'object') raw = JSON.stringify(resp.json).slice(0, 240); else if (resp && typeof resp.text === 'string') raw = resp.text.slice(0, 240); } catch (e) { raw = ''; }
+  return 'HTTP ' + (resp && resp.status) + ' | ' + (raw || '(无响应体)');
+}
+function vrIsCodeUsed(resp) {
+  let raw = '';
+  try { if (resp && resp.json && typeof resp.json === 'object') raw = JSON.stringify(resp.json); else if (resp && typeof resp.text === 'string') raw = resp.text; } catch (e) { raw = ''; }
+  return /已被?使用|已被?注册|已被?领取|已被?验证|已使用|已用|已注册|已领取|已验证|already\s*(been\s*)?(used|registered|claimed|verified)|code\s*(is\s*)?(already\s*)?(used|expired|consumed|invalid)|too\s*many|次数超限|重复/i.test(String(raw));
+}
+function vrCredResponse(cred) { return { status: 200, json: { session: { sessionToken: cred.bearer, user: { id: cred.uid } } } }; }
+async function verifyWithRetry(opt) {
+  const o = opt || {};
+  const log = o.log || function () {};
+  const now = o.now || function () { return Date.now(); };
+  const sleep = o.sleep || function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  const env = o.env || {};
+  const label = o.label || '';
+  const checkCred = typeof o.checkCred === 'function' ? o.checkCred : function () { return null; };
+  if (!vrEnhancedEnabled(env)) {
+    const tries = Math.max(1, Number(vrEnvStr(env, 'LIGHTVELA_VERIFY_TRY', 3)) || 3);
+    const gap = Math.max(0, Number(vrEnvStr(env, 'LIGHTVELA_VERIFY_GAP_MS', 5000)) || 0);
+    let last = null;
+    for (let i = 1; i <= tries; i++) {
+      last = await o.request({ phone: o.phone, code: o.code });
+      const t = vrExtractToken(last);
+      if (t) return { token: t, lastResponse: last, cred: null, attempts: i, elapsedMs: 0, err: null, suspicious: false, mode: 'legacy', reason: 'success' };
+      log('  ⚠️ 验码第 ' + i + '/' + tries + ' 次未拿到凭证（' + vrErrText(last) + '）' + (i < tries ? '，' + (gap / 1000) + ' 秒后重试…' : ''));
+      if (i < tries) await sleep(gap);
+    }
+    return { token: null, lastResponse: last, cred: null, attempts: tries, elapsedMs: 0, err: vrErrText(last), suspicious: vrIsCodeUsed(last), mode: 'legacy', reason: 'failed' };
+  }
+  const gaps = vrParseGaps(env);
+  const win = vrWindowMs(env);
+  const cap = vrMaxTry(env, gaps.length + 1);
+  const started = now();
+  const deadline = started + win;
+  let last = null, attempt = 0;
+  function tryIdem(tag) {
+    try { const c = checkCred(); if (c && c.bearer) { log('  ✅ 幂等[' + tag + ']：本地已有凭证' + (label ? '（' + label + '）' : '') + '，直接复用，跳过验码'); return c; } }
+    catch (e) { log('  ⚠️ 幂等查凭证失败（忽略）: ' + e.message); }
+    return null;
+  }
+  const pre = tryIdem('pre');
+  if (pre) return { token: pre.bearer, lastResponse: vrCredResponse(pre), cred: pre, attempts: 0, elapsedMs: 0, err: null, suspicious: false, mode: 'enhanced', reason: 'idempotent_pre' };
+  while (attempt < cap) {
+    attempt++;
+    const mid = tryIdem('loop' + attempt);
+    if (mid) return { token: mid.bearer, lastResponse: vrCredResponse(mid), cred: mid, attempts: attempt, elapsedMs: now() - started, err: null, suspicious: false, mode: 'enhanced', reason: 'idempotent_loop' };
+    last = await o.request({ phone: o.phone, code: o.code });
+    const t = vrExtractToken(last);
+    if (t) { log('  ✅ 验码成功（第 ' + attempt + ' 次，用时 ' + Math.round((now() - started) / 1000) + 's）'); return { token: t, lastResponse: last, cred: null, attempts: attempt, elapsedMs: now() - started, err: null, suspicious: false, mode: 'enhanced', reason: 'success' }; }
+    const e = vrErrText(last), susp = vrIsCodeUsed(last), elapsed = now() - started;
+    log('  ⚠️ 验码第 ' + attempt + ' 次未拿到凭证（' + e + '）' + (susp ? ' [疑似码已用/已注册]' : '') + ' 用时 ' + Math.round(elapsed / 1000) + 's');
+    if (susp) { log('  ⚠️ 识别为「码已用/已注册」，停止重试，交对账标记待确认'); return { token: null, lastResponse: last, cred: null, attempts: attempt, elapsedMs: elapsed, err: e, suspicious: true, mode: 'enhanced', reason: 'code_used' }; }
+    const gi = Math.min(attempt - 1, gaps.length - 1);
+    const gap = Math.max(0, gaps[gi] != null ? gaps[gi] : gaps[gaps.length - 1]) * 1000;
+    const projected = now() + gap;
+    if (attempt >= cap || projected >= deadline) {
+      const why = projected >= deadline ? 'window_exhausted' : 'max_try';
+      log('  ❌ 验码重试耗尽：已试 ' + attempt + ' 次、用时 ' + Math.round(elapsed / 1000) + 's' + (why === 'window_exhausted' ? '（窗口将满，停止）' : '（次数上限）'));
+      return { token: null, lastResponse: last, cred: null, attempts: attempt, elapsedMs: elapsed, err: e, suspicious: false, mode: 'enhanced', reason: why };
+    }
+    log('     ' + (gap / 1000) + 's 后重试（窗口剩余 ' + Math.round((deadline - now()) / 1000) + 's）…');
+    await sleep(gap);
+  }
+  return { token: null, lastResponse: last, cred: null, attempts: attempt, elapsedMs: now() - started, err: vrErrText(last), suspicious: false, mode: 'enhanced', reason: 'max_try' };
+}
+// <<< VERIFY_RETRY_END
+
 // 凭证落盘（与国际版 lv-tokens.json 隔离，独立文件 domestic-tokens.json）
 function saveDomesticToken(cred) {
   const fs = require('fs');
@@ -2856,8 +3558,12 @@ async function main() {
     }
   }
 
-  try { console.log('[' + (SMS_PROVIDER === 'feihu' ? '飞狐' : SMS_PROVIDER === 'lubansms' ? '鲁班' : '豪猪') + '] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
-  catch (e) { console.warn('[豪猪] 查余额失败:', e.message); }
+  if (SMS_PROVIDER === 'newsfang') {
+    console.log('[新四方] 固定号池：号商直供号码与接口地址，无取号 / 余额接口');
+  } else {
+    try { console.log('[' + (SMS_PROVIDER === 'feihu' ? '飞狐' : SMS_PROVIDER === 'lubansms' ? '鲁班' : '豪猪') + '] 当前余额:', await SMS.balance(), '（余额不足会导致取号/接码失败，批量前请充值）'); }
+    catch (e) { console.warn('[豪猪] 查余额失败:', e.message); }
+  }
 
   if (!ACCOUNTS.length) throw new Error('ACCOUNTS 为空：把每账号的 name+idCard 填进去');
   const deployMsg = msgArg || readDeployMsg();

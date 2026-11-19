@@ -312,6 +312,9 @@ HANDLERS = {
     "domestic_jcsms_set":        lambda a: dcore.set_jcsms_config(a[0] if a else "", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "",
                                                                   a[3] if len(a) > 3 else ""),
+    "domestic_newsfang_set":     lambda a: dcore.set_newsfang_config(a[0] if a else "", a[1] if len(a) > 1 else ""),
+    # ★ 2026-11-19 V3：面板「导入未使用号码」用，只读永久台账
+    "domestic_sf_used_phones":   lambda a: dcore.sf_used_phones(),
     "domestic_proxy_set":        lambda a: dcore.set_proxy_config(a[0] if a else "socks5", a[1] if len(a) > 1 else "",
                                                                   a[2] if len(a) > 2 else "", a[3] if len(a) > 3 else "",
                                                                   a[4] if len(a) > 4 else ""),
