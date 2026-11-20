@@ -2210,10 +2210,13 @@ async function domesticLogin(acc, idx) {
       //   递增间隔 10,10,15,15,20,20,25,25… 覆盖满验证码5分钟窗口（270s 硬闸留缓冲）；
       //   每次重试前查本地凭证做幂等；识别「码已用/已注册」停止空转；总开关 LIGHTVELA_VERIFY_ENHANCED=0 退回老逻辑。
       //   逻辑本体 verifyWithRetry() 内联在本文件（标记 VERIFY_RETRY_BEGIN/END 之间，已单测全绿）。
+      // ★ 2026-11-20 修复：做新号的验码幂等改为「按手机号」查凭证（传第三参数 phone）。
+      //   绝不按身份证查——同一身份换新手机号会被吞成老号（11-06 修过、本版又回归的 bug）。
+      //   规则：一个手机号一个账号；一个身份可认证多个账号。
       const vr = await verifyWithRetry({
         phone: phone, code: code, label: (acc && (acc.name || acc.idCard)) || '',
         request: (body) => httpsReq('POST', '/auth/sms/verify', { body: body }),
-        checkCred: () => (typeof readDomesticToken === 'function' ? readDomesticToken(acc && acc.name, acc && acc.idCard) : null),
+        checkCred: () => (typeof readDomesticToken === 'function' ? readDomesticToken(acc && acc.name, acc && acc.idCard, phone) : null),
         sleep: (ms) => new Promise(r => setTimeout(r, ms)),
         now: () => Date.now(),
         log: (s) => console.log(s),
@@ -3514,7 +3517,12 @@ function saveDomesticToken(cred) {
 // ★ 续跑：从凭证文件取回某账号最新一条记录（按姓名匹配，后写覆盖先写）
 //   用于「已登录+已实名，只差订阅/部署」的场景：不再取号、不再发码、不再实名，
 //   直接复用上次落盘的 bearer，省掉豪猪接码费也不会换号（换号 = 变成另一个全新账号）。
-function readDomesticToken(name, idCard) {
+// ★ 2026-11-20 修复：新增第三参数 phone（按手机号查凭证）。
+//   规则：一个手机号一个账号，一个身份可认证多个账号。
+//   - 验码幂等（做新号）必须传 phone → 按手机号查：同号重试能命中旧凭证，换新号查不到→正常注册新账号。
+//   - 续跑 resume 不传 phone → 维持按身份证/姓名查（那是老账号补部署，身份不变）。
+//   ★ 绝不可以在做新号时按身份证查——会把同一身份的新号吞成老号（11-06 修过、11-20 又回归的 bug）。
+function readDomesticToken(name, idCard, phone) {
   const fs = require('fs');
   const base = process.env.LIGHTVELA_DOMESTIC_TOKENS || (__dirname + '/domestic-tokens');
   const nd = base.replace(/\.json$/, '') + '.ndjson';
@@ -3524,8 +3532,10 @@ function readDomesticToken(name, idCard) {
     for (const line of txt.split('\n')) {
       if (!line.trim()) continue;
       let o; try { o = JSON.parse(line); } catch (e) { continue; }
-      // ★ 优先按身份证匹配（唯一，重名也不会串号）；没有身份证才退回按姓名
-      const match = idCard ? (o && o.idCard === idCard) : (o && o.name === name);
+      // ★ 传了 phone 就只按手机号匹配（做新号的幂等）；否则按身份证/姓名（续跑）
+      let match;
+      if (phone) match = o && o.phone === phone;
+      else match = idCard ? (o && o.idCard === idCard) : (o && o.name === name);
       if (match) hit = o;   // 取最后一条（最新）
     }
   } catch (e) { return null; }
