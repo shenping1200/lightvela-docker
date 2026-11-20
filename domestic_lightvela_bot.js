@@ -996,6 +996,14 @@ const SMS_JCSMS = {
 //   LIGHTVELA_SF_TIMEOUT_MS 单次取码轮询总时长（默认 180000）
 //   LIGHTVELA_SF_RETRIES    HTTP 请求重试次数（轮换代理每次出口不同，默认 5）
 const SF_DEFAULT_TIMEOUT = Number(process.env.LIGHTVELA_SF_TIMEOUT_MS || 180000);
+// ★ 2026-11-20 老大定：四方取码超时单独压到 60s（老平台共用的 CODE_TIMEOUT_MS=180s 不动，绝不误伤）。
+//   实测老大「第一次收不到、再发一次基本都能收到」，180s 死等是耗时大头；压到 60s 后一次重试约 1.5 分钟。
+//   注意：历史上有一条短信延迟 3分23秒才上报，压到 60s 会漏这类慢码——老大已知并接受此取舍。
+//   可用 LIGHTVELA_SF_CODE_TIMEOUT_MS 随时调回；设 0 表示退回共用的 180s。
+const SF_CODE_TIMEOUT_MS = (function () {
+  const v = Number(process.env.LIGHTVELA_SF_CODE_TIMEOUT_MS || 60000);
+  return v > 0 ? v : 180000;
+})();
 const SF_RETRIES = Math.max(1, parseInt(process.env.LIGHTVELA_SF_RETRIES || '5', 10));
 // ★ 2026-11-19 V3（老大选 A）：取短信默认直连，三级回退「直连域名 → 固定节点IP → 代理」。
 //   实测：本机关掉 TUN 后直连 5/5 通、走代理 3 次里 2 次被 302 挡；
@@ -2105,7 +2113,7 @@ async function domesticLogin(acc, idx) {
           phone: phone,
           // ★ V4：旧码从永久台账读，冷却 300s 后重起子进程也不会把验过的旧码再拿去验
           usedCodes: sfLedgerUsedCodes(process.env, phone, { dirname: __dirname }),
-          maxTry: Number(process.env.LIGHTVELA_SF_GROUP_TRY || 3),
+          maxTry: Number(process.env.LIGHTVELA_SF_GROUP_TRY || 2),
           sendGapMs: 0,
           sleep: (ms) => new Promise(function (r) { setTimeout(r, ms); }),
           log: (s) => console.log(s),
@@ -2133,7 +2141,8 @@ async function domesticLogin(acc, idx) {
           },
           getCode: async function (sinceTs, excludeCodes) {
             return await SMS.getCode(phone, {
-              timeoutMs: CODE_TIMEOUT_MS,
+              // ★ 2026-11-20：四方专用 60s 超时（不动老平台共用的 CODE_TIMEOUT_MS=180s）
+              timeoutMs: SF_CODE_TIMEOUT_MS,
               sinceTs: sinceTs ? (sinceTs - SF_SINCE_TOLERANCE_MS) : 0,
               excludeCodes: excludeCodes,
               log: console.log,
