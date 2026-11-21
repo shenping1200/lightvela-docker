@@ -1463,6 +1463,26 @@ function sfLedgerPath(env, pathMod, dirname) {
   const d = (env && env.LIGHTVELA_SF_LEDGER_DIR) || dirname || '.';
   return pathMod ? pathMod.join(d, SF_LEDGER_DEFAULT_NAME) : (d + '/' + SF_LEDGER_DEFAULT_NAME);
 }
+// ★ 2026-11-21 老大定：四方成功接码的手机号上报数据中心（只上报，不拉黑、不走通用查重）。
+//   来源标记 sf_code_received，与豪猪等平台的 code_received 区分；失败静默、绝不阻断接码主流程。
+//   开关：LIGHTVELA_SF_UPLOAD=0 可关（默认开）。
+function sfReportPhone(env, phone, log) {
+  try {
+    if (String((env && env.LIGHTVELA_SF_UPLOAD) || '1') === '0') return;
+    const p = String(phone || '').replace(/[\s-]/g, '');
+    if (!/^1\d{10}$/.test(p)) return;
+    if (!PHONE_LEDGER || typeof PHONE_LEDGER._req !== 'function') return;
+    PHONE_LEDGER._req('/phone_used', { phones: [p], source: 'sf_code_received' }, 'POST')
+      .then(function (j) {
+        if (log) log('  [新四方] 号码 ' + p + ' 已上报数据中心（来源 sf_code_received' +
+          (j && typeof j.added === 'number' ? '，新增 ' + j.added : '') + '）');
+      })
+      .catch(function (e) {
+        if (log) log('  [新四方] 号码上报数据中心失败（忽略，不影响接码）: ' + (e && e.message || e));
+      });
+  } catch (e) { /* 任何异常都忽略，绝不阻断 */ }
+}
+
 // 永久台账写入：手机号+身份+验证码。失败静默。
 function sfLedgerAdd(env, rec, opt) {
   opt = opt || {};
@@ -2162,6 +2182,8 @@ async function domesticLogin(acc, idx) {
           console.log('SF_NEED_COOLDOWN=1');
           throw new Error('新四方本组' + (grp.attempts || 3) + '次验证失败，交后端冷却重试');
         }
+        // ★ 2026-11-21：验证成功才上报手机号到数据中心（只上报，不拉黑、不走通用查重）
+        sfReportPhone(process.env, phone, console.log);
         CFG.bearer = token;
       } else {
       // —— 发码错峰门控 + 限频同号重发 ——
