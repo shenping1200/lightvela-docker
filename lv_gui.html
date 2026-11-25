@@ -610,6 +610,7 @@ COM3 16544043493
           <button class="btn sm" id="domNfBtnExportSuccess">导出成功</button>
           <button class="btn sm" id="domNfBtnExportFailed">导出失败</button>
           <button class="btn sm" id="domNfBtnImportFailed">剔除成功号码</button>
+          <button class="btn sm" id="domNfBtnClear">清空号码</button>
           <input type="file" id="fileNfTxt" style="display:none">
           <span id="domNfNumStat" class="stat" style="margin-top:0"></span>
         </div>
@@ -1359,6 +1360,7 @@ function boot() {
   $('domNfBtnExportSuccess').onclick = domNfExportSuccess;
   $('domNfBtnExportFailed').onclick = domNfExportFailed;
   $('domNfBtnImportFailed').onclick = domNfImportFailed;
+  $('domNfBtnClear').onclick = domNfClearNumbers;
   $('domBtnProxySave').onclick = domProxySave;
   $('domBtnProxyTest').onclick = domProxyTest;
   $('domBtnStratSave').onclick = domStrategySave;
@@ -1469,7 +1471,7 @@ async function domStart() {
   if (!r || !r.ok) { appendDomLog(['[启动失败] ' + (r && r.error)]); return; }
   $('domLog').textContent = ''; domLogLen = 0;
   domRunning = true; domResumedOnce = true; $('domBtnStart').disabled = true; $('domBtnStop').disabled = false; $('domBtnExportSuccess').disabled = true; $('domBtnExportFailed').disabled = true; $('domBtnImportFailed').disabled = true;
-  $('domNfBtnImportUnused').disabled = true; $('domNfBtnImportFailed').disabled = true;   // ★ V3：跑任务时不让改号码清单
+  $('domNfBtnImportUnused').disabled = true; $('domNfBtnImportFailed').disabled = true; $('domNfBtnClear').disabled = true;   // ★ V3：跑任务时不让改号码清单
   switchTab('domestic');
   const bundleLabel = mode === 'login' ? '（登录模式不下单）'
                     : (bundleStrategy === 'launch_ai' ? '只订4500'
@@ -1634,9 +1636,10 @@ async function domImportFailed() {
   $('domAcc').value = kept.join('\n');
   $('domAcc').dispatchEvent(new Event('input'));            // 触发解析刷新账号数 + 草稿落盘
   // 号码清单区同步剔除成功号
-  const nr = domNfPruneSuccess({ silent: true });
+  const nr = await domNfPruneSuccess({ silent: true });
   let extra = '';
-  if (nr && nr.removed) extra = '；号码清单区同步剔除 ' + nr.removed + ' 个成功号，剩 ' + nr.kept + ' 个';
+  if (nr && nr.removed) extra = '；号码清单区同步剔除 ' + nr.removed + ' 个成功号，剩 ' + nr.kept + ' 个' +
+                                (nr.saved ? '（已自动保存）' : '（自动保存失败，请手动点保存配置）');
   appendDomLog(['[剔除成功] 账号区剔除 ' + removed.length + ' 个成功账号，剩 ' + kept.length +
                 ' 个（失败的 + 未跑到的）' +
                 (byNameOnly ? '（其中 ' + byNameOnly + ' 个没身份证号，按姓名匹配）' : '') + extra]);
@@ -1709,11 +1712,21 @@ async function domNfExportFailed() {
   appendDomLog(lines);
   appendDomLog(['[导出失败] 共 ' + lines.length + ' 个（已显示在上方，未生成文件）']);
 }
-function domNfImportFailed() {
+async function domNfImportFailed() {
   // ★ 2026-11-20 老大定：这个按钮同样改成「剔除成功的」——
   //   清单区逐行看，手机号在本轮成功名单里的删掉，其余原样保留（含 COM 口标签和顺序）。
   //   剔完剩下的就是「失败的号 + 本轮没轮到的号」。
-  domNfPruneSuccess({ silent: false });
+  await domNfPruneSuccess({ silent: false });
+}
+
+/* ★ 2026-11-25 老大定：号码清单一改动就立刻落盘，不用再手点「保存配置」。
+   后端 set_newsfang_config 只写 sms.newsfang 段，不碰其他平台。失败会在日志里喊出来。 */
+async function domNfAutoSave() {
+  const r = await API.domestic_newsfang_set(
+    $('domNfUrl').value.trim(),
+    $('domNfNumbers').value.trim()
+  );
+  return !!(r && r.ok);
 }
 
 /* ★ 2026-11-20 「剔除成功」的核心：从号码清单区删掉本轮成功的号。
@@ -1722,8 +1735,8 @@ function domNfImportFailed() {
      · 本轮没轮到的号（并发没排上的）天然留在清单里，不用另外算
      · 手动加的号不会被清掉
    opt.silent=true 时只改内容不打日志（供账号区按钮顺带调用）。
-   返回 { removed, kept }，没有运行记录/没有成功号时返回 null。 */
-function domNfPruneSuccess(opt) {
+   返回 { removed, kept, saved }，没有运行记录/没有成功号时返回 null。 */
+async function domNfPruneSuccess(opt) {
   const silent = !!(opt && opt.silent);
   const s = lastDomStatus;
   if (!s || !s.results) { if (!silent) appendDomLog(['[剔除成功] 还没有运行记录']); return null; }
@@ -1747,11 +1760,24 @@ function domNfPruneSuccess(opt) {
   }
   $('domNfNumbers').value = kept.join('\n');
   domNfStat($('domNfNumbers').value);
+  const saved = await domNfAutoSave();
   if (!silent) {
     appendDomLog(['[剔除成功] 号码清单区剔除 ' + removed.length + ' 个成功号，剩 ' + kept.length +
-                  ' 个（失败的 + 未轮到的），记得点「保存配置」后重跑']);
+                  ' 个（失败的 + 未轮到的），' + (saved ? '已自动保存，下次运行直接生效' : '自动保存失败，请手动点「保存配置」')]);
   }
-  return { removed: removed.length, kept: kept.length };
+  return { removed: removed.length, kept: kept.length, saved: saved };
+}
+
+/* ★ 2026-11-25 老大定：清单下方新增「清空号码」按钮。
+   点一下清空号码清单 + 刷新统计 + 立刻落盘，不用再手点保存配置。 */
+async function domNfClearNumbers() {
+  const oldN = domNfParse($('domNfNumbers').value || '').length;
+  if (!oldN) { appendDomLog(['[清空号码] 清单本来就是空的，无需清空']); return; }
+  $('domNfNumbers').value = '';
+  domNfStat('');
+  const saved = await domNfAutoSave();
+  appendDomLog(['[清空号码] 已清空 ' + oldN + ' 个号' +
+                (saved ? '，并已自动保存，下次运行生效' : '，但自动保存失败，请手动点「保存配置」')]);
 }
 
 function renderDomRows(s) {
@@ -1806,7 +1832,7 @@ async function domPoll() {
   if (!s.running) {
     domRunning = false;
     $('domBtnStart').disabled = false; $('domBtnStop').disabled = true; $('domBtnExportSuccess').disabled = false; $('domBtnExportFailed').disabled = false; $('domBtnImportFailed').disabled = false;
-    $('domNfBtnImportUnused').disabled = false; $('domNfBtnImportFailed').disabled = false;
+    $('domNfBtnImportUnused').disabled = false; $('domNfBtnImportFailed').disabled = false; $('domNfBtnClear').disabled = false;
     appendDomLog(['[全部结束] 完成 ' + (s.done || 0) + ' / ' + (s.total || 0)]);
     doTkInfo();
   }
